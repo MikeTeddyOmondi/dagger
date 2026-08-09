@@ -1,9 +1,12 @@
 package idtui
 
 import (
+	"io"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/dagger/dagger/dagql/dagui"
 	"github.com/muesli/termenv"
 	"github.com/vito/tuist"
 )
@@ -115,5 +118,68 @@ func TestAgentRosterTruncatesToWidth(t *testing.T) {
 	}
 	if !strings.Contains(line, "…") {
 		t.Fatalf("expected an ellipsis marking the truncation, got:\n%q", line)
+	}
+}
+
+// TestAgentRosterEntriesFromDB closes the seam between the trace DB and the
+// strip: the frontend must source its entries from the agents the engine
+// published, including a worker whose loop span sits under a Boundary (its
+// chief's tool call) — the containment that hides a fixture service must not
+// hide an agent.
+func TestAgentRosterEntriesFromDB(t *testing.T) {
+	db := dagui.NewDB()
+	start := time.Unix(100, 0)
+	traceID := prettyTestTraceID()
+	rootID := prettyTestSpanID(1)
+	chiefID := prettyTestSpanID(2)
+	toolID := prettyTestSpanID(3)
+	workerID := prettyTestSpanID(4)
+
+	db.ImportSnapshots([]dagui.SpanSnapshot{
+		{
+			ID:        rootID,
+			TraceID:   traceID,
+			Name:      "dagger",
+			StartTime: start,
+		},
+		{
+			ID:        chiefID,
+			TraceID:   traceID,
+			ParentID:  rootID,
+			Name:      "agent: interactive",
+			StartTime: start.Add(time.Second),
+			Agent:     true,
+			AgentID:   "agent-chief",
+			AgentName: "interactive",
+		},
+		{
+			// The chief's spawn tool call: a Boundary, which is exactly the
+			// containment SurfacedServices would hide behind.
+			ID:        toolID,
+			TraceID:   traceID,
+			ParentID:  chiefID,
+			Name:      `spawn(name: "scout")`,
+			StartTime: start.Add(2 * time.Second),
+			Boundary:  true,
+		},
+		{
+			ID:        workerID,
+			TraceID:   traceID,
+			ParentID:  toolID,
+			Name:      "agent: scout",
+			StartTime: start.Add(3 * time.Second),
+			Agent:     true,
+			AgentID:   "agent-scout",
+			AgentName: "scout",
+		},
+	})
+
+	fe := NewWithDB(io.Discard, db)
+	entries := fe.agentRosterEntries()
+	if len(entries) != 2 {
+		t.Fatalf("expected chief and worker, got %d: %+v", len(entries), entries)
+	}
+	if entries[0].Name != "interactive" || entries[1].Name != "scout" {
+		t.Fatalf("unexpected roster: %+v", entries)
 	}
 }
