@@ -17,14 +17,13 @@
 #
 # NOT registered in dagger.toml: load explicitly, e.g.
 # `dagger -m ./modules/staff`.
-
 """
 Hire and direct a staff of asynchronous worker agents: spawn them by name,
 steer and observe them while they run, and collect their results.
 """
 type Staff {
   # Live worker handles; unique by name, by construction.
-  let members: [Agent!]! = []
+  let members: Map[Agent!]! = [:]
 
   # Not really tools: chiefLine is spawn's plumbing, and workerPrompt is a
   # public constant (tests build worker recordings against its exact text).
@@ -68,7 +67,7 @@ type Staff {
   ): Staff! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): composes, starts, and messages a real agent runtime —
     # side effects that must actually run, never replay from cache.
-    if (members.any { m => m.name == name }) {
+    if (members.has(name)) {
       raise `staff member "${name}" already exists — dismiss it first or pick another name`
     }
     # Workers work; they don't orchestrate. Compose the workspace's agents
@@ -91,7 +90,7 @@ type Staff {
       .spawn(name: name)
     # Fire-and-forget: signal-with-start opens the worker's first turn.
     worker.send(task)
-    self.members += [worker]
+    self.members = self.members.with(name, worker)
     self
   }
 
@@ -156,7 +155,7 @@ type Staff {
     if (members.isEmpty) {
       "(none)"
     } else {
-      members.map { m => `${m.name}: ${toString(m.state)}` }.join("\n")
+      members.map { name, agent => `${name}: ${toString(agent.state)}` }.values.join("\n")
     }
   }
 
@@ -239,7 +238,7 @@ type Staff {
   ): Staff! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): stopping the runtime is a side effect that must run.
     member(name).stop
-    self.members = members.filter { m => m.name != name }
+    self.members = members.without(name)
     self
   }
 
@@ -254,19 +253,18 @@ type Staff {
 
   # Address a member by name, with a helpful miss.
   let member(name: String!): Agent! {
-    let found = members.filter { m => m.name == name }[0]
-    if (found != null) {
-      found
-    } else {
+    let member = members[name]
+    if (member == null) {
       raise `no staff member named "${name}"; current members: ${memberNames}`
     }
+    member
   }
 
   let memberNames: String! {
     if (members.isEmpty) {
       "(none)"
     } else {
-      members.map { m => m.name }.join(", ")
+      members.keys.join(", ")
     }
   }
 
