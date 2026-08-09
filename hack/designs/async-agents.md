@@ -436,6 +436,55 @@ Cloud) attaching to the same session addresses the same agent **by held ID**
 — its telemetry-carried ID, never by re-deriving the composition, which
 would simply spawn a fresh agent (attach-by-rederivation is renounced; §9).
 
+### 5.1 Multi-agent UI: the roster, focus, and attention
+
+One frontend, many live agents: the client folds the `dagger.io/agent.*`
+telemetry (§9) into a **roster** of every agent the trace mentions, and the
+user alternates prompting between its entries. The roster is a tmux-style
+switcher strip immediately above the prompt, not a sidebar section. The
+sidebar (`SetSidebarContent`/`SidebarSection`,
+dagql/idtui/frontend_pretty.go:846, carrying "Changes" and "References"
+today) was considered and rejected as the end state on three counts: it is a
+top-right overlay, so it occludes the tree it summarizes; it has no
+selection model, so it could only ever duplicate the switcher rather than
+*become* it; and its sections queue, so the roster would be least visible
+exactly when the session is busiest. Three idioms come straight from tmux —
+per-agent status flags, numbered jump targets, and a **last-focused toggle**,
+since the two-agent ping-pong is the common case and a next/prev cycle is the
+wrong verb for it. `tab` is unavailable for any of them: it is already the
+input-mode binding (frontend_pretty.go:2421,:4552) and the completion menu
+consumes it.
+
+**Focus is moved only by a keypress, never by an event.** An agent that
+needs the user *advertises* attention on its roster entry; the user decides
+when to go. Attention taken rather than advertised would drop a message into
+whatever was half-typed, and the parked-question model (§3.4) exists
+precisely because the human is not a service to be called. A draft is kept
+per agent, saved on blur and restored on focus, so an interrupted
+composition survives the switch. Ctrl-C interrupts the FOCUSED agent only:
+`interrupt` is per-runtime (§3.5), and a key that preempted every live agent
+at once would be unusable in exactly the sessions this UI is for.
+
+Focus makes the client's session-scoped affordances **focused-agent scoped**,
+and that is accepted deliberately: `/compact`, `/save`, `ctrl+s` and the
+status line's context gauge (internal/cmd/dagger/llm.go:596-603) each
+describe one conversation, so they follow focus, and session-wide totals move
+to the roster header. The alternative is a status line that lies about which
+conversation it is describing.
+
+Build order is **roster first, attention second**. Slice 1 is the engine's
+telemetry publication plus a read-only roster strip — no focus, no change
+to routing (both built; §11). Slice 2 is focus, per-agent drafts, and the
+`LLMSession` refactor (it holds exactly one agent today:
+`currentAgent`/`dropAgent`/`setTurnAgent`/`Interject`/`syncFromAgent`,
+internal/cmd/dagger/llm.go:241-343), which must land *together with* the
+send-routing change: bolting focus onto the current `shellRunning →
+Interject` latch (frontend_pretty.go:4684) would silently deliver
+messages to whichever agent happens to own the in-flight turn. Slice 3 is
+the parked-question/attention work (§3.4), which is what makes the roster
+worth having — a roster where nobody can ever say "I need you" is only a
+progress display.
+
 ## 6. Naming: freeing `Agent`
 
 `Agent` and `AgentGroup` are currently the *descriptor* types for `@agent`
@@ -480,7 +529,8 @@ Middlewares *define* agents; `compose(...).spawn(name)` *instantiates* one.
 
 ## 9. As-built ratifications
 
-Semantics settled during implementation (core/agent.go, core/schema/agent.go,
+Semantics settled during implementation (core/agent.go, core/agent_telemetry.go,
+core/schema/agent.go, engine/telemetryattrs/attrs.go,
 core/integration/agent_runtime_test.go), ratified here:
 
 - **State projection order.** `state` is a pure ordering of runtime facts:
@@ -566,6 +616,56 @@ core/integration/agent_runtime_test.go), ratified here:
   turn as `STEERED` — but awaiting it from inside that same turn's tool call
   is a deadlock (the turn cannot end until the tool returns). Fire-and-forget
   sends to self are legal steering; awaits belong on *other* agents.
+- **Telemetry is the directory, and it needed no new schema.** Discovery is a
+  purely client-side derivation from the trace a client already ingests: the
+  capability was in every trace before any of this was written. `spawn` pins
+  instance identity through an internal `Select` of `agent(id:, name:)`
+  (core/schema/llm.go:523-538), and every dagql call span carries the full
+  protobuf `Call` (`DagCallAttr`, core/telemetry.go:92-105), so a client
+  reconstructs a *sendable* handle from a carried digest exactly as
+  `llmCallDigest` → `loadIDFromSpan` (dagql/idtui/frontend_pretty.go:5012) →
+  `dagger.Ref` already does for branch-from-message. §3.3's renunciation of
+  `Query.agents` therefore holds as an API contract and not merely as advice:
+  the roster is a projection of the trace, an agent whose spans a client
+  cannot see stays unreachable to it, and the schema gained nothing.
+- **Identity rides span attributes; state rides log records.** The split is
+  forced by the export model, not chosen for tidiness. A live span is
+  exported as a *snapshot taken at span start* (`LiveSpanProcessor.OnStart`
+  calls `OnEnd(SnapshotSpan(span))`, github.com/dagger/otel-go), and
+  `SpanHeartbeater` (engine/telemetry/heartbeat.go:55-67) re-exports that
+  same frozen snapshot for as long as the span lives — so an attribute
+  written onto a live span later reaches no client at all, even though
+  client-side ingest would have merged it fine (`recordOTelSpan`,
+  dagql/dagui/db.go:608-652, re-processes attributes on every export). So
+  immutable identity facts (`AgentAttr`, `AgentIDAttr`, `AgentNameAttr`,
+  `AgentCallDigestAttr`) are stamped at span start (`agentSpanAttrs`), and
+  mutable lifecycle state (`AgentStateAttr`, `AgentWaitingOnAttr`) is emitted
+  as OTel **log records** attributed to the loop span (`EmitAgentState`) —
+  the same channel streaming progress uses (`EmitProgress`,
+  engine/snapshots/progress.go:41 → `ingestProgress`,
+  dagql/dagui/progress.go:82) and for the same reason. Such records are
+  latest-wins and consumed as data: a client folds them into the roster
+  entry, and never renders them as log text. Rejected: a child span per state
+  interval, which gives per-state durations for free and needs no new ingest
+  plumbing, but pollutes the very span tree the user is reading, needs dedupe
+  against the projection, and has no live parent to hang the final record
+  from once the loop span has ended — which breaks the FAILED-tombstone seal;
+  and a `waitForChange(since:)` long-poll per agent, which is correct and
+  genuinely not polling (`Agent.waitFor` already blocks server-side) but
+  costs a request and a goroutine per agent per client, needs new schema
+  right where §3.3 renounced it, and is dead in replay, where the roster must
+  still come out of the trace.
+- **The roster keys on the agent ID, and the last record outlives the span.**
+  The grouping key is the spawn-minted `AgentIDAttr`, never the span ID: a
+  `resume` retry relaunches the loop, so one agent owns several loop spans
+  over its life. Publication is edge-triggered on the *projection*
+  (`publishStateLocked`), because `transitionLocked` fires on every fact
+  change and most fact changes do not move the state (the projection order
+  above). And `AgentRuntime.spanCtx` is deliberately retained past its span's
+  own end — a record carries its span ID whether or not that span is still
+  open — so the tombstone-sealing transition in `stop`, which runs after the
+  loop has already returned, still reaches a client's roster instead of
+  leaving a FAILED agent apparently retryable forever.
 
 ### 9.1 Harvesting a worker's work
 
@@ -690,6 +790,29 @@ What is BUILT (see also §9 for ratified semantics):
   planned").
 - **Namespace**: descriptor types renamed `AgentMiddleware` /
   `AgentMiddlewareGroup` (§6).
+- **Agent telemetry publication** (§3.3, §9): the `dagger.io/agent.*`
+  vocabulary in `engine/telemetryattrs/attrs.go` (`AgentAttr`, `AgentIDAttr`,
+  `AgentNameAttr`, `AgentCallDigestAttr`, `AgentStateAttr`,
+  `AgentWaitingOnAttr`), `core/agent_telemetry.go` (`agentSpanAttrs`,
+  `EmitAgentState`), and the loop span in `core/agent.go` — anonymous before
+  — now stamped with identity at start; `AgentRuntime` gained `spanCtx` and
+  `emittedState`, and `transitionLocked` publishes through
+  `publishStateLocked` on every change of the projected state. Every live
+  agent, module-internal ones included, is now discoverable in the trace.
+- **Client-side roster** (§5.1, slice 1): `dagql/dagui/agents.go` folds the
+  published directory into `DB.Agents()` — `AgentNode` keyed by
+  `AgentIDAttr`, so a resume-retry's second loop span joins the same agent
+  rather than forking a phantom one — with the span attributes decoded in
+  `spans.go` and the state records consumed in `ingestAgentState` beside
+  `ingestProgress`, which keeps them out of the log text and bumps the
+  mutation counter the roster memo keys on. Deliberately flat and
+  containment-free, unlike `SurfacedServices`: a worker born under its
+  chief's tool-call span (a Boundary) is exactly what the roster exists to
+  reveal. `dagql/idtui/agent_roster.go` renders it as the strip above the
+  prompt, hidden below two agents so single-agent sessions are untouched.
+  Tests: `dagql/dagui/agents_test.go`, `dagql/idtui/agent_roster_test.go`.
+  Read-only: the strip surfaces agents but does not yet bind the prompt to
+  one (NOT-built 1).
 - **CLI prompt mode** (`internal/cmd/dagger/llm.go`, `shell.go`,
   `dagql/idtui/frontend_pretty.go`): submit = send + resume + await,
   re-rooting on `snapshot` at turn end; interjections send immediately
@@ -736,11 +859,16 @@ What is BUILT (see also §9 for ratified semantics):
 
 What is NOT built — threads to pull, each self-contained:
 
-1. **Telemetry directory** (§3.3, §5): the loop span carries no agent-ID
-   attribute yet, so the TUI cannot offer "send to this agent" for agents
-   it renders; generalize the `llmCallDigest` branch-from-message
-   machinery. Start at the loop span in `core/agent.go` and
-   `dagql/dagui/spans.go`.
+1. **Addressing the roster** (§3.3, §5.1): the engine publishes the
+   directory and the client renders it (both BUILT above), but the strip is
+   read-only — the prompt is still bound to the one agent the session
+   spawned, so an agent the user did not start can be watched and not
+   spoken to. Missing: handle reconstruction from `AgentCallDigestAttr`
+   through the existing `loadIDFromSpan` → `dagger.Ref` path
+   (dagql/idtui/frontend_pretty.go:5055), degrading to a read-only entry
+   when the digest does not resolve; then the rest of §5.1 — focus with
+   per-agent drafts, the tmux keymap, and the `LLMSession` send-routing
+   refactor, which must land as one change.
 2. **Enqueue guards** (§3.3): depth limiting, self-send rejection, cycle
    detection — none exist. Central point: the enqueue path in
    `AgentRuntimes` (`Send`). Until then `modules/staff` documents the
@@ -750,7 +878,10 @@ What is NOT built — threads to pull, each self-contained:
    or telemetry.
 4. **`WAITING_INPUT` / `waitingOn`** (§3.4): enum value exists but is
    unreachable; needs the user-ask parking path (the non-modal
-   resurrection of the dead `LLM.Interject`).
+   resurrection of the dead `LLM.Interject`). The telemetry half is
+   pre-wired: `AgentWaitingOnAttr` rides every state record and is emitted
+   empty until something can park a question, so the roster's attention flag
+   (§5.1) lights up the moment the state becomes reachable.
 5. **Loop-as-sugar** (§7): `LLM.loop`/`step` remain an independent code
    path; consequently sync loops cannot satisfy `Agent!` args. Note the
    spawn pivot constrains the eventual sugar pleasantly: `loop` stays a
@@ -816,4 +947,20 @@ What is NOT built — threads to pull, each self-contained:
     reloads, the origin link is gone (it is engine-side metadata), so a
     re-pull relies on REDUNDANT to notice — a durable fix needs the
     origin in the commit object, as a trailer or a git note.
+14. **A session restart silently RE-ANIMATES workers** (§4, §3.3): observed
+    live — after restarting a client session, a `modules/staff` chief's
+    workers reported `RUNNING` again, while their `snapshot` had degraded to
+    the SEED conversation (system prompt plus opening task, none of the work
+    they had actually done). Likely mechanism: re-selecting the chief's held
+    agent IDs re-executed the recorded `send`, and signal-with-start (§3.3)
+    then started a FRESH runtime from the seed — so the agents genuinely were
+    running, redoing their opening task from scratch. Adjacent to item 13's
+    note that a tombstone re-selected in a NEW session projects
+    IDLE-from-absence with the seed as its snapshot, but distinct and worse:
+    there the re-selection is inert, here it has side effects. Cross-session
+    identity is the unresolved question — §4 resumes a *conversation* from
+    the trace and says nothing about a client replaying a chain that contains
+    imperative verbs — and the failure mode is expensive (silent duplicate
+    work) and confusing (a roster full of agents that look busy but have lost
+    their history). A roster (item 1) makes it more visible, not less.
 
