@@ -197,6 +197,26 @@ func (c *OpenAICodexClient) SendQuery(ctx context.Context, history []*LLMMessage
 				}
 			}
 
+		case "response.incomplete", "response.failed":
+			// A turn cut short ends with one of these instead of
+			// response.completed. Anything streamed so far is partial — a
+			// truncated tool call, half a message — so report the stop rather
+			// than letting the partial turn read as a clean finish.
+			var resp responses.Response
+			if event.Type == "response.incomplete" {
+				resp = event.AsResponseIncomplete().Response
+			} else {
+				resp = event.AsResponseFailed().Response
+			}
+			reason := resp.IncompleteDetails.Reason
+			if reason == "" {
+				reason = resp.Error.Message
+			}
+			if reason == "" {
+				reason = string(resp.Status)
+			}
+			return nil, &ModelFinishedError{Reason: reason}
+
 		case "response.completed":
 			e := event.AsResponseCompleted()
 			resp := e.Response
