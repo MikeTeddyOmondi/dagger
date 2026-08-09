@@ -16253,6 +16253,8 @@ func (r *Workspace) Address(ctx context.Context) (string, error) {
 type WorkspaceAgentsOpts struct {
 	// Only include agents matching the specified patterns
 	Include []string
+	// Exclude agents matching the specified patterns
+	Exclude []string
 }
 
 // Return all agent middlewares from modules loaded in the workspace.
@@ -16262,6 +16264,10 @@ func (r *Workspace) Agents(opts ...WorkspaceAgentsOpts) *AgentMiddlewareGroup {
 		// `include` optional argument
 		if !querybuilder.IsZeroValue(opts[i].Include) {
 			q = q.Arg("include", opts[i].Include)
+		}
+		// `exclude` optional argument
+		if !querybuilder.IsZeroValue(opts[i].Exclude) {
+			q = q.Arg("exclude", opts[i].Exclude)
 		}
 	}
 

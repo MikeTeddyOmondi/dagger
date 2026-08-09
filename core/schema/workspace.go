@@ -406,6 +406,7 @@ func (s *workspaceSchema) Install(srv *dagql.Server) {
 			Doc("Return all agent middlewares from modules loaded in the workspace.").
 			Args(
 				dagql.Arg("include").Doc("Only include agents matching the specified patterns"),
+				dagql.Arg("exclude").Doc("Exclude agents matching the specified patterns"),
 			),
 		migrateField,
 	}.Install(srv)
@@ -3682,6 +3683,7 @@ func (s *workspaceSchema) agents(
 	parentResult dagql.ObjectResult[*core.Workspace],
 	args struct {
 		Include dagql.Optional[dagql.ArrayInput[dagql.String]]
+		Exclude dagql.Optional[dagql.ArrayInput[dagql.String]]
 	},
 ) (*core.AgentMiddlewareGroup, error) {
 	parent := parentResult.Self()
@@ -3690,6 +3692,7 @@ func (s *workspaceSchema) agents(
 	}
 
 	include := workspaceIncludePatterns(args.Include)
+	exclude := workspaceIncludePatterns(args.Exclude)
 
 	ctx, err := s.withWorkspaceClientContext(ctx, parent)
 	if err != nil {
@@ -3732,6 +3735,19 @@ func (s *workspaceSchema) agents(
 		)
 		if err != nil {
 			return nil, err
+		}
+		if len(exclude) > 0 {
+			filtered, err = filterNodesByExclude(
+				ctx,
+				filtered,
+				exclude,
+				func(agent *core.AgentMiddleware) *core.ModTreeNode { return agent.Node },
+				func(agent *core.AgentMiddleware) string { return agent.Name() },
+				"agent",
+			)
+			if err != nil {
+				return nil, err
+			}
 		}
 		allAgents = append(allAgents, filtered...)
 	}

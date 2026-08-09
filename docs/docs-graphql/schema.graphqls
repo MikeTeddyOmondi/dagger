@@ -5787,6 +5787,9 @@ type Workspace implements Node {
   agents(
     """Only include agents matching the specified patterns"""
     include: [String!]
+
+    """Exclude agents matching the specified patterns"""
+    exclude: [String!]
   ): AgentMiddlewareGroup!
 
   """Return this workspace's pending overlay changes."""

@@ -186,6 +186,36 @@ func (AgentsSuite) TestComposeToolset(ctx context.Context, t *testctx.T) {
 	require.NotContains(t, out, "## editor_")
 }
 
+// TestComposeExclude covers the exclude arg: dropping a whole agent from the
+// composition without enumerating its tools — the shape orchestration modules
+// like modules/staff use to keep their own toolset out of spawned workers.
+func (AgentsSuite) TestComposeExclude(ctx context.Context, t *testctx.T) {
+	c := connect(ctx, t)
+	modGen, err := installAgents(t, c, "editor", "godoc")
+	require.NoError(t, err)
+
+	// Excluding godoc removes its whole toolset; editor's remains — and with
+	// the collision partner gone, editor keeps its bare tool names.
+	out, err := modGen.
+		With(daggerQuery(`{workspace: currentWorkspace{agents(exclude:["godoc"]){compose{tools}}}}`)).
+		Stdout(ctx)
+	require.NoError(t, err)
+	require.Contains(t, out, "## readFile")
+	require.Contains(t, out, "## shared")
+	require.NotContains(t, out, "## goDoc")
+	require.NotContains(t, out, "## editor_")
+	require.NotContains(t, out, "## godoc_")
+
+	// Exclude composes with include: the intersection here selects nothing,
+	// folding over no agents into the bare workspace-bound LLM.
+	out, err = modGen.
+		With(daggerQuery(`{workspace: currentWorkspace{agents(include:["editor"], exclude:["editor"]){compose{tools}}}}`)).
+		Stdout(ctx)
+	require.NoError(t, err)
+	require.NotContains(t, out, "## readFile")
+	require.NotContains(t, out, "## goDoc")
+}
+
 // TestComposeSeedIsWorkspaceBound locks in that compose's default base LLM is
 // bound to the workspace the group was rolled up from. llm() starts unbound
 // (NewLLM no longer binds the ambient workspace), so without the explicit
