@@ -113,6 +113,7 @@ type frontendPretty struct {
 	promptErr       error
 	promptErrLabel  *ErrorLabel
 	queuedMsgLabel  *QueuedMessageLabel
+	agentRoster     *AgentRoster
 	statusLine      *StatusLine
 	statusLineData  StatusLineData
 	llmCostFn       LLMCostFunc
@@ -966,10 +967,12 @@ func (fe *frontendPretty) startShell(ctx context.Context, handler ShellHandler) 
 	// Intercept special keys before TextInput processes them.
 	fe.textInput.KeyInterceptor = fe.interceptEditlineKey
 
-	// Insert errorLabel + queuedMsg + textInput + statusLine before keymapBar:
-	// output → error → queued → prompt → statusLine → keymap
+	// Insert errorLabel + queuedMsg + agentRoster + textInput + statusLine
+	// before keymapBar:
+	// output → error → queued → agents → prompt → statusLine → keymap
 	fe.promptErrLabel = NewErrorLabel()
 	fe.queuedMsgLabel = NewQueuedMessageLabel(fe.profile)
+	fe.agentRoster = NewAgentRoster(fe.profile, fe.agentRosterEntries)
 	fe.statusLine = &StatusLine{
 		profile:   fe.profile,
 		data:      fe.statusLineData, // seed from the last SetStatusLine (e.g. a resumed session)
@@ -980,6 +983,7 @@ func (fe *frontendPretty) startShell(ctx context.Context, handler ShellHandler) 
 	fe.promptFrame = NewPromptFrame(fe.textInput, fe.profile)
 	fe.tui.AddChild(fe.promptErrLabel)
 	fe.tui.AddChild(fe.queuedMsgLabel)
+	fe.tui.AddChild(fe.agentRoster)
 	fe.tui.AddChild(fe.promptFrame)
 	fe.tui.AddChild(fe.statusLine)
 	fe.tui.AddChild(fe.keymapBar)
@@ -1003,6 +1007,10 @@ func (fe *frontendPretty) stopShell() {
 	if fe.queuedMsgLabel != nil {
 		fe.tui.RemoveChild(fe.queuedMsgLabel)
 		fe.queuedMsgLabel = nil
+	}
+	if fe.agentRoster != nil {
+		fe.tui.RemoveChild(fe.agentRoster)
+		fe.agentRoster = nil
 	}
 	if fe.statusLine != nil {
 		fe.tui.RemoveChild(fe.statusLine)
@@ -2588,6 +2596,7 @@ func (fe *frontendPretty) Render(ctx tuist.Context) {
 	reserved := 1 // keymap bar
 	reserved += fe.errorLabelHeight()
 	reserved += fe.queuedMessageHeight() // queuedMsgLabel is a sibling, not rendered here
+	reserved += fe.agentRosterHeight()   // agentRoster is a sibling, not rendered here
 	reserved += fe.statusLineHeight()    // statusLine is a sibling, not rendered here
 	reserved += fe.editlineHeight()
 	reserved += fe.formHeight()
@@ -3553,6 +3562,40 @@ func (fe *frontendPretty) reportServices() []*dagui.ServiceNode {
 		return nil
 	}
 	return fe.db.SurfacedServicesForSpan(fe.surfaceRoot())
+}
+
+// agentRosterEntries sources the roster strip from the session's published
+// agents. Unlike the surfaced views above it is NOT relative to the zoom
+// root: the roster answers "who is in this session", a question the current
+// zoom has no bearing on — and an agent spawned deep inside a module call is
+// exactly the one worth surfacing.
+func (fe *frontendPretty) agentRosterEntries() []AgentRosterEntry {
+	if fe.db == nil {
+		return nil
+	}
+	agents := fe.db.Agents()
+	entries := make([]AgentRosterEntry, 0, len(agents))
+	for _, agent := range agents {
+		name := agent.Name
+		if name == "" {
+			name = "agent"
+		}
+		entries = append(entries, AgentRosterEntry{
+			Name:      name,
+			State:     agent.State,
+			WaitingOn: agent.WaitingOn,
+		})
+	}
+	return entries
+}
+
+// agentRosterHeight returns the line count of the roster strip, which
+// renders nothing for a session with fewer than two agents.
+func (fe *frontendPretty) agentRosterHeight() int {
+	if fe.agentRoster == nil {
+		return 0
+	}
+	return fe.agentRoster.Height()
 }
 
 // reportTestRoot is surfaceRoot for the TESTS section.
