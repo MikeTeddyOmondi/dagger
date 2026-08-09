@@ -432,6 +432,21 @@ type AgentRuntime struct {
 	// stateChanged is closed and replaced on every fact transition, so
 	// WaitFor can block on transitions without polling.
 	stateChanged chan struct{}
+
+	// Telemetry directory plumbing (design §3.3), guarded by mu.
+	//
+	// spanCtx carries the loop span, set when the loop starts, and is what
+	// state records are attributed to. It deliberately outlives the span
+	// itself: a record emitted after the span ended still carries its span
+	// ID, which is how the tombstone-sealing transition (Stop on a FAILED
+	// agent, after the loop returned) still reaches a client's roster.
+	//
+	// emittedState is the last state published on that channel, so a
+	// transition that does not change the PROJECTION emits nothing —
+	// transitionLocked fires on every fact change, of which only a fraction
+	// are state changes.
+	spanCtx      context.Context
+	emittedState AgentState
 }
 
 // Name returns the agent's display name.
@@ -441,10 +456,40 @@ func (rt *AgentRuntime) Name() string {
 
 // transitionLocked applies a fact mutation and broadcasts it to any WaitFor
 // blocked on stateChanged. Must be called with rt.mu held.
+//
+// It is also the single choke point for state telemetry: every fact change
+// in the runtime goes through here, so publishing the projection here is
+// what guarantees a client's roster can never miss a transition.
 func (rt *AgentRuntime) transitionLocked(mut func()) {
 	mut()
 	close(rt.stateChanged)
 	rt.stateChanged = make(chan struct{})
+	rt.publishStateLocked()
+}
+
+// publishStateLocked emits a state record when the PROJECTED state has
+// changed since the last one, attributed to the agent's loop span. Must be
+// called with rt.mu held.
+//
+// Emitting under the lock is safe and deliberate: the OTel log pipeline is a
+// non-blocking batch processor, and serializing emission with the transition
+// that caused it is what keeps the published sequence faithful to the
+// runtime's actual history (two racing transitions can never publish out of
+// order).
+func (rt *AgentRuntime) publishStateLocked() {
+	if rt.spanCtx == nil {
+		// The loop has not started, so there is no span to attribute state
+		// to. Nothing is lost: start() publishes the initial state, and an
+		// inert entry's state is IDLE — exactly what a client projects for
+		// an agent it has never seen a record for.
+		return
+	}
+	state := rt.stateLocked()
+	if state == rt.emittedState {
+		return
+	}
+	rt.emittedState = state
+	EmitAgentState(rt.spanCtx, state, "")
 }
 
 // State projects the entry's lifecycle state from its facts.
@@ -727,7 +772,18 @@ func (rt *AgentRuntime) loop(ctx context.Context) {
 	// child->parent channel of design §3.1. Covers the Resume-retry
 	// relaunch too, which re-enters here on a fresh detached context.
 	ctx = AgentToContext(ctx, rt.self)
-	ctx, span := Tracer(ctx).Start(ctx, fmt.Sprintf("agent: %s", rt.name))
+	ctx, span := Tracer(ctx).Start(ctx, fmt.Sprintf("agent: %s", rt.name),
+		agentSpanAttrs(ctx, rt.name, rt.self)...)
+
+	// Publish the loop span as the agent's state channel, and seed it with
+	// the state the loop is starting in. Everything after this point flows
+	// through transitionLocked, which publishes on every change of the
+	// projection (design §3.3: telemetry is the directory).
+	rt.mu.Lock()
+	rt.spanCtx = ctx
+	rt.emittedState = ""
+	rt.publishStateLocked()
+	rt.mu.Unlock()
 
 	var loopErr error
 	defer func() {
