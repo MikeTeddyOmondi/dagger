@@ -520,8 +520,15 @@ type Staff {
       .changes(from: base)
     # Force the apply here; a swallowed failure would silently discard the
     # commit's work.
+    #
+    # Conflict markers only rescue a hunk that no longer matches; git refuses
+    # outright to create a file your tree already has, which is exactly the
+    # shape of a DIRTY conflict over an added path. Say so, since the remedy
+    # is the other branch of the conflict loop, not a retry.
     delta.isEmpty rescue { e: Error =>
-      raise `applying commit ${short(sha)} from worker "${name}" to your tree failed: ${e.message}`
+      raise `applying commit ${short(sha)} from worker "${name}" to your tree failed: ${e.message}` +
+        ` — if that is your own uncommitted work on those paths, commit or revert it and ` +
+        `pull(name: "${name}", commits: ["${short(sha)}"]) instead`
     }
 
     let note = if (clean) {
