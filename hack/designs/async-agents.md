@@ -628,6 +628,17 @@ core/integration/agent_runtime_test.go), ratified here:
   `Query.agents` therefore holds as an API contract and not merely as advice:
   the roster is a projection of the trace, an agent whose spans a client
   cannot see stays unreachable to it, and the schema gained nothing.
+  Verified end to end rather than argued: `TestRosterAddressing`
+  (core/integration/agent_runtime_test.go) runs a real OTLP hop into a
+  `dagui.DB` and asserts the rebuilt handle observes the *live* runtime —
+  facts a re-derived value could not fake, since re-deriving the composition
+  yields the same content digest and would land silently on a fresh inert
+  entry. Two facts the argument did not predict: the lookup's span is flagged
+  internal (nested `Select`) yet still carries its payload, which is exactly
+  what the walk needs; and `spawn`'s returned ID is the *handle* form of the
+  pinned chain (~24 bytes, an engine-local shared-result reference), while
+  the trace-rebuilt one is the *recipe* form (~350 bytes for a bare `llm`
+  seed, growing with the composition) — different encodings, same instance.
 - **Identity rides span attributes; state rides log records.** The split is
   forced by the export model, not chosen for tidiness. A live span is
   exported as a *snapshot taken at span start* (`LiveSpanProcessor.OnStart`
@@ -868,7 +879,9 @@ What is NOT built — threads to pull, each self-contained:
    (dagql/idtui/frontend_pretty.go:5055), degrading to a read-only entry
    when the digest does not resolve; then the rest of §5.1 — focus with
    per-agent drafts, the tmux keymap, and the `LLMSession` send-routing
-   refactor, which must land as one change.
+   refactor, which must land as one change. The risky half is de-risked:
+   that path is proven to yield a handle on the live runtime
+   (`TestRosterAddressing`, §9), so what remains here is UI wiring.
 2. **Enqueue guards** (§3.3): depth limiting, self-send rejection, cycle
    detection — none exist. Central point: the enqueue path in
    `AgentRuntimes` (`Send`). Until then `modules/staff` documents the
@@ -963,4 +976,34 @@ What is NOT built — threads to pull, each self-contained:
     imperative verbs — and the failure mode is expensive (silent duplicate
     work) and confusing (a roster full of agents that look busy but have lost
     their history). A roster (item 1) makes it more visible, not less.
+15. **Changeset replay loses tracked-ness** (known, pre-existing, unexplained
+    — started some time ago): the workspace's changeset machinery
+    intermittently forgets that a path is already tracked and treats it as
+    new content, so a surgical edit to a long-tracked file is recorded as a
+    whole-file ADD. Symptoms seen in one session, in increasing order of
+    consequence. (i) Commit summaries lie: two edits of a few lines each to
+    `dagql/dagui/db.go` and `dagql/dagui/spans.go` were reported as
+    `A +1303 -0` / `A +1141 -0`, and a ~45-line edit to
+    `dagql/idtui/frontend_pretty.go` as `A +7121 -0`, while an earlier commit
+    in the same session correctly reported `M` for `core/agent.go` — so it is
+    intermittent, and it began mid-session. (ii) A worker's commit of a
+    tracked file becomes a whole-file add, which the chief's `pull` then
+    cannot apply: it lands as CONFLICT (§9.1's CONTENT reason) even though
+    the worker changed only a dozen lines, and the real diff has to be
+    re-applied by hand — authorship lost for no reason. (iii) Worst: a worker
+    bootstrapped from a replayed changeset can materialize a source file with
+    git CONFLICT MARKERS in it (observed in `engine/telemetryattrs/attrs.go`,
+    markers landing exactly where the chief's edit had been inserted), which
+    fails the worker's own build and aborts `spawn` before its task ever
+    runs. That failure is then CACHED — a retry returned a byte-identical
+    error with the same traceparent and input digests, i.e. it never
+    re-executed — so the only recovery was recomposing the agent against the
+    current workspace. Both (ii) and (iii) were observed right after the
+    checkout moved under a live session (a deploy), which is the obvious
+    suspect but is not confirmed as necessary. Practical workarounds until
+    root-caused: take a conflicting worker commit's substance as edits rather
+    than fighting `pull`, and recompose after a checkout move. Not
+    agent-specific — it is a workspace-layer defect — but recorded here
+    because the staff workflow (spawn, harvest, pull) is where it keeps
+    surfacing.
 
