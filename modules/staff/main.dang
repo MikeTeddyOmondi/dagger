@@ -727,11 +727,23 @@ type Staff {
 
   # The worker's own copy of the workspace: Agent.snapshot is its last
   # committed conversation, and LLM.workspace the workspace bound to it.
-  # No rescue here — this only BUILDS a query, so a rescue could never fire
-  # (and the compiler says so). The harvest tools rescue at their own
-  # forcing points instead.
+  #
+  # `sync` is load-bearing, not decoration. Dang forces a lazy chain once per
+  # SELECTION off it, not once per `let` binding — and Agent.snapshot is
+  # DoNotCache, so every field a harvest tool reads off an unpinned `theirs`
+  # re-executes snapshot and lands on a DIFFERENT live snapshot as the worker
+  # steps. diffOf alone reads four; the resulting patch could mix trees.
+  # LLM.sync returns ID! @expectedType(LLM), which Dang forces at the call
+  # site and re-hydrates through node(id:) (hack/designs/async-agents.md §9),
+  # so the read happens exactly once and every later selection replays the
+  # lookup instead.
+  #
+  # The flip side: this FORCES, where the old chain only built a query, so a
+  # snapshot failure now surfaces here rather than at the harvest tool's own
+  # forcing point. Deliberate — reading a live member's snapshot does not
+  # fail in practice, and locating it earlier beats a torn harvest.
   let workerWorkspace(name: String!): Workspace! {
-    harvestTarget(name).snapshot.workspace
+    harvestTarget(name).snapshot.sync.workspace
   }
 
   # Resolve a caller-supplied sha against a worker's staged commits: exact
