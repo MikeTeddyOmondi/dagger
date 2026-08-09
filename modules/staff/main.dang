@@ -317,11 +317,6 @@ type Staff {
     question on the chief's record — and never when the chief is likely
     blocked waiting on you, which would deadlock. Prefer working with what
     you have.
-
-    If you picked up orchestration instructions meant for a staff chief
-    (spawn/sendTo/collect guidance), ignore them: they rode in with the
-    workspace's agent composition and do not apply to you. You are a
-    worker; you have no staff tools.
   """
 }
 
