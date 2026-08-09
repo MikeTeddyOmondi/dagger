@@ -29,22 +29,41 @@ package core
 // stop), spawn and send are ID-returning, sync-style: lazy clients force
 // the side effect at the call site, and re-hydrating the returned ID
 // replays the lookup, not the spawn/send.
+//
+// One test — TestRosterAddressing — reaches past the API and into the trace,
+// standing up an OTLP endpoint of its own and folding what the session's CLI
+// forwards to it into the same dagui.DB a frontend builds its roster from.
+// The round trip is the point: the client half of the agent directory
+// (design §3.3) is not an engine behaviour that GraphQL can be asked about —
+// it only exists once spans and log records have actually crossed the wire.
 
 import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"dagger.io/dagger"
+	"github.com/dagger/dagger/dagql/dagui"
 	"github.com/dagger/dagger/internal/buildkit/identity"
+	telemetry "github.com/dagger/otel-go"
 	"github.com/dagger/testctx"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/proto"
 )
 
 type AgentRuntimeSuite struct{}
@@ -956,4 +975,206 @@ func (AgentRuntimeSuite) TestMessageIdentity(ctx context.Context, t *testctx.T) 
 	fresh := spawnAgent(ctx, t, c, spawnOpts{model: emptyReplayModel, name: "never-ran"})
 	_, err = fresh.run(ctx, t, `message(id: "bogus") { delivery }`)
 	require.ErrorContains(t, err, "no runtime entry")
+}
+
+// agentTraceSink is the consumer half of the agent directory, stood up
+// in-process: an OTLP endpoint the session's CLI forwards engine telemetry
+// to, folded into the same dagui.DB a frontend builds its roster from.
+//
+// A frontend owns its DB single-threaded, so ingest (HTTP handler
+// goroutines) and the test's reads are serialized on one mutex rather than
+// the DB being made concurrent.
+type agentTraceSink struct {
+	mu     sync.Mutex
+	db     *dagui.DB
+	logExp sdklog.Exporter
+	base   string
+}
+
+func newAgentTraceSink(t *testctx.T) *agentTraceSink {
+	t.Helper()
+	db := dagui.NewDB()
+	sink := &agentTraceSink{db: db, logExp: db.LogExporter()}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/traces", sink.tracesHandler)
+	mux.HandleFunc("POST /v1/logs", sink.logsHandler)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(l) //nolint:errcheck
+	t.Cleanup(func() { srv.Close() })
+
+	sink.base = "http://" + l.Addr().String()
+	return sink
+}
+
+// clientOpts points the CLI session this client spawns at the sink. LIVE is
+// what makes a still-running agent's loop span arrive at all: without it the
+// CLI only forwards spans once they have ended.
+func (sink *agentTraceSink) clientOpts() []dagger.ClientOpt {
+	return []dagger.ClientOpt{
+		dagger.WithEnvironmentVariable("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", sink.base+"/v1/traces"),
+		dagger.WithEnvironmentVariable("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", sink.base+"/v1/logs"),
+		dagger.WithEnvironmentVariable("OTEL_EXPORTER_OTLP_TRACES_LIVE", "1"),
+	}
+}
+
+func (sink *agentTraceSink) tracesHandler(w http.ResponseWriter, r *http.Request) {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req coltracepb.ExportTraceServiceRequest
+	if err := proto.Unmarshal(body, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := sink.db.ExportSpans(r.Context(), telemetry.SpansFromPB(req.ResourceSpans)); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (sink *agentTraceSink) logsHandler(w http.ResponseWriter, r *http.Request) {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req collogspb.ExportLogsServiceRequest
+	if err := proto.Unmarshal(body, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := telemetry.ReexportLogsFromPB(r.Context(), sink.logExp, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+// read runs fn against the DB with ingest held off.
+func (sink *agentTraceSink) read(fn func(db *dagui.DB)) {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	fn(sink.db)
+}
+
+// TestRosterAddressing covers the claim §3.3 rests its whole no-namespace
+// argument on: that a client can turn what the trace advertises about an
+// agent back into a WORKING handle on that same live runtime. Without it the
+// roster is a read-only display and an agent you did not spawn is
+// unreachable — which is the capability a Query.agents namespace would have
+// provided, and which telemetry is supposed to provide instead.
+//
+// The path is the one branch-from-message already uses: the loop span's
+// dagger.io/agent.call.digest names a dagql call; the client finds the span
+// carrying that call digest, rebuilds the ID from the call payloads it has
+// ingested (Span.CallID walks receiver digests through the DB), encodes it,
+// and loads it. The digest names spawn's internal Select of the pure
+// agent(id:, name:) lookup — a span the UI hides as internal, but which
+// carries its call payload like any other, which is what makes this work.
+//
+// The identity assertions are deliberately ones a freshly derived agent
+// value could never satisfy. Re-deriving the composition yields a value with
+// the same content digest, so a broken reconstruction would not error — it
+// would silently land on a different, inert runtime, and the user would
+// prompt a corpse. So the test asserts on runtime facts: the FAILED state
+// and the transcript of a message only this instance ever received, and a
+// send that reports QUEUED (mail behind a tombstone) where an inert agent
+// would report STARTED.
+func (AgentRuntimeSuite) TestRosterAddressing(ctx context.Context, t *testctx.T) {
+	if _, nested := os.LookupEnv("DAGGER_SESSION_PORT"); nested {
+		// An inherited session is already attached to somebody else's
+		// frontend; only a CLI session this test starts can be pointed at
+		// the sink.
+		t.Skip("needs its own CLI session to forward telemetry to the sink")
+	}
+
+	sink := newAgentTraceSink(t)
+	c := connect(ctx, t, sink.clientOpts()...)
+
+	h := spawnAgent(ctx, t, c, spawnOpts{model: emptyReplayModel, name: "rostered"})
+
+	// A per-run marker, so "the reconstructed handle sees this runtime"
+	// cannot pass by coincidence.
+	marker := "roster marker " + identity.NewID()
+	delivery, err := h.sendNoWait(ctx, t, marker)
+	require.NoError(t, err)
+	require.Equal(t, "STARTED", delivery)
+
+	// The empty recording fails the first model call, so the loop lands in
+	// FAILED — a state no never-started agent can project, and one that
+	// also makes further sends QUEUED rather than STARTED.
+	state, err := h.waitFor(ctx, t, "FAILED")
+	require.NoError(t, err)
+	require.Equal(t, "FAILED", state)
+
+	// (1) The engine published the agent, and the client folded it into a
+	// roster entry: identity from the loop span's attributes, state from
+	// its log records.
+	var node *dagui.AgentNode
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		sink.read(func(db *dagui.DB) {
+			agents := db.Agents()
+			if !assert.Len(ct, agents, 1) {
+				return
+			}
+			if !assert.NotEmpty(ct, agents[0].CallDigest) ||
+				!assert.Equal(ct, "FAILED", agents[0].State) {
+				return
+			}
+			node = agents[0]
+		})
+	}, 60*time.Second, 100*time.Millisecond)
+	require.Equal(t, "rostered", node.Name)
+
+	// (2)+(3) The advertised digest names a call the client holds a payload
+	// for, and the whole receiver chain behind it reconstructs — the part
+	// that breaks if any ancestor's span never reached the client.
+	var encoded, display string
+	sink.read(func(db *dagui.DB) {
+		var match *dagui.Span
+		for _, span := range db.Spans.Map {
+			if span.CallDigest == node.CallDigest {
+				match = span
+				break
+			}
+		}
+		require.NotNil(t, match, "no span carries the advertised call digest")
+		require.Equal(t, "agent", match.Call().Field,
+			"the digest must name the pinned agent(id:, name:) lookup")
+
+		callID, err := match.CallID()
+		require.NoError(t, err)
+		display = callID.Display()
+		encoded, err = callID.Encode()
+		require.NoError(t, err)
+	})
+	// The rebuilt chain is the honest one spawn pinned, instance ID and
+	// all. (It is not byte-identical to what spawn returned: that is the
+	// compact handle form of the same value, this is the recipe form.)
+	require.Contains(t, display, fmt.Sprintf(`agent(id: %q, name: %q)`, node.ID, "rostered"))
+
+	// (4) The reconstructed handle addresses the SAME runtime, not a fresh
+	// inert one derived from the same composition.
+	rebuilt := &agentHandle{c: c, agentID: encoded}
+	require.Equal(t, "rostered", rebuilt.mustRun(ctx, t, `name`).Get("name").String())
+	require.Equal(t, "FAILED", rebuilt.state(ctx, t))
+	transcript, _ := rebuilt.snapshot(ctx, t)
+	require.Contains(t, transcript, marker)
+
+	// And it is sendable, which is the whole point: mail lands in the live
+	// mailbox, queued behind the tombstone a resume would drain. An inert
+	// agent would have reported STARTED.
+	delivery, err = rebuilt.sendNoWait(ctx, t, "sent to an agent this client never spawned")
+	require.NoError(t, err)
+	require.Equal(t, "QUEUED", delivery)
 }
