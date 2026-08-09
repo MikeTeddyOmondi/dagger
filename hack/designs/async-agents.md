@@ -567,6 +567,79 @@ core/integration/agent_runtime_test.go), ratified here:
   is a deadlock (the turn cannot end until the tool returns). Fire-and-forget
   sends to self are legal steering; awaits belong on *other* agents.
 
+### 9.1 Harvesting a worker's work
+
+Every worker gets its own `Workspace`, so anything it edits or commits is
+invisible to the chief until it is deliberately taken. `Workspace.commitsFrom`
+/ `withCommitsFrom` and the `modules/staff` harvest family
+(`logOf`/`diffOf`/`pull`/`pullConflicted`/`pullPending`) close that gap.
+Semantics ratified during implementation:
+
+- **Application is patch-based, never whole-file overlay.** `withChanges` is a
+  `ReplaceExisting` copy, so applying a worker changeset anchored at spawn
+  time would silently clobber the chief's newer edits. Each commit is applied
+  as a patch to the receiver's *current* content, so a commit still lands
+  cleanly when the receiver has moved on since the worker branched off.
+  Patch application is the merge; `withChanges` is only the write.
+- **Plan/apply split.** A pure planner (`commitsFrom`) classifies each of the
+  source's staged commits — PICKABLE, PICKED, REDUNDANT, or CONFLICT with a
+  reason (CONTENT / DIRTY) and the obstructing paths — and a strict apply
+  (`withCommitsFrom`) executes. Conflicts are *data*, not errors; but a commit
+  the caller explicitly asked for is never silently dropped, so the apply
+  raises on any conflict in its set. **Skip-and-continue is the module's
+  policy, not the engine's**: `pull` plans, then applies only the pickable
+  set, and reports the rest.
+- **The fold judges each candidate against the workspace that would exist if
+  every prior pickable candidate had been applied**, oldest first. The cascade
+  property falls out for free: a skipped commit never folds, so a later commit
+  building on it is patched against a tree lacking its pre-image and lands as
+  CONFLICT. Every fold step is a real dagql field selection, which is what
+  keeps a plan and the apply that follows it on the same cache entries — and
+  is why the planner cannot be an in-Go loop (N constructions would collide on
+  one call ID).
+- **Provenance collapses transitively to the root.** A replayed commit records
+  the original as its `origin`; replaying a commit that already carries an
+  origin records THAT origin, not the immediate source's hash. So a commit
+  pulled A → B → C still names the commit A staged, and a later pull straight
+  from A recognises it as already present.
+- **Dirty-path refusal.** A candidate touching a path the receiver has
+  uncommitted edits on is refused (DIRTY) rather than applied — git
+  cherry-pick's rule for a dirty worktree, and the guarantee that the chief's
+  WIP is never swept into a commit attributed to a worker. `git.unmanaged`
+  joins `git.uncommitted` in the dirty set: those edits are invisible to
+  `uncommitted` yet would be clobbered by a whole-file write.
+- **The reverse-apply probe is what makes REDUNDANT real.** `git apply`
+  refuses an already-applied patch rather than producing an identical tree, so
+  "the chief hand-merged the same fix" would otherwise be misreported as a
+  content conflict. A patch whose *reverse* applies cleanly is git's own
+  definition of already-applied (what `git am`/`rebase` use); it only runs
+  after a forward failure, and a partial hand-merge fails both directions and
+  stays CONFLICT. Correct.
+- **`pullConflicted` is deliberately NOT a mode of `pull`.** A commit must
+  never be staged with conflict markers inside it — that would put a broken
+  tree in history under the worker's name. So the resolution lands in the
+  chief's working tree, the commit that records it is the chief's, and the
+  worker's authorship is lost by construction; the original message is printed
+  for reuse, and a commit that would have applied cleanly gets an advisory
+  NOTE steering back to `pull`.
+- **`pullPending` re-anchors by intersecting with tree drift.** Naively
+  applying the worker's `uncommitted` patch to the chief's tree fails in the
+  COMMON case: the worker inherited the chief's pending edits at spawn, so its
+  patch contains hunks the chief already has, and `withPatch` is a plain
+  `git apply` with no 3-way. Scoping the patch to the paths where the two
+  trees genuinely differ removes whole-file overlap. Partial overlap *inside*
+  a file still fails — honestly, pointing at `markers: true`.
+- **Tombstones are what make WIP rescue possible.** `dismiss` files the
+  worker's handle away instead of dropping it, and the harvest family resolves
+  through live members *then* tombstones, so a forgotten `pullPending` is
+  still recoverable until the session ends. The steering tools keep resolving
+  through `member()` alone, so they can never address a corpse.
+- **The harvest reads the source only through already-materialized in-engine
+  values** (its recorded changesets), never through its host, so a worker's
+  workspace is classified without routing to its client. Only receiver reads
+  go through the host. Preserve this: pulling the source's host in would make
+  the operation depend on a second live client.
+
 ## 10. Alternatives considered
 
 
@@ -635,6 +708,20 @@ What is BUILT (see also §9 for ratified semantics):
   zero-arg `status` could never observe a state transition. Windowed
   reads (`read_agent`-style) are the module-side `read` projection over
   `snapshot.messages`, as predicted — no core work needed.
+- **Workspace harvesting** (§9.1): the core API is
+  `Workspace.commitsFrom` / `withCommitsFrom` (+ the internal
+  `__withReplayedCommit`), with `WorkspaceCommitPick` and its
+  status/reason enums, `WorkspaceStagedCommit.origin`, and
+  `WorkspaceRepoContainsCommits`; the chief-facing tools are
+  `modules/staff`'s `logOf`/`diffOf`/`pull`/`pullConflicted`/
+  `pullPending`, resolving the worker's workspace through
+  `member(name).snapshot.workspace` and a `tombstones` map so a dismissed
+  worker's WIP is still reachable. All five are `@cache(Never)` because
+  they read the worker's live snapshot, which is not part of the call's
+  arguments. Tests: `core/integration/workspace_commit_from_test.go`
+  (15 cases, including the drift, dirty-refusal, cascade and hand-merge
+  cases), plus a live end-to-end pass of the whole loop against real
+  workers.
 - **Tests**: `core/integration/agent_runtime_test.go` +
   `agent_injection_test.go` (fixture
   `testdata/modules/go/agent-poker`) + `staff_test.go` (E2E over the
@@ -687,6 +774,46 @@ What is NOT built — threads to pull, each self-contained:
    the first reload. Fresh arg-tuples always read live. Suspects: the
    module-function cache policy path (`core/modfunc.go`,
    `derivedCachePolicy`) or reload/re-serve interplay with cached
-   function metadata. Until root-caused, treat repeated same-arg module
-   reads in long reload-heavy sessions with suspicion.
+   function metadata. A related defect in the same area HAS since been
+   fixed — `Workspace.reloaded` used to mint a result for its own
+   (`PerCallInput`) call, stamping a nonce into the workspace ID that
+   every later edit inherited, so an agent that reloaded once re-declared
+   its modules on every subsequent edit; it now returns its parent's own
+   result. Whether that also explains the staleness is unconfirmed: the
+   staleness has not been reproduced since. Until root-caused, treat
+   repeated same-arg module reads in long reload-heavy sessions with
+   suspicion.
+9. **Chief prompt leak into workers**: the chief's system prompt rides
+   into workers via workspace compose. Known and mitigated by
+   `workerPrompt`'s closing paragraph (observed effective live); the same
+   class as `modules/delegate`'s documented leak. A real fix belongs in
+   composition, not prompting.
+10. **`Staff.read` counts SYSTEM entries toward `last`**, so small `last`
+    values return only boilerplate. Filtering the SYSTEM role is the
+    obvious fix.
+11. **Workers don't know their own staff name**: `name` is display
+    metadata on the runtime and never reaches the worker's conversation,
+    so a worker cannot refer to itself the way the chief addresses it.
+    Cheap fix — interpolate it into `workerPrompt` at spawn — with one
+    catch: recordings match `workerPrompt` byte for byte, so the
+    interpolation has to become part of the public constant's contract.
+12. **Idle notification (chief-side)**: the chief only learns a worker
+    went idle by polling `status` or blocking in `collect`. Natural fit:
+    on turn-end, push a "worker ⟨name⟩ went idle" message onto the
+    chief's queue — the same channel `askChief` already uses, so it
+    steers an open turn or wakes the chief, with no polling and none of
+    `collect`'s deadlock exposure. Could be a spawn opt-in
+    (`notifyOnIdle: true`) or an engine-level watch verb on Agent.
+13. **Harvest limitations worth revisiting** (§9.1): patch scoping
+    matches on `DiffStat.path` only, so a renamed file's old path can be
+    dropped from a scoped patch, leaving a half-applied rename
+    (`modules/review` has the same limitation, but `pullPending`
+    *applies* rather than displays, so the consequence is bigger — select
+    `oldPath` too). A tombstone re-selected in a NEW session projects
+    IDLE-from-absence and its `snapshot` is the SEED conversation, so
+    harvest silently returns "nothing new" rather than erroring; harvest
+    within the session. And once the chief SAVES a pulled commit and
+    reloads, the origin link is gone (it is engine-side metadata), so a
+    re-pull relies on REDUNDANT to notice — a durable fix needs the
+    origin in the commit object, as a trailer or a git note.
 
