@@ -513,9 +513,11 @@ func TestNavCycleWithNobodyToCycleTo(t *testing.T) {
 	// One agent: the strip is hidden, so the keys are not bound at all.
 	solo := focusTestFrontend(t, dagui.NewDB(), &focusShellHandler{target: "agent-chief"})
 	solo.enterNavMode(false)
-	require.False(t, solo.navCycleAgent(1))
+	pressNavKey(t, solo, ']')
+	pressNavKey(t, solo, '[')
+	require.False(t, solo.editlineFocused, "no strip, no cycle bindings")
+	require.False(t, solo.navCycleAgent(1), "the binding reports the no-op")
 	require.False(t, solo.navCycleAgent(-1))
-	require.False(t, solo.editlineFocused)
 
 	// Two agents, one of them watch-only: the strip is up, but there is still
 	// only one agent focus can move to -- itself.
