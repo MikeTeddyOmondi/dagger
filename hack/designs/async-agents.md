@@ -560,6 +560,22 @@ describe one conversation, so they follow focus, and session-wide totals move
 to the roster header. The alternative is a status line that lies about which
 conversation it is describing.
 
+**The tree follows focus too** (built; §11). The strip moved the prompt
+between agents while the tree above it kept showing the whole session, so
+switching told you nothing about what the agent you switched to was doing —
+the roster's own purpose, missing its other half. The scoping rides the
+conversation-PROMOTION axis, not the zoom axis, and that is a renunciation
+rather than a preference: focus could have been a write to `ZoomedSpan`, the
+existing "show me this subtree" mechanism, at a cost of about five lines, but
+zoom is navigation the user drives with enter/esc — so `esc` would silently
+un-follow the agent the prompt still addresses, and a switch would discard
+wherever the user had navigated to. Two cases deliberately keep the whole
+trace: no strip on screen, since a single-agent session's one agent already IS
+the whole conversation and narrowing it would change what every existing
+session renders; and a focused agent that has surfaced no turn yet, since
+promoting an empty set onto a Passthrough host is a blank screen rather than
+an empty conversation.
+
 Build order is **roster first, attention second**. Slice 1 is the engine's
 telemetry publication plus a read-only roster strip — no focus, no change
 to routing (both built; §11). Slice 2 is focus, per-agent drafts, and the
@@ -1043,6 +1059,30 @@ What is BUILT (see also §9 for ratified semantics):
   `dagql/idtui/agent_focus_test.go` (routing, Ctrl-C, focus keys in both
   input modes, the cycle's consecutive taps and request coalescing, drafts,
   read-only entries, and the trace push that makes the strip re-render).
+- **Roster conversation switching** (§5.1): the tree above the strip follows
+  focus. `dagql/dagui/conversation.go` gains `SurfacedConversationForAgent`,
+  keyed on the AGENT rather than a span — a resume relaunches the loop under
+  a fresh span, so an agent owns several loop spans over its life and scoping
+  to `AgentNode.Span()` alone would silently drop everything said before the
+  last relaunch — with a memo slot of its own, since the whole-trace memo is
+  single-entry and keyed by root while both are read on the same render.
+  Promotion splits into `PromoteConversationNodesTo` plus a matching
+  `DemoteConversationNodesFrom`: promotion is an ADD into a set that outlives
+  the render (it mutates the cached, reused DB's spans), so it can express a
+  fixed scope but not a CHANGE of scope, and a switch that skipped the
+  withdrawal would reveal both agents' transcripts at once rather than
+  switching between them. `promoteConversationLocked`
+  (`dagql/idtui/frontend_pretty.go`) chooses the scope and withdraws the
+  previous one; focus invalidates the view as well as the strip, checked
+  against focus alone so the state flags — which fingerprint in the same
+  place and change far more often — do not force a recalculation. Tests:
+  `dagql/dagui/agent_conversation_test.go` (scoping, the relaunch union, memo
+  independence, and withdrawal reaching nested reveals) and
+  `dagql/idtui/agent_conversation_focus_test.go` (switching re-scopes and
+  retracts, zoom is untouched, an agent with nothing said keeps the session).
+  NOT verified: `TestTelemetry/TestGolden` renders through this same
+  promotion path but needs an engine to warm up, so it is item 7's
+  outstanding CI confirmation with a live reason to run it.
 - **CLI prompt mode** (`internal/cmd/dagger/session_agent.go`, `shell.go`,
   `dagql/idtui/frontend_pretty.go`): submit = send + resume + await,
   re-rooting on `snapshot` at turn end; mid-turn submissions send
@@ -1398,11 +1438,12 @@ What is NOT built — threads to pull, each self-contained:
     records an ADD, and its commit is unpullable. It does not by itself
     explain a chief-side sighting like this one, so either the guard has a
     second hole or there are two causes.
-    Confirmation experiment, which nobody has run: assert that a file absent
-    from `TouchedPaths` but present on the host reports `MODIFIED` after an
-    edit, driven through a module-held workspace. If it reports `ADDED`, this
-    is the bug, and the fix is to stop sizing a correctness-bearing diff base
-    by an optimization's path set.
+    Confirmation experiment [RUN — see below: it reported `MODIFIED`, and
+    refuted this suspect]: assert that a file absent from `TouchedPaths` but
+    present on the host reports `MODIFIED` after an edit, driven through a
+    module-held workspace. If it reports `ADDED`, this is the bug, and the fix
+    is to stop sizing a correctness-bearing diff base by an optimization's
+    path set.
     **A seventh sighting, and the sharpest evidence yet, because it caught the
     two anchors disagreeing at the same instant.** A worker committing a
     146-line edit to an existing file reported, from `status` immediately
@@ -1426,6 +1467,67 @@ What is NOT built — threads to pull, each self-contained:
     experiment: what would close it is the confirmation test already described,
     driven through a module-held workspace whose parent overlay's touched set
     excludes the edited path.
+    **The confirmation experiment has now been RUN, and it REFUTES the
+    suspect.** `core/integration/workspace_module_edit_test.go`
+    (`WorkspaceSuite.TestWorkspaceModuleEditOfUntouchedTrackedFile`, fixture
+    `testdata/modules/go/workspace-editor`) drives a surgical edit to a
+    long-tracked, host-present file through a module-held workspace whose
+    parent overlay's touched set excludes that path, and reads THREE anchors:
+    the overlay `changes`, `git.uncommitted`, and the staged commit's own
+    changeset — the projection the seventh sighting reported as `A +1488`. All
+    three report `MODIFIED +1 -1`, in all three cases (client-side control;
+    module, pristine workspace; module, after an unrelated write). 9/9, green
+    across four runs; the test is unskipped, as a regression guard.
+    **The premise is false: a workspace handed to a module does NOT stop being
+    client-local.** Measured by temporarily instrumenting `overlayEdit` (added,
+    measured, reverted — `core/schema/workspace.go` is untouched):
+
+        edit 1: hostPath=/work clientLocalBase=true source=ClientLocal
+                parentTouched=[]            editTouched=[scratch.txt]  branch=sparse-host
+        edit 2: hostPath=/work clientLocalBase=true source=Overlay/ClientLocal
+                parentTouched=[scratch.txt] editTouched=[tracked.txt]  branch=sparse-host
+
+    `ClientLocalBase()` reads the source TYPE and `HostPath()` a recorded
+    field; both travel with the value across the module boundary, because the
+    module receives the workspace by ID and re-evaluates it in the owning
+    session, with `withWorkspaceClientContext` routing host reads back through
+    the owning client. So the guard at workspace.go:2591 holds,
+    `overlayWorkspaceWithMutation` is never reached, and `touchedAll` contains
+    the edited path before the base is sized. The sixth sighting's "a workspace
+    handed to a MODULE is exactly one that stops being client-local" is simply
+    not true, and the predictions drawn from it go with it.
+    **What survives, and it is most of the diagnosis.** The seventh sighting's
+    anchor disagreement is untouched: the sparse `Before` is still the anchor
+    that lies, `buildDiffStats` still decides ADDED vs MODIFIED against a base
+    sized by `TouchedPaths`, and this is still a path-accumulation bug rather
+    than a tracking one. What falls is only the explanation of HOW a workspace
+    reaches that state. The structural requirement can now be stated exactly:
+    the failure needs a MIXED state — a parent overlay carrying a host-derived
+    SPARSE `Changes.Before` together with an edit taking the FULL-ROOT branch.
+    Both-sparse accumulates touched paths correctly; both-full diffs against a
+    full tree. So the search narrows to whatever strips host-ness while KEEPING
+    a host-derived overlay. Nothing in-tree does that through the public API
+    (`SetSource` appears only in `overlayEdit`, `overlayWorkspaceWithMutation`
+    and the two synthetic constructors, which build fresh workspaces;
+    `SetHostPath` only in tests). The one candidate is
+    `decodePersistedWorkspaceSource`, where `NewWorkspaceSourceClientLocal("")`
+    keeps `ClientLocalBase()` true while `hostPath` is empty — precisely
+    full-root-branch-over-sparse-`Before`. That, plus the agent-snapshot route
+    (`workerWorkspace` = `harvestTarget(name).snapshot.sync.workspace`) and a
+    restart or checkout-move boundary, is where the next measurement belongs.
+    **What the experiment does NOT cover**, stated because a green run is weak
+    evidence against an intermittent defect. The module receives its workspace
+    by contextual auto-injection of an omitted `Workspace!` argument; a staff
+    worker receives a BOUND one (`WorkspaceFromContext`) through
+    `Agent.snapshot`. That route is untested, and it is the population every
+    real sighting came from — if anything rewrites the source there, the
+    trigger lives there and this test cannot see it. Also absent: any session
+    boundary (no restart, no `ctrl+s`, no checkout move between the writes),
+    which is exactly the condition sightings (ii) and (iii) were observed
+    under. And the host-backed workspace is a container git repo reached by
+    nested privileged exec rather than a laptop checkout, though the test
+    asserts `clientLocalBase=true` so it cannot silently degenerate into a
+    value-workspace test.
 15. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
     broken from a session that stopped before resolving it, and it is still
     unknown whether the test or the code is wrong — hence skipped rather
