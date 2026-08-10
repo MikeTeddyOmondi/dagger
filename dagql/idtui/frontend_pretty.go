@@ -149,6 +149,9 @@ type frontendPretty struct {
 	// from the trace, so the roster can render them as read-only rather than
 	// letting a failed rebuild look like a working entry.
 	unaddressableAgents map[string]bool
+	// agentRosterState fingerprints what the strip last rendered, so the
+	// trace can push updates into it without re-rendering every frame.
+	agentRosterState string
 
 	// logProvider lazily fetches a span's logs on demand (e.g. on expand, or
 	// when a failure is surfaced). The bool is whether to roll up descendant
@@ -2173,6 +2176,7 @@ func (fe prettySpanExporter) ExportSpans(ctx context.Context, spans []sdktrace.R
 			}
 		}
 		fe.updateTestViews()
+		fe.updateAgentRoster()
 		// Don't recalculate here — set dirty flag so Render coalesces
 		// multiple ExportSpans batches into one recalculate per frame.
 		fe.viewDirty = true
@@ -2245,6 +2249,9 @@ func (fe prettyLogExporter) Export(ctx context.Context, logs []sdklog.Record) er
 			fe.updateLogPagerForLogs(spanID)
 		}
 		fe.updateTestViews()
+		// Agent state rides the log stream (design §9), so a state change
+		// arrives here rather than on a span.
+		fe.updateAgentRoster()
 		fe.Update()
 	})
 	return nil
@@ -3712,12 +3719,14 @@ func (fe *frontendPretty) focusAgent(entry AgentRosterEntry) bool {
 				fe.restoreAgentDraft(previous)
 				fe.markAgentUnaddressable(entry.ID)
 				fe.setPromptError(fmt.Errorf("focus %q: %w", entry.Name, err))
+				fe.updateAgentRoster()
 				fe.Update()
 			})
 			return
 		}
 		fe.dispatch(func() {
 			fe.lastFocusedAgent = previous
+			fe.updateAgentRoster()
 			fe.Update()
 		})
 	})
@@ -3787,6 +3796,27 @@ func (fe *frontendPretty) agentRosterHeight() int {
 		return 0
 	}
 	return fe.agentRoster.Height()
+}
+
+// updateAgentRoster re-renders the strip when the published roster has
+// changed. Components render only when marked dirty, and the roster's content
+// comes from the trace rather than from a setter, so this is where the trace
+// pushes it: on span batches (an agent appearing) and on log records (an
+// agent's state changing), plus whenever focus moves.
+func (fe *frontendPretty) updateAgentRoster() {
+	if fe.agentRoster == nil {
+		return
+	}
+	var fingerprint strings.Builder
+	for _, entry := range fe.agentRosterEntries() {
+		fmt.Fprintf(&fingerprint, "%s\x00%s\x00%s\x00%t\x00%t\n",
+			entry.ID, entry.Name, entry.State, entry.Focused, entry.ReadOnly)
+	}
+	if fingerprint.String() == fe.agentRosterState {
+		return
+	}
+	fe.agentRosterState = fingerprint.String()
+	fe.agentRoster.Update()
 }
 
 // reportTestRoot is surfaceRoot for the TESTS section.
