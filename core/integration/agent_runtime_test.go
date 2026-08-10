@@ -30,13 +30,13 @@ package core
 // the side effect at the call site, and re-hydrating the returned ID
 // replays the lookup, not the spawn/send.
 //
-// Two tests — TestRosterAddressing and TestRosterAddressingFromModule —
-// reach past the API and into the trace, standing up an OTLP endpoint of
-// their own and folding what the session's CLI forwards to it into the same
-// dagui.DB a frontend builds its roster from. The round trip is the point:
-// the client half of the agent directory (design §3.3) is not an engine
-// behaviour that GraphQL can be asked about — it only exists once spans and
-// log records have actually crossed the wire.
+// The three TestRosterAddressing* tests reach past the API and into the
+// trace, standing up an OTLP endpoint of their own and folding what the
+// session's CLI forwards to it into the same dagui.DB a frontend builds its
+// roster from. The round trip is the point: the client half of the agent
+// directory (design §3.3) is not an engine behaviour that GraphQL can be
+// asked about — it only exists once spans and log records have actually
+// crossed the wire.
 
 import (
 	"context"
@@ -47,6 +47,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1340,3 +1341,176 @@ func (AgentRuntimeSuite) TestRosterAddressingFromModule(ctx context.Context, t *
 	require.NoError(t, err)
 	require.Equal(t, "QUEUED", delivery)
 }
+
+// newHostWorkspaceRoot creates a temp directory workspace detection accepts
+// as a boundary: detection walks up to a .git and stops there
+// (core/workspace/detect.go:62-81), so an empty one is enough to make the
+// session's currentWorkspace this directory rather than whatever the test
+// harness happened to inherit — which is the point, since the composition
+// under test has to be one the test controls.
+func newHostWorkspaceRoot(t *testctx.T) string {
+	t.Helper()
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "dagger.toml"),
+		[]byte("# workspace\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "root.txt"),
+		[]byte("from workspace root"), 0o600))
+	return root
+}
+
+// queryID runs a query with no variables and returns the ID at the given
+// gjson path. Raw rather than typed because the three workspace shapes below
+// differ only in their selection.
+func queryID(ctx context.Context, t *testctx.T, c *dagger.Client, query, path string) dagger.ID {
+	t.Helper()
+	res := map[string]any{}
+	require.NoError(t, c.Do(ctx,
+		&dagger.Request{Query: query},
+		&dagger.Response{Data: &res},
+	))
+	raw, err := json.Marshal(res)
+	require.NoError(t, err)
+	out := gjson.Get(string(raw), path)
+	require.True(t, out.Exists() && out.String() != "",
+		"no ID at %s in response: %s", path, raw)
+	return dagger.ID(out.String())
+}
+
+// TestRosterAddressingHostWorkspace is TestRosterAddressing with a workspace
+// bound into the seed — the one thing every real composition has and the two
+// passing roster tests happen to lack. A bare llm() seed carries no workspace
+// at all, so those tests establish that the mechanism CAN work, not that it
+// works for the compositions users actually drive (design §11.2).
+//
+// The three cases differ only in where the workspace comes from, and that
+// alone decides whether addressing survives:
+//
+//   - host directory workspace — host.directory(…).asWorkspace(), a
+//     replayable, digest-stable leaf.
+//   - session workspace — Query.currentWorkspace, which is NotReplayable and
+//     carries PerCallInput/PerSessionInput (core/schema/workspace.go:35-40),
+//     i.e. deliberately mints a fresh value on every evaluation.
+//   - session workspace overlay — the same, plus an edit, to separate the
+//     sparse-overlay machinery from currentWorkspace itself. It is not the
+//     overlay: this case fails exactly like the bare one.
+//
+// What breaks is not the walk. Every frame resolves, the ID rebuilds, and
+// the handle reads back its own name and instance ID — those are literals in
+// the recipe. But a telemetry-rebuilt ID is the RECIPE form (design §9), so
+// USING it re-executes the chain; a fresh currentWorkspace means a fresh
+// seed, a different agent value, and therefore a different key in
+// AgentRuntimes, which is keyed on the agent value's content digest
+// (core/agent.go:201-232). The lookup misses, and a miss is indistinguishable
+// from a never-started agent — Get never creates, and IDLE-with-seed-snapshot
+// is the honest projection of one. So the handle looks healthy and addresses
+// a corpse, which is strictly worse than failing loudly.
+//
+// The assertions are split at exactly that seam: everything up to and
+// including the literal-derived identity RUNS for all three cases (and is
+// real coverage — it is what would catch the loud, walk-side failure), and
+// only the runtime-identity assertions past it are skipped where the defect
+// bites. When the registry stops keying on the value digest, deleting the
+// skip is the whole change.
+func (AgentRuntimeSuite) TestRosterAddressingHostWorkspace(ctx context.Context, t *testctx.T) {
+	if _, nested := os.LookupEnv("DAGGER_SESSION_PORT"); nested {
+		t.Skip("needs its own CLI session to forward telemetry to the sink")
+	}
+
+	for _, tc := range []struct {
+		name string
+		// query selects a workspace ID; the client's workdir is the
+		// temp-dir workspace root, so relative host paths resolve to it.
+		query  string
+		idPath string
+		// broken, when set, is why the runtime-identity assertions are
+		// skipped for this case.
+		broken string
+	}{
+		{
+			name:   "host directory workspace",
+			query:  `{ host { directory(path: ".") { asWorkspace { id } } } }`,
+			idPath: "host.directory.asWorkspace.id",
+		},
+		{
+			name:   "session workspace",
+			query:  `{ currentWorkspace { id } }`,
+			idPath: "currentWorkspace.id",
+			broken: "known-broken: re-executing a recipe containing currentWorkspace " +
+				"mints a fresh workspace, so the rebuilt handle's agent value digest " +
+				"misses AgentRuntimes and projects IDLE; see async-agents.md §11.2 mode B",
+		},
+		{
+			name: "session workspace overlay",
+			query: `{ currentWorkspace {
+				withNewFile(path: "probe.txt", contents: "probe") { id }
+			} }`,
+			idPath: "currentWorkspace.withNewFile.id",
+			broken: "known-broken: same as the bare session workspace -- the overlay is " +
+				"not the trigger, currentWorkspace is; see async-agents.md §11.2 mode B",
+		},
+	} {
+		t.Run(tc.name, func(ctx context.Context, t *testctx.T) {
+			root := newHostWorkspaceRoot(t)
+			sink := newAgentTraceSink(t)
+			c := connect(ctx, t, append(sink.clientOpts(), dagger.WithWorkdir(root))...)
+
+			h := spawnAgent(ctx, t, c, spawnOpts{
+				model: emptyReplayModel,
+				name:  "rostered",
+				wsID:  queryID(ctx, t, c, tc.query, tc.idPath),
+			})
+
+			// A per-run marker, so "the reconstructed handle sees this
+			// runtime" cannot pass by coincidence.
+			marker := "roster marker " + identity.NewID()
+			delivery, err := h.sendNoWait(ctx, t, marker)
+			require.NoError(t, err)
+			require.Equal(t, "STARTED", delivery)
+
+			// The empty recording fails the first model call, so the loop
+			// lands in FAILED — a state no never-started agent can project,
+			// which is what makes IDLE-from-absence detectable at all.
+			state, err := h.waitFor(ctx, t, "FAILED")
+			require.NoError(t, err)
+			require.Equal(t, "FAILED", state)
+
+			node := sink.awaitAgent(t, "FAILED")
+			require.Equal(t, "rostered", node.Name)
+
+			// The walk closes: every frame of a workspace-carrying chain
+			// reached this client. This is the half that fails loudly when
+			// it fails, and it passes in all three cases — a workspace in
+			// the seed is not what breaks the reconstruction.
+			rebuilt, rebuiltID := sink.rebuild(t, c, node)
+			require.Contains(t, rebuiltID.Display(),
+				fmt.Sprintf(`agent(id: %q, name: %q)`, node.ID, "rostered"))
+
+			// Read off the chain's own literals, so these hold even when the
+			// handle addresses nothing. They are asserted anyway, precisely
+			// so the failure below cannot be mistaken for a mangled chain.
+			require.Equal(t, "rostered",
+				rebuilt.mustRun(ctx, t, `name`).Get("name").String())
+			require.Equal(t, node.ID,
+				rebuilt.mustRun(ctx, t, `instanceID`).Get("instanceID").String())
+
+			if tc.broken != "" {
+				t.Skip(tc.broken)
+			}
+
+			// Everything past here comes from the runtime registry rather
+			// than the recipe, which is what addressing has to reach.
+			require.Equal(t, "FAILED", rebuilt.state(ctx, t))
+			transcript, _ := rebuilt.snapshot(ctx, t)
+			require.Contains(t, transcript, marker)
+
+			// And it is sendable: mail lands in the live mailbox, queued
+			// behind the tombstone a resume would drain. An inert agent
+			// would have reported STARTED.
+			delivery, err = rebuilt.sendNoWait(ctx, t, "sent to an agent this client never spawned")
+			require.NoError(t, err)
+			require.Equal(t, "QUEUED", delivery)
+		})
+	}
+}
+
