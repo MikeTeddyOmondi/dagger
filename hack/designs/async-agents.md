@@ -1352,6 +1352,46 @@ What is NOT built — threads to pull, each self-contained:
     false conclusion was written into §11.1 as guidance before the human
     caught it. Worth stating for whoever root-causes this: the summary is not
     just cosmetic, it is evidence that other agents will reason from.
+    **Not fixed. A sixth sighting, and the first mechanism that is more than a
+    guess.** A ~41-line prose edit to this document committed as `A +1514 -0`
+    — whole file — in a session whose immediately preceding commit was a
+    `pull` of a worker's commit. Minutes later a fresh edit to the same file
+    reported `M +2 -0`, so it remains intermittent and there is still no
+    deterministic repro.
+    What is new is that the verdict's provenance is now known, and it is not
+    git's. `ADDED` vs `MODIFIED` is decided in `buildDiffStats`
+    (core/changeset.go:629) from `computeChangesetPathsDelta(before, after)`,
+    and for a host-backed workspace the BEFORE tree is deliberately **sparse**:
+    `sparseHostBase` (core/schema/workspace.go:2677-2705) builds it as
+    `host.directory(path: ".", include: <TouchedPaths>)` — only the paths the
+    overlay has accumulated. So "loses tracked-ness" is a misnomer that has
+    been steering the search wrong: nothing consults git's index, and the file
+    is not mistaken for untracked. It is genuinely absent from the tree it is
+    diffed against, because its path was not in `TouchedPaths` when that base
+    was sized. **This is a path-accumulation bug, not a tracking bug** — which
+    explains why the symptom is a whole-file ADD rather than a wrong line
+    count, and why the summary is not merely cosmetic: a staged commit's own
+    changeset is computed against that same sparse base
+    (core/schema/workspace_commit.go:221-250), so `pull` really does receive
+    an add.
+    The specific suspect, unconfirmed: `overlayWorkspaceWithMutation`
+    (workspace.go:2511-2554) re-bases a new overlay on the PARENT overlay's
+    `Changes.Before` — sparse, for a host-backed parent — while passing `nil`
+    for `TouchedPaths`, on the stated assumption that it is only ever reached
+    for value/git/rootless workspaces. `overlayEdit` upholds that today by
+    branching on `ws.HostPath() == "" || !ws.ClientLocalBase()` (:2591). But a
+    workspace handed to a MODULE is exactly one that stops being client-local
+    while carrying a host-derived sparse overlay — which is every staff
+    worker, and which is the §9.1 asymmetry recorded above. That predicts
+    sightings (ii) and (iii) precisely: a worker editing a long-tracked file
+    records an ADD, and its commit is unpullable. It does not by itself
+    explain a chief-side sighting like this one, so either the guard has a
+    second hole or there are two causes.
+    Confirmation experiment, which nobody has run: assert that a file absent
+    from `TouchedPaths` but present on the host reports `MODIFIED` after an
+    edit, driven through a module-held workspace. If it reports `ADDED`, this
+    is the bug, and the fix is to stop sizing a correctness-bearing diff base
+    by an optimization's path set.
 15. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
     broken from a session that stopped before resolving it, and it is still
     unknown whether the test or the code is wrong — hence skipped rather
@@ -1455,11 +1495,26 @@ What is NOT built — threads to pull, each self-contained:
     `Directory` has a receiver whose span never carried a payload. Which one
     is not yet measured — the walk names the REFERRING frame by field and
     type, while the missing receiver survives only as a digest, and
-    "`directory`" alone does not identify it. Candidates by reading: the
-    workspace rootfs materialization selects `host` and then `directory(…)`
-    off the root (core/schema/workspace.go:913-916), making `Query.host` the
-    receiver of a `directory` call in every host-rooted workspace chain; a
-    `Directory.directory(path)` parent is the other shape.
+    "`directory`" alone does not identify it. The leading candidate came out
+    of item 14's investigation: `sparseHostBase`
+    (core/schema/workspace.go:2696-2701) selects `host` and then
+    `directory(path:, include:)` off the root, so **`Query.host` is the
+    receiver of a `directory` call in every host-backed workspace chain** —
+    and every staff worker's composition carries one, via the chief's
+    workspace. What makes it fit rather than merely qualify: `host` takes no
+    arguments, so it has exactly ONE call digest for the whole session, and
+    `ShouldEmitTelemetry` dedupes per digest per session (core/telemetry.go:81)
+    — one emission, ever. If that single emission lands where this client
+    cannot ingest it (a nested module session) or under a suppressed context
+    (`IsSkipped`, introspection, `isMeta`), then no host-rooted chain in that
+    session is rebuildable, while the `directory` frame above it still
+    publishes normally from any of its many arg-distinct digests. That is
+    exactly the observed shape: a hole one level up the receiver spine,
+    beneath a frame that resolved fine.
+    It also explains the scope gap §9 admitted without knowing its cause:
+    `TestRosterAddressing`'s bare `llm` seed touches no workspace, so it
+    carries no `host` frame and rebuilds — the tests are not wrong, they are
+    blind to this shape.
     The mechanism that would produce exactly this: span emission is per
     selected step in `AroundFunc` (core/telemetry.go:31-105), which returns
     before recording a payload for introspection frames, `isMeta` frames
