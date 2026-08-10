@@ -1038,23 +1038,20 @@ What is NOT built — threads to pull, each self-contained:
    `workerPrompt`'s closing paragraph (observed effective live); the same
    class as `modules/delegate`'s documented leak. A real fix belongs in
    composition, not prompting.
-10. **`Staff.read` counts SYSTEM entries toward `last`**, so small `last`
-    values return only boilerplate. Filtering the SYSTEM role is the
-    obvious fix.
-11. **Workers don't know their own staff name**: `name` is display
+10. **Workers don't know their own staff name**: `name` is display
     metadata on the runtime and never reaches the worker's conversation,
     so a worker cannot refer to itself the way the chief addresses it.
     Cheap fix — interpolate it into `workerPrompt` at spawn — with one
     catch: recordings match `workerPrompt` byte for byte, so the
     interpolation has to become part of the public constant's contract.
-12. **Idle notification (chief-side)**: the chief only learns a worker
+11. **Idle notification (chief-side)**: the chief only learns a worker
     went idle by polling `status` or blocking in `collect`. Natural fit:
     on turn-end, push a "worker ⟨name⟩ went idle" message onto the
     chief's queue — the same channel `askChief` already uses, so it
     steers an open turn or wakes the chief, with no polling and none of
     `collect`'s deadlock exposure. Could be a spawn opt-in
     (`notifyOnIdle: true`) or an engine-level watch verb on Agent.
-13. **Harvest limitations worth revisiting** (§9.1): patch scoping
+12. **Harvest limitations worth revisiting** (§9.1): patch scoping
     matches on `DiffStat.path` only, so a renamed file's old path can be
     dropped from a scoped patch, leaving a half-applied rename
     (`modules/review` has the same limitation, but `pullPending`
@@ -1071,7 +1068,7 @@ What is NOT built — threads to pull, each self-contained:
     different live snapshot (§9's scope correction) — `diffOf` alone reads
     four, so its patch could mix trees, and the tools' documented contract
     of reading the worker's LAST COMMITTED step was not what they did.
-14. **A session restart silently RE-ANIMATES workers** (§4, §3.3): observed
+13. **A session restart silently RE-ANIMATES workers** (§4, §3.3): observed
     live — after restarting a client session, a `modules/staff` chief's
     workers reported `RUNNING` again, while their `snapshot` had degraded to
     the SEED conversation (system prompt plus opening task, none of the work
@@ -1122,13 +1119,13 @@ What is NOT built — threads to pull, each self-contained:
     duplicate work into a loud save-time failure. None landed: this is a hole
     in §4's cross-session identity story rather than a defect in `send`, and
     every option changes engine-wide semantics.
-    Adjacent to item 13's note that a tombstone re-selected in a NEW session
+    Adjacent to item 12's note that a tombstone re-selected in a NEW session
     projects IDLE-from-absence with the seed as its snapshot, but distinct
     and worse: there the re-selection is inert, here it has side effects. The
     failure mode is expensive (silent duplicate work) and confusing (a roster
     full of agents that look busy but have lost their history). A roster
     (item 1) makes it more visible, not less.
-15. **Changeset replay loses tracked-ness** (known, pre-existing, unexplained
+14. **Changeset replay loses tracked-ness** (known, pre-existing, unexplained
     — started some time ago): the workspace's changeset machinery
     intermittently forgets that a path is already tracked and treats it as
     new content, so a surgical edit to a long-tracked file is recorded as a
@@ -1158,7 +1155,7 @@ What is NOT built — threads to pull, each self-contained:
     agent-specific — it is a workspace-layer defect — but recorded here
     because the staff workflow (spawn, harvest, pull) is where it keeps
     surfacing.
-16. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
+15. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
     broken from a session that stopped before resolving it, and it is still
     unknown whether the test or the code is wrong — hence skipped rather
     than deleted or "fixed" by adjusting the assertion until it passes. It
@@ -1178,7 +1175,7 @@ What is NOT built — threads to pull, each self-contained:
     agent's recorded history can disagree with what it actually sends, which
     §3.2's influence⇔append rule forbids; and the `replay/` provider's
     byte-for-byte history matching would be the only thing that ever notices.
-    Worth pairing with item 11 (workers not knowing their own name), which
+    Worth pairing with item 10 (workers not knowing their own name), which
     also wants to interpolate into `workerPrompt` and would move the same
     seed boundary.
 
