@@ -455,6 +455,45 @@ wrong verb for it. `tab` is unavailable for any of them: it is already the
 input-mode binding (frontend_pretty.go:2421,:4552) and the completion menu
 consumes it.
 
+All three keys are bound in **both input modes**. At the prompt they can only
+be modified ones — the digits themselves have to keep typing — and
+`alt+<digit>` is the most contested chord there is: editors, browsers and
+terminal emulators all spend it on tab switching, so for many users the
+keypress never arrives at all. Nav mode is a modal context where unmodified
+keys are the vocabulary, so it carries the same jumps on bare `1`…`9` and the
+last-focused toggle on `` ` `` (tmux's `l` is nav mode's expand); the `alt+`
+bindings stay for everyone they do reach, since this adds a path that always
+works rather than replacing one. It also settles a live false affordance: the
+strip already printed `1:chief* 2:scout` in nav mode, where those numbers did
+nothing at all.
+
+Nav mode additionally binds the `[`/`]` cycle the paragraph above renounced.
+That renunciation stands as far as it went — the toggle, not the cycle,
+answers the two-agent ping-pong, which is why nav mode binds the toggle too —
+but it was an argument about the common case, not about a roster long enough
+that finding an agent's number is itself the work, where stepping along the
+strip beats counting it. Not `ctrl+[`, the obvious pairing, and not because
+it cannot be read: tuist enables the Kitty keyboard protocol's disambiguate
+mode unconditionally, under which `esc` arrives as `CSI 27 u` and `ctrl+[` as
+`CSI 91;5u` — genuinely distinct. The objection is that it is *ambiguous*:
+every terminal without that protocol (Terminal.app, older xterm, tmux/screen,
+conhost) sends `ctrl+[` as the bare 0x1B byte, which decodes as plain `esc`,
+and nothing here consults `HasKittyKeyboard` to tell the two worlds apart. It
+would be a real key for some users and a silent Esc for the rest — and even
+where it works it is muscle memory for Esc, so taking it breaks Esc for
+exactly the users whose terminal is good enough to give it to us.
+
+The keys **split by verb** on whether they return to the prompt. A digit or
+the toggle *names* a destination, so it hands the prompt back: that is the
+whole point of the per-agent draft below, which only pays off if the next
+keystroke is the message. The cycle *surveys*, and is meant to be tapped until
+you land on the one you want, so it stays in nav mode — a cycle key that
+switched modes would type its own second press into the input. The strip's `*`
+marker is its feedback instead, which is why focus is believed on the keypress
+and confirmed afterwards rather than waiting on the round-trip that retargets
+the handler. All of them bind only while the strip is on screen: an unmodified
+key may not be swallowed to address something invisible.
+
 **Focus is moved only by a keypress, never by an event.** An agent that
 needs the user *advertises* attention on its roster entry; the user decides
 when to go. Attention taken rather than advertised would drop a message into
@@ -913,18 +952,29 @@ What is BUILT (see also §9 for ratified semantics):
   conversation, so `dropAgent` stops only what the session spawned and
   clearing an attached conversation can never kill somebody else's worker.
   Frontend half in `dagql/idtui/frontend_pretty.go`: `alt+1…9` jump to a
-  roster entry and `alt+l` toggles back to the last (tmux's idioms, minus
-  the next/prev cycle), each agent keeps its own draft, and an agent the
-  session does not already drive is attached to through a handle rebuilt
-  from the trace via `encodedIDForCallDigest` — factored out of
-  `llmBranchID`, so branch-from-message and roster addressing share the one
-  proven path. A failed rebuild marks the entry read-only rather than faking
-  a handle. Submission asks the target first and queues only behind a serial
-  turn; Ctrl-C interrupts the focused runtime (§9). `Agent.instanceID` is
-  what correlates a held handle with its roster entry. Tests:
-  `internal/cmd/dagger/session_agent_test.go` (routing, ownership and
-  interrupt policy against a fake runtime, no engine) and
-  `dagql/idtui/agent_focus_test.go` (routing, Ctrl-C, focus keys, drafts,
+  roster entry and `alt+l` toggles back to the last (tmux's idioms), with
+  nav mode carrying both on unmodified keys — `1`…`9` and `` ` `` — plus a
+  `[`/`]` cycle, since `alt+<digit>` is routinely eaten upstream. The keys
+  split by verb: naming an agent returns to the prompt, the cycle stays in
+  nav mode so it can be tapped. Focus is believed on the keypress and
+  confirmed after (`pendingFocusAgent`), which is what the strip's `*`
+  marker and the cycle's next step both read — the handler's target is only
+  re-pointed on the shell goroutine, so counting from it would step from
+  where focus has been rather than where it is going — and one request is
+  allowed out at a time, so a burst of taps attaches where the user landed
+  instead of to every agent walked past. Each agent keeps its own draft, and
+  an agent the session does not already drive is attached to through a
+  handle rebuilt from the trace via `encodedIDForCallDigest` — factored out
+  of `llmBranchID`, so branch-from-message and roster addressing share the
+  one proven path. A failed rebuild marks the entry read-only rather than
+  faking a handle, and the cycle steps over such entries rather than
+  reporting one the user never named. Submission asks the target first and
+  queues only behind a serial turn; Ctrl-C interrupts the focused runtime
+  (§9). `Agent.instanceID` is what correlates a held handle with its roster
+  entry. Tests: `internal/cmd/dagger/session_agent_test.go` (routing,
+  ownership and interrupt policy against a fake runtime, no engine) and
+  `dagql/idtui/agent_focus_test.go` (routing, Ctrl-C, focus keys in both
+  input modes, the cycle's consecutive taps and request coalescing, drafts,
   read-only entries, and the trace push that makes the strip re-render).
 - **CLI prompt mode** (`internal/cmd/dagger/session_agent.go`, `shell.go`,
   `dagql/idtui/frontend_pretty.go`): submit = send + resume + await,
