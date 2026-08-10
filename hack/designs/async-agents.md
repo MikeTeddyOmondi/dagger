@@ -1433,6 +1433,47 @@ What is NOT built — threads to pull, each self-contained:
     "verified end to end" as scoped to compositions that carry no
     post-evaluation object argument, which the two roster tests happen to
     satisfy and real staff sessions do not.
+    **Reproduced with the diagnostic in, and it named the frame — but not the
+    one predicted.** Live, same session, focusing a `modules/staff` worker
+    spawned minutes earlier:
+
+        agent "scoper" cannot be addressed: cannot rebuild ID for "agent"
+        (Agent): call xxh3:b034a1d294a17bec, referenced as receiver of
+        "directory" (Directory) never reached this client
+
+    The diagnostic half does its job: one named frame instead of ×13
+    `failed to decode receiver Call` wrappers. And it settles the question it
+    was built to settle — **the gap is on the receiver spine, not behind an
+    argument.** The two hops are distinguished by construction (`receiver of
+    …`, dagql/dagui/extract.go:80, versus `argument %q of …`, :84), so the
+    leading hypothesis above is ruled out for this occurrence: no handle-form
+    `Result.ID()` sits in an ID-literal argument here. It remains possible for
+    other compositions, but it should stop being the first thing to measure —
+    which also means roster addressing is NOT broken by construction for
+    object-routing compositions, the worst reading this item entertained.
+    What the evidence does say is narrower: some `directory` call returning
+    `Directory` has a receiver whose span never carried a payload. Which one
+    is not yet measured — the walk names the REFERRING frame by field and
+    type, while the missing receiver survives only as a digest, and
+    "`directory`" alone does not identify it. Candidates by reading: the
+    workspace rootfs materialization selects `host` and then `directory(…)`
+    off the root (core/schema/workspace.go:913-916), making `Query.host` the
+    receiver of a `directory` call in every host-rooted workspace chain; a
+    `Directory.directory(path)` parent is the other shape.
+    The mechanism that would produce exactly this: span emission is per
+    selected step in `AroundFunc` (core/telemetry.go:31-105), which returns
+    before recording a payload for introspection frames, `isMeta` frames
+    (`node`, `id`, `sync`, anything returning `Error`) and anything under an
+    inherited `IsSkipped` context. A frame that only ever materializes inside
+    a suppressed subtree publishes nothing, while a later unsuppressed
+    selection of its CHILD still publishes — leaving a hole one level up the
+    receiver spine, which is the shape observed. Unconfirmed.
+    Next measurement, and it is cheaper than the argument-side investigation
+    it replaces: have the walk report the referring call's own digest and
+    arguments alongside the missing receiver's digest. That turns "some
+    `directory` call" into a frame findable in the trace, and the receiver it
+    wanted is then identifiable by inspection rather than by guessing which
+    of two shapes it was.
 
 ### 11.1 Notes for live QA
 
