@@ -1451,6 +1451,8 @@ What is NOT built — threads to pull, each self-contained:
     seed boundary.
 16. **A staff-spawned worker can be unaddressable from the roster in the SAME
     session** (§3.3, §9) — distinct from item 13, which needs a restart.
+    **RESOLVED — read "Mode A: RESOLVED" in §11.2 first; everything below is
+    the investigation that led there, kept for its dead ends.**
     Observed live: a worker spawned through `modules/staff` rendered on the
     roster carrying the read-only marker, and focusing it failed with
 
@@ -1484,7 +1486,11 @@ What is NOT built — threads to pull, each self-contained:
     1: the referring frame now carries its own digest and arguments, so it is
     findable in the trace rather than merely named — the errors quoted below
     are the older field-and-type-only shape.)
-    **Unproven, and the first thing to measure.** The error bottoms out behind
+    **Unproven, and the first thing to measure.** [SUPERSEDED — this whole
+    hypothesis was REFUTED BY CONSTRUCTION; see "Mode A: RESOLVED" in §11.2.
+    An ID literal in a recorded call is recipe-form or the engine panics
+    (`mustBeRecipe`). Kept only so the reasoning is not re-derived.] The error
+    bottoms out behind
     an **argument**, not on the receiver spine. `modules/staff` passes
     post-evaluation objects around (`source: Workspace!`, the bound
     `[Agent!]`), and §4.1 and §9 both measured that a post-evaluation
@@ -1608,6 +1614,14 @@ What is NOT built — threads to pull, each self-contained:
 
 ### 11.2 Handoff: fixing roster switching
 
+**STATUS.** MODE A (the loud "never reached this client") is FIXED, tested and
+explained below — a recurrence is a bug report, not an expected condition.
+MODE B (the silent IDLE-from-absence) is untouched and is the only thing left
+here; it is blocked on an owner's decision between (a)/(b)/(c) below, not on
+another measurement. If you are picking this up to test a TUI fix: switching
+to a worker whose seed carries `currentWorkspace` will STILL land on an inert
+IDLE handle, and that is Mode B, expected, not a regression of the fix.
+
 Written at the end of a session that investigated ONLY this, so the next one
 does not re-derive it. Everything below is about **switching between agents in
 the TUI failing** — item 16's territory. It is deliberately separate from item
@@ -1625,16 +1639,18 @@ addressing still failed. Fix the implementation, not the persistence story.
 first thing to do with any new report, because they need opposite fixes:
 
 - **MODE A, loud.** `Span.CallID` cannot rebuild the chain and fails with
-  `cannot rebuild ID for "agent" (Agent): call <digest>, referenced as
-  receiver of "directory" (Directory) never reached this client`. The roster
-  marks the entry read-only (`·`). This is the observed live failure.
-  **Not root-caused.**
+  `cannot rebuild ID for "agent" (Agent): call <digest> never reached this
+  client, referenced as …`. The roster marks the entry read-only (`·`).
+  **ROOT-CAUSED AND FIXED** — see "Mode A: resolved" below. A recurrence is
+  now a bug report, not an expected condition, and the error names the frame
+  to chase.
 - **MODE B, silent and worse.** The chain rebuilds COMPLETELY, and the handle
   then addresses a different, inert entry: `state` reads `IDLE` while the live
   runtime is something else, and `name`/`instanceID` read back CORRECTLY
   because they are literals in the recipe and never touch the registry. A
   handle that looks healthy and points at nothing. **Root-caused and
-  measured.**
+  measured, NOT fixed** — it is the only one of the two still open, and what
+  it needs is a decision, not a measurement.
 
 **Mode B: the mechanism, settled.** `AgentRuntimes` keys entries on the
 agent VALUE's content digest (`agentKey` → `ContentPreferredDigest`,
@@ -1694,36 +1710,80 @@ item 16). More usefully, the same probe established that the plain
 client-side workspace chain rebuilds COMPLETELY. So the gap is not in a
 client-issued composition, which is most of the search space gone.
 
-**Mode A: the next two measurements, in order.**
+**Mode A: RESOLVED.** Root cause, fix and remaining edge all measured in one
+session. Read this before touching anything telemetry-shaped.
 
-1. **DONE.** The walk now reports the referring call's own digest and
-   arguments next to the missing receiver's digest (`dagql/dagui/extract.go`:
-   `missingCall`, `frameRef`, `frameDetail`; covered by `extract_test.go`).
-   It used to name the referrer by field and type alone — "some `directory`
-   call", of which a real chain has several — while the missing receiver
-   survives only as a digest, because its payload is precisely what never
-   arrived. A gap now reads
+*The live repro that cracked it.* With the diagnostic above in a built CLI,
+focusing a `modules/staff` worker gave:
 
-       cannot rebuild ID for "agent" (Agent): call xxh3:b034a1d294a17bec
-       never reached this client, referenced as receiver of "directory"
-       (Directory) xxh3:1a2b3c4d5e6f7a8b(path: "/src", include: ["**/*.go"])
+    agent "scout" cannot be addressed: cannot rebuild ID for "agent" (Agent):
+    call xxh3:47ab2dce6d1d5b1e never reached this client, referenced as
+    argument "directory" of "withSkills" (LLM)
+    xxh3:edf3a4032b78d5df(directory: xxh3:47ab2dce6d1d5b1e)
 
-   so the referring frame is greppable in the trace and its arguments
-   normally identify the missing receiver by inspection. An ID-literal
-   argument renders as the digest it points at, which is what traces a gap
-   behind an argument to the argument holding it; every unbounded lane
-   (string length, list length, argument count) is capped, since an argument
-   can carry a whole file and this lands in an error message. Two notes for
-   readers: "never reached this client" moved next to the digest it is about,
-   so the strings quoted in item 16 and under MODE A above are the OLD shape;
-   and this has not yet been exercised against a live MODE A failure, which
-   is measurement 2's job.
-2. **Then reproduce on the untested dimension**: `TestRosterAddressingFromModule`
-   with a host-backed workspace threaded through the module. That is the
-   shape the live failure actually had and the one no test covers — a chain
-   built inside a module call, with a module-held `source: Workspace!` and
-   host reads routed through `withWorkspaceHostReadContext` for another
-   client.
+Note this is an ARGUMENT gap, where the earlier occurrence recorded in item 16
+was on the receiver spine. Both shapes are the same defect; neither is special.
+
+*The handle-form hypothesis is REFUTED BY CONSTRUCTION, not merely unproven.*
+Item 16 spent a long time on "maybe a post-evaluation `Result.ID()` handle
+form is embedded as an argument, and no span can ever publish it". It cannot
+happen: `NewLiteralID` and `LiteralID.pb()` both call `id.mustBeRecipe(...)`,
+which PANICS on a handle-form ID (dagql/call/literal.go:71-77, :110-117;
+dagql/call/id.go:110-114). Any ID literal in a recorded call is recipe-form or
+the engine crashes. Do not re-derive this.
+
+*The actual mechanism.* A call payload only ever reached a client as an
+attribute on the span emitted for that exact selection — ONE `callpbv1.Call`
+proto, base64'd into `dagger.io/dag.call` (core/telemetry.go:92-105). So the
+walk needed every frame to have been independently spanned, and whole classes
+never are: `LiteralID.pb()` flattens an embedded ID's entire DAG to a bare
+digest reference; `AroundFunc` returns early for skipped/introspection/isMeta
+frames and for digests the per-session span dedupe already spent; array
+members are never selected. Sharpest of all, and measured rather than
+reasoned: **loading an ID never re-selects the calls behind it** —
+`Server.LoadType` serves handle IDs straight from the result cache and
+`loadRecipeVertex` short-circuits the subtree on a digest hit
+(dagql/server.go:1338, :1530-1539) — so an ID that enters a session from
+OUTSIDE it (another client, a handed-over ID, anything already cached)
+contributes zero spans, and every frame behind it is permanently unresolvable
+to that client. That is what the live `withSkills` failure was.
+
+*The fix, shipped.* Call payloads now also travel as OTel LOG records
+(core/dag_call_telemetry.go producer, dagql/dagui/callpayloads.go consumer,
+vocabulary in engine/telemetryattrs), modelled on the agent-state records that
+already ride that channel. Emission is the TRANSITIVE CLOSURE of a call's ID,
+minus digests already claimed from a session-wide seen-set
+(`dagql.ShouldEmitCallPayload`) — and the span channel claims into that same
+set, so logs only ever fill gaps rather than duplicating spans. The claim
+key space is namespaced away from `ShouldEmitTelemetry`'s: sharing it would
+suppress the span of every frame in a closure. `dagger.io/dag.call` is
+untouched, so this is additive in both directions of version skew. Crucially
+`extractIntoDAG` and `Span.CallID` needed NO change — that was the acceptance
+criterion, and it held.
+
+*Base64, not bytes, and why it looked tempting.* The log data model has a
+Bytes kind, but bytes do not survive the first hop: `telemetry.LogValueToPB`
+has no `KindBytes` case and silently encodes such a value as the string
+`"INVALID"` (measured). Upstream fix filed: dagger/otel-go#16. Until that
+lands and is bumped, base64 is not a preference, it is a requirement.
+
+*Still open, deliberately.* (1) **Array members** — `TestArrayMemberSubSelection`
+(core/integration/callid_rebuild_test.go) is SKIPPED, and its comment carries
+the measurement and the next move; the closure walk goes through
+`ResultCall.RecipeID`, which an array-member receiver appears to defeat.
+(2) **Dedupe is session-wide but delivery is per-client**, so a NEW nested
+client created after a digest was claimed never receives it. Not a regression
+(it would not have had the span either), but if a consumer can ever attach
+fresh mid-session and rebuild IDs, the claim set has to become per-client.
+(3) `DB.CallPayloads` still has no pruning path.
+
+*Tests that pin this.* `TestRosterAddressingWithSkills`
+(core/integration/agent_roster_skills_test.go) — three cases by who built the
+skills directory: client-built and module-built rebuild fine, and
+directory-from-another-session is the one that failed and now passes. Note
+this REFUTES the "reproduce through a module call" measurement this section
+used to recommend: nested-session spans ARE forwarded, so a module-built
+chain was never the problem.
 
 **Lost work, RECREATED.** A probe test, `TestRosterAddressingHostWorkspace`,
 was written and measured but lost with its worker's workspace before it could
@@ -1794,11 +1854,13 @@ session by hand:
 - **Harvest inside the session that spawned the worker** (item 12): a
   tombstone re-selected later projects IDLE-from-absence with the seed as its
   snapshot, so harvest silently reports "nothing new" rather than failing.
-- **A worker you spawned this session may still be roster-unaddressable**
-  (item 16). The strip marks it read-only (`·` after the name) and focusing it
-  fails with a wall of `failed to decode receiver Call`. Nothing is wrong with
-  the worker: steer and harvest it through the chief's tools as usual. Do not
-  read the marker as "the agent died".
+- **A worker you spawned this session may focus onto a CORPSE** (§11.2 mode
+  B). The loud read-only marker (`·` after the name) is fixed as of the
+  call-payload channel, so an entry that renders normally can still address
+  nothing: `state` reads `IDLE` while the worker is really running or failed,
+  and `name` reads back correctly because it is a literal. The tell is a
+  state that disagrees with what `staff.status` says. Nothing is wrong with
+  the worker: steer and harvest it through the chief's tools as usual.
 - **A worker's commit on this document may be unpullable, via item 14.** When
   the changeset machinery loses tracked-ness, a small prose edit is recorded
   as a whole-file ADD, and `pullConflicted` then refuses it — an add cannot
