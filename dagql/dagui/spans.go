@@ -172,7 +172,7 @@ func (span *Span) CallID() (*call.ID, error) {
 	// rebuildable and the caller must degrade (a read-only roster entry, no
 	// branch-from-message) rather than act on a truncated chain.
 	if missing := extractIntoDAG(recipe, span.db, spanCall.Digest); len(missing) > 0 {
-		return nil, fmt.Errorf("cannot rebuild ID for %s: %s never reached this client",
+		return nil, fmt.Errorf("cannot rebuild ID for %s: %s",
 			frameLabel(spanCall), missing[0])
 	}
 	dag := &callpbv1.DAG{
