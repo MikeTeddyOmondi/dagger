@@ -586,7 +586,17 @@ type Staff {
     # with no 3-way — it rejects an already-applied hunk. Restrict the patch
     # to the files where the two trees genuinely differ. Partial overlap
     # INSIDE a file still fails; that is what markers: true is for.
-    let drift = theirs.directory("/").changes(from: base).diffStats.{{path}}.map { s => s.path }
+    # Both sides of a rename, because the two views disagree about it: a
+    # rename is ONE diffStat, keyed on the new path with oldPath alongside,
+    # while asPatch runs `git diff --no-renames` (rename headers do not
+    # survive --no-prefix) and so spells it out as a delete section naming
+    # only the old path plus an add section naming only the new one. Scoping
+    # on `path` alone drops the delete and half-applies the rename: the new
+    # file lands, the old one is never removed. oldPath is null for every
+    # other kind, and an empty scope would match the whole tree, so drop it.
+    let driftStats = theirs.directory("/").changes(from: base).diffStats.{{path, oldPath}}
+    let drift = driftStats.map { s => s.path } +
+      driftStats.map { s => s.oldPath ?? "" }.filter { p => p != "" }
     if (drift.isEmpty) {
       print(`Worker "${name}" has nothing your workspace does not already have.`)
       return base.changes(from: base)
