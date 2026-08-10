@@ -75,9 +75,11 @@ func AroundFunc(
 		return ctx, dagql.NoopDone
 	}
 	var q *Query
+	var seenKeys dagql.TelemetrySeenKeyStore
 	if currentQuery, currentQueryErr := CurrentQuery(ctx); currentQueryErr == nil {
 		q = currentQuery
-		if seenKeys, seenKeysErr := q.TelemetrySeenKeyStore(ctx); seenKeysErr == nil {
+		if store, seenKeysErr := q.TelemetrySeenKeyStore(ctx); seenKeysErr == nil {
+			seenKeys = store
 			if !dagql.ShouldEmitTelemetry(ctx, seenKeys, callDigest.String(), req.DoNotCache) {
 				return ctx, dagql.NoopDone
 			}
@@ -154,6 +156,14 @@ func AroundFunc(
 
 	ctx, span := Tracer(ctx).Start(ctx, spanName, trace.WithAttributes(attrs...))
 	initCacheEvidence(span, req)
+
+	// The span above carries this one frame's payload as DagCallAttr. Publish
+	// the rest of the chain over the log channel, so a client can rebuild the
+	// ID even for the frames that structurally never get a span of their own
+	// (see core/dag_call_telemetry.go). Attributed to the span just started,
+	// which is always a valid span context — the per-client log store drops
+	// records that have none.
+	recordCallPayloads(ctx, seenKeys, callDigest.String(), req.ResultCall)
 
 	return ctx, func(res dagql.AnyResult, cached bool, err *error) {
 		slog.InfoContext(ctx, "end call",
