@@ -130,8 +130,11 @@ source = "github.com/vito/dagger-go@go-doc"
 [env.dev.modules.golang.settings]
 base = "engine-dev:go-container"
 
-[env.dev.modules.delegate]
-source = "modules/delegate"
+[env.dev.modules.staff]
+source = "modules/staff"
+
+# [env.dev.modules.delegate]
+# source = "modules/delegate"
 
 [env.dev.modules.review]
 source = "modules/review"
