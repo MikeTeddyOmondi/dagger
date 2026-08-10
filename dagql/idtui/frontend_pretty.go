@@ -166,6 +166,18 @@ type frontendPretty struct {
 	// agentRosterState fingerprints what the strip last rendered, so the
 	// trace can push updates into it without re-rendering every frame.
 	agentRosterState string
+	// lastRosterFocus is the focused agent as of the last roster update, so a
+	// change of FOCUS can invalidate the view without the state flags -- which
+	// also fingerprint above, and change far more often -- doing so too.
+	lastRosterFocus string
+	// The conversation currently promoted into the live tree, and the agent
+	// it is scoped to (empty for the whole trace). Promotion is an ADD into
+	// the host's RevealedSpans, so switching agents has to withdraw the
+	// previous scope by hand -- these three remember exactly what to
+	// withdraw. See promoteConversationLocked.
+	promotedConversationAgent string
+	promotedConversation      []*dagui.MessageNode
+	promotedConversationHost  *dagui.Span
 
 	// logProvider lazily fetches a span's logs on demand (e.g. on expand, or
 	// when a failure is surfaced). The bool is whether to roll up descendant
@@ -4069,6 +4081,17 @@ func (fe *frontendPretty) updateAgentRoster() {
 	if fe.agentRoster == nil {
 		return
 	}
+	// The strip is no longer the only thing focus drives: the live tree is
+	// promoted per focused agent (see promoteConversationLocked), so a focus
+	// change has to invalidate the view too. Checked ahead of the fingerprint
+	// below, and against focus alone: this is the one place every focus path
+	// converges on -- focusAgent believing a switch, and the handler's
+	// completion confirming or rolling it back -- while the fingerprint also
+	// covers state flags, which change often and do not move the transcript.
+	if focused := fe.focusedAgentID(); focused != fe.lastRosterFocus {
+		fe.lastRosterFocus = focused
+		fe.viewDirty = true
+	}
 	var fingerprint strings.Builder
 	for _, entry := range fe.agentRosterEntries() {
 		fmt.Fprintf(&fingerprint, "%s\x00%s\x00%s\x00%t\x00%t\n",
@@ -4161,11 +4184,64 @@ func (fe *frontendPretty) promoteConversationLocked() {
 		// The host is itself a message: there is no setup noise above it to hide.
 		return
 	}
-	fe.db.PromoteConversationTo(host)
+	scope, nodes := fe.conversationToPromote()
+	// Withdraw the previous scope before wiring the new one: promotion only
+	// adds, so a switch that skipped this would reveal both agents' transcripts
+	// at once (see DB.DemoteConversationNodesFrom).
+	if fe.promotedConversationHost != nil &&
+		(fe.promotedConversationAgent != scope || fe.promotedConversationHost != host) {
+		fe.db.DemoteConversationNodesFrom(fe.promotedConversationHost, fe.promotedConversation)
+	}
+	fe.db.PromoteConversationNodesTo(host, nodes)
+	fe.promotedConversationAgent = scope
+	fe.promotedConversation = nodes
+	fe.promotedConversationHost = host
 	host.Passthrough = true
 	if !fe.ZoomedSpan.IsValid() {
 		fe.ZoomedSpan = fe.db.PrimarySpan
 	}
+}
+
+// conversationToPromote is the transcript the live tree should show, and the
+// agent it is scoped to ("" for the whole trace).
+//
+// This is the read side of "the tree follows focus". It deliberately moves the
+// PROMOTION axis and not the zoom axis: zoom is navigation the user drives with
+// enter/esc, so focusing an agent by writing ZoomedSpan would make esc silently
+// un-follow the agent it is still routing messages to, and would discard
+// whatever the user had zoomed to before they switched.
+//
+// Two cases fall back to the whole trace rather than narrowing:
+//
+//   - No roster strip on screen. A single-agent session's one agent IS the
+//     whole conversation, so scoping buys nothing and would change what every
+//     existing non-roster session renders.
+//   - The focused agent has surfaced nothing yet -- freshly spawned, or its
+//     first turn has not reached this client. Promoting an empty set marks the
+//     host Passthrough with nothing revealed, i.e. a blank screen; showing the
+//     session until it speaks is the honest reading of "no transcript yet".
+func (fe *frontendPretty) conversationToPromote() (string, []*dagui.MessageNode) {
+	whole := func() (string, []*dagui.MessageNode) {
+		return "", fe.db.SurfacedConversation()
+	}
+	if fe.agentRoster == nil || !fe.agentRoster.Visible() {
+		return whole()
+	}
+	focused := fe.focusedAgentID()
+	if focused == "" {
+		return whole()
+	}
+	for _, agent := range fe.db.Agents() {
+		if agent.ID != focused {
+			continue
+		}
+		if nodes := fe.db.SurfacedConversationForAgent(agent); len(nodes) > 0 {
+			return focused, nodes
+		}
+		return whole()
+	}
+	// Focused on an agent the trace no longer lists.
+	return whole()
 }
 
 // promoteGeneratorsLocked is the `dagger generate` analog of
