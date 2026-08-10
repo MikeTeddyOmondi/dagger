@@ -1332,6 +1332,19 @@ What is NOT built — threads to pull, each self-contained:
     the corrupted file broke the module parse, and the broken parse is what
     stranded item 13's dismisses, so a workspace-layer defect disabled the
     cleanup path for an agent-layer one.
+    **A fifth sighting, on this document, with a new consequence: it
+    misleads.** A ~50-line prose edit to this file was recorded `A +1231 -0`,
+    while a ~160-line edit to the same file minutes later in the same session
+    recorded correctly as `M +160 -7` — the clearest demonstration yet that
+    the defect is intermittent within a single session. Two costs beyond the
+    lying summary. The whole-file add made a worker's doc commits unpullable:
+    `pullConflicted` cannot apply an add onto a file that already exists, so
+    two commits had to be replayed by hand and their author lost. And the
+    symptom was misdiagnosed — an agent inferred from the whole-file add that
+    the document was untracked, a chief believed it without checking, and the
+    false conclusion was written into §11.1 as guidance before the human
+    caught it. Worth stating for whoever root-causes this: the summary is not
+    just cosmetic, it is evidence that other agents will reason from.
 15. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
     broken from a session that stopped before resolving it, and it is still
     unknown whether the test or the code is wrong — hence skipped rather
@@ -1377,8 +1390,14 @@ session by hand:
 - **Harvest inside the session that spawned the worker** (item 12): a
   tombstone re-selected later projects IDLE-from-absence with the seed as its
   snapshot, so harvest silently reports "nothing new" rather than failing.
-- **This document is untracked upstream**, so its changesets record as
-  whole-file adds. A worker's doc commit therefore cannot be applied with
-  `pullConflicted` onto a tree that already has the file — replay the prose
-  by hand and commit it yourself, at the cost of the worker's authorship.
+- **A worker's commit on this document may be unpullable, via item 14.** When
+  the changeset machinery loses tracked-ness, a small prose edit is recorded
+  as a whole-file ADD, and `pullConflicted` then refuses it — an add cannot
+  apply onto a file that already exists ("already exists in working
+  directory"). Replay the prose by hand and commit it yourself, at the cost
+  of the worker's authorship. Do NOT infer from the whole-file add that the
+  file is untracked: this document is committed, and a comparable edit
+  minutes later in the same session recorded correctly as `M`. That wrong
+  inference was made here, believed, and written into this section as fact
+  before being caught.
 
