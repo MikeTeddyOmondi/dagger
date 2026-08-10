@@ -1528,6 +1528,27 @@ What is NOT built — threads to pull, each self-contained:
     nested privileged exec rather than a laptop checkout, though the test
     asserts `clientLocalBase=true` so it cannot silently degenerate into a
     value-workspace test.
+    **An eighth sighting, minutes after the refutation above and on the same
+    document — which is what makes it useful.** Committing the very edit that
+    recorded the refutation, `status` reported `M +107 -5` and the commit that
+    immediately followed recorded `A +1976 -0`, the whole file. That is the
+    seventh sighting's anchor disagreement exactly, reproduced seconds apart —
+    but CHIEF-side this time: an ordinary client-local workspace, no module
+    holding it, no worker, no restart, no checkout move. Content was intact
+    (no conflict markers, the file reads correctly), so this is the reporting
+    failure alone.
+    It matters because of its timing. The module explanation had just been
+    measured away, so a chief-side occurrence cannot fall back on it, and
+    "either the guard has a second hole or there are two causes" is no longer
+    a hedge — the second cause is now the only one with evidence. Note also
+    what did NOT misreport: three other files first touched in that same
+    session (`dagql/dagui/conversation.go`, `dagql/dagui/db.go`,
+    `dagql/idtui/frontend_pretty.go`) committed correctly as `M` from the same
+    workspace minutes earlier. Same session, same client-local host workspace,
+    all first-touched that session, and one of them reports a whole-file add.
+    Whatever the discriminator is, it is not module-holding, not
+    tracked-ness, and not "the path was never touched before" — which
+    together retire most of what this item has assumed for six sightings.
 15. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
     broken from a session that stopped before resolving it, and it is still
     unknown whether the test or the code is wrong — hence skipped rather
