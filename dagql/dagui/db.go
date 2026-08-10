@@ -193,6 +193,15 @@ type DB struct {
 	surfacedConversationRoot SpanID
 	surfacedConversationInit bool
 
+	// The agent-scoped conversation gets a memo slot of its own rather than
+	// sharing the one above: both are consulted on the same render (the
+	// roster scopes the live tree while the report stays zoom-scoped), and a
+	// single slot keyed by root would make them evict each other every frame.
+	agentConversation     []*MessageNode
+	agentConversationAt   uint64
+	agentConversationID   string
+	agentConversationInit bool
+
 	surfacedGenerators     []*GeneratorNode
 	surfacedGeneratorsAt   uint64
 	surfacedGeneratorsRoot SpanID
