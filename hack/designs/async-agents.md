@@ -1338,8 +1338,133 @@ What is NOT built — threads to pull, each self-contained:
     discard of worker WIP; and a staff-wide reset has `dismiss`'s shape with
     none of its bookkeeping. The real defect is narrower and lives in the
     §9.1 asymmetry recorded under item 14.
-14. **Changeset replay loses tracked-ness** (known, pre-existing, unexplained
-    — started some time ago): the workspace's changeset machinery
+14. **Changeset replay loses tracked-ness** — the name is a misnomer, kept
+    only so the history below still reads. The defect is **a staged commit's
+    delta diffed against a stale sparse base**.
+    **ROOT-CAUSED AND FIXED. Read to the end of this paragraph block and
+    stop; everything from "The investigation as it ran" onward is that
+    investigation as it happened, kept for its dead ends and because its
+    eight sightings are the evidence the diagnosis had to fit.**
+    **The mechanism.** `stagedCommitChanges` (core/schema/workspace_commit.go)
+    derived commit N's own changes by diffing its staged tree against commit
+    N-1's staged tree: `before = commits[index-1].Committed.After`. Every
+    `WorkspacePendingCommit.Committed` is *cumulative* and anchored on the
+    overlay's `Before` **as it stood when that commit was staged**, and for a
+    host-backed workspace that base is sparse — `host.directory` including
+    only the paths touched so far (`sparseHostBase`). `TouchedPaths` grows
+    with every edit, so the earlier tree sits on a strictly narrower base,
+    and a path whose FIRST edit falls after the previous commit was staged is
+    absent from it altogether. The step then reports that path as a
+    whole-file ADD at its full content. Two diff anchors, sized at different
+    instants; the older one lies.
+    **The tell, and why it looked intermittent for eight sightings:** commit
+    index 0 anchors on its own `Committed.Before` — the current base, which
+    does contain the path — so **the first commit of a session is always
+    right**. Everything else follows: "began mid-session"; the same file
+    reported `A` and then correctly `M` minutes later (by then the path was
+    in the previous commit's tree); a session whose preceding commit was a
+    `pull`, which stages commits the same way. The rule is
+    `edit X, commit, first-edit Y, commit` ⇒ Y reports `A +<whole file>`,
+    while `edit X and Y, commit X, commit Y` ⇒ Y reports `M`. Deterministic,
+    5 seconds to reproduce, no module, no worker, no restart, no checkout
+    move.
+    **Why every earlier hypothesis missed it.** All six looked at the *edit*
+    path — `TouchedPaths`, `overlayEdit`, `overlayWorkspaceWithMutation`,
+    persistence — and the touched set is innocent at every one of those
+    sites (audited again, independently, and cleared). The defect is in the
+    *read* path, in a projection derived at render time that nothing
+    persisted and no test covered. And the confirmation experiment recorded
+    above stayed green for a reason that is now obvious and was invisible
+    then: `workspace_module_edit_test.go` stages exactly ONE commit
+    (`require.Len(..., 1)`), so it never reaches the `index > 0` branch. A
+    green run against the wrong branch is worth exactly nothing, which is the
+    transferable lesson.
+    **The fix**, two commits. First, anchor both sides of the diff on one
+    base: rebuild the previous staged state over THIS commit's base rather
+    than reusing its frozen tree. That is not an approximation but the
+    identity — `withCommit` seeds the cumulative record from exactly that
+    expression (`overlay.Before.withChanges(staged)` in
+    `workspaceOverlayChanges`), so the reconstruction is the same dagql
+    selection, and the diff is precisely the commit's own step. Second,
+    extract `stagedTreeOver` and call it from both sites, because nothing
+    linked the two copies of that expression and a later edit to either would
+    silently reintroduce the class. The fix is retroactive: the per-commit
+    delta is derived on read and never persisted, so stacks already staged in
+    a live session render correctly as soon as the engine has it.
+    Reviewed adversarially before landing. It does not depend on the sparse
+    base being monotonic (it applies the previous changeset rather than
+    assuming containment); `withChanges` onto a wider base is already the
+    load-bearing primitive on the main read path (`resolveHostOverlayRootfs`);
+    it is a semantic no-op for value/git/rootless workspaces, whose `Before`
+    is constant; it costs no extra host sync, since `withChanges` is lazy and
+    the base is already in the after-side's lineage; and the guard must stay
+    `index > 0 && commits[index-1].Committed != nil`, which mirrors
+    `StagedChanges()` and is what makes the reconstruction exact.
+    **Consequences, measured rather than assumed.** The content was always
+    innocent: the workspace holds the surgical edit, nothing is left pending,
+    and after `export` git itself records `M` for the edit and `D` for the
+    removal whose summary was *empty* — history was never corrupt, only its
+    projection. The harvest cost is a refusal, not a clobber: `pull` replays
+    the same recorded changeset as a patch, `git apply` refuses an add over a
+    file the receiver already has, and `withCommitsFrom` then rejects the
+    WHOLE batch — so the receiver takes nothing, not even the unrelated
+    commit that would have applied. That is sighting (ii) exactly, and the
+    reason it cost authorship every time.
+    **`pullConflicted` is broken for this shape too** — discovered by needing
+    it during this very investigation. It is documented as the recovery for a
+    CONTENT conflict, but git cannot leave conflict markers for an add over
+    an existing file; it refuses outright. So the escape hatch fails on the
+    one defect it existed to work around, and the only route left is
+    re-applying the work by hand. Worth fixing on its own terms (§9.1): a
+    refused add whose target exists should degrade to a 3-way merge against
+    the receiver's copy rather than an error.
+    **Provenance.** The anchoring was introduced by `2e8c27fb8468`
+    ("cli(agent): show staged commits in Changes", #13835), 25 days after
+    `6376ba07d838` (#13600) made the diff base sparse — the sparse base is
+    what turned a plausible-looking derivation into a wrong one. #13835 is
+    still open, so this never reached `main`. Its message states the design
+    outright ("each entry's own changes are derived at read time as the step
+    between consecutive staged trees — no new persisted state"), and a
+    sibling commit asserts the record is "stable across chained and
+    path-scoped commits", which is precisely the claim that fails. #13600's
+    review discussion is entirely about performance; nobody raised diff-anchor
+    correctness, and #13835 has no review comments at all.
+    **Regression coverage**, and one trap worth stating: the suite's Go entry
+    point is `TestWorkspace`, so `-run WorkspaceSuite/...` matches NOTHING and
+    reports a green "no tests to run". Use
+    `TestWorkspace/TestWorkspaceStagedCommitSequence`, which covers the five
+    failing sequences and a control (`...TrackedEdit`), the saved history read
+    back with git (`...SavedHistoryIsIntact`), and the cross-workspace replay
+    (`...Harvest`); plus unit-level pins of the anchor arithmetic in
+    `core/changeset_test.go` and of the sparse include semantics in
+    `core/host_include_filter_test.go`.
+    **What this does NOT explain, and remains open.** Sighting (iii) — a
+    worker's workspace materializing a source file with git CONFLICT MARKERS
+    in it — and the fourth sighting's host-side corrupted
+    `modules/staff/main.dang` are NOT accounted for by this defect: the replay
+    was measured to refuse rather than merge, and `pullConflicted` cannot
+    produce markers for an add either. Those stay open, and with the
+    reporting defect gone they should be re-observed from scratch rather than
+    assumed to share a cause.
+    **Follow-ups this turned up, none blocking.** (a) The structural version
+    of the fix: record the per-commit delta at staging time, where both
+    operands are already in hand, instead of re-deriving it on read — that
+    retires the two-anchors class rather than this instance, at the cost of a
+    persisted field and back-compat decode. (b) `withChanges` collapses a
+    fully-removed directory to `RemoveAll`, which on a wider base also deletes
+    siblings the narrower base never held; pre-existing, inherited by the fix,
+    fixable by removing files individually and only rmdir'ing genuinely empty
+    directories. (c) A commit staged on a workspace with no overlay renders an
+    *empty* summary — same "summaries lie" family, different cause. (d) Latent
+    in `sparseHostBase`: a touched path containing glob metacharacters, one
+    starting with `!`, or one under a symlinked ancestor is silently missed;
+    none occur in this checkout, all now pinned by tests. (e) Unproven
+    suspect: `latest.Repo` is a full host read frozen at the first commit of a
+    stack while the remainder applied on top is anchored live — same shape,
+    bounded by the read epoch, and it does not match any recorded sighting.
+    **The investigation as it ran, from here down.** Originally filed as
+    known, pre-existing and unexplained — started some time ago: the
+    workspace's changeset machinery
     intermittently forgets that a path is already tracked and treats it as
     new content, so a surgical edit to a long-tracked file is recorded as a
     whole-file ADD. Symptoms seen in one session, in increasing order of
@@ -1951,10 +2076,11 @@ are the reason it can sit in a green tree:
 
 **Two hazards for whoever picks this up.** Do not open the investigation by
 calling a `modules/staff` tool on a resumed session (§11.1, item 13) — it
-revives workers on receiver load, including reads. And expect item 14 to
-misreport your own commits as whole-file adds; it did so twice in this
-session and once caused a worker's commit to be unpullable. Neither is this
-issue; both will waste your time if unexpected.
+revives workers on receiver load, including reads. Item 14 used to be the
+second hazard — it misreported this section's own commits as whole-file adds
+and made a worker's commit unpullable — but it is fixed; a session running an
+engine built before that fix will still show it, and the tell is that only the
+FIRST commit of the session is reported correctly.
 
 ### 11.1 Notes for live QA
 
@@ -1984,14 +2110,16 @@ session by hand:
   and `name` reads back correctly because it is a literal. The tell is a
   state that disagrees with what `staff.status` says. Nothing is wrong with
   the worker: steer and harvest it through the chief's tools as usual.
-- **A worker's commit on this document may be unpullable, via item 14.** When
-  the changeset machinery loses tracked-ness, a small prose edit is recorded
-  as a whole-file ADD, and `pullConflicted` then refuses it — an add cannot
-  apply onto a file that already exists ("already exists in working
-  directory"). Replay the prose by hand and commit it yourself, at the cost
-  of the worker's authorship. Do NOT infer from the whole-file add that the
-  file is untracked: this document is committed, and a comparable edit
-  minutes later in the same session recorded correctly as `M`. That wrong
-  inference was made here, believed, and written into this section as fact
-  before being caught.
+- **A worker's commit may be unpullable, via item 14 — fixed, but know the
+  shape.** On an engine built before the fix, any commit after the first in a
+  session records a first-touched path as a whole-file ADD, and both `pull`
+  and `pullConflicted` then refuse it: an add cannot apply onto a file that
+  already exists ("already exists in working directory"). Replay the change by
+  hand and commit it yourself, at the cost of the worker's authorship — this
+  section's own harvest had to do exactly that. Do NOT infer from the
+  whole-file add that the file is untracked: it never meant that, and a
+  comparable edit minutes later in the same session records correctly as `M`.
+  That wrong inference was made here, believed, and written into this section
+  as fact before being caught — and it cost the investigation several sessions
+  by pointing it at tracked-ness instead of at the diff anchor.
 
