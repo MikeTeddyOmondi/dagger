@@ -149,6 +149,20 @@ type frontendPretty struct {
 	// from the trace, so the roster can render them as read-only rather than
 	// letting a failed rebuild look like a working entry.
 	unaddressableAgents map[string]bool
+	// pendingFocusAgent is the agent the client BELIEVES it has focused: the
+	// destination of the most recent focus keypress, held until the handler
+	// confirms it. Focus is retargeted on the shell goroutine, so between a
+	// keypress and its completion TargetAgentID() still names the agent being
+	// left -- and nav mode's [/] is meant to be tapped, so the next press
+	// routinely lands inside that window. Reading the settled target there
+	// would step from where focus has BEEN instead of where it is GOING.
+	pendingFocusAgent string
+	// focusInFlight is true while a FocusAgent request is out. Only one is
+	// allowed at a time: the request attaches and re-points the handler's
+	// target, so two of them racing could settle wherever finished last
+	// rather than where the user walked to. Taps behind it coalesce, and
+	// settleFocus issues one catch-up hop when it lands.
+	focusInFlight bool
 	// agentRosterState fingerprints what the strip last rendered, so the
 	// trace can push updates into it without re-rendering every frame.
 	agentRosterState string
@@ -2521,6 +2535,9 @@ func (fe *frontendPretty) keys(out *termenv.Output) []key.Binding {
 		binds = append(binds,
 			key.NewBinding(key.WithKeys("1…9", "1", "2", "3", "4", "5", "6", "7", "8", "9"),
 				key.WithHelp("1…9", "focus agent")),
+			key.NewBinding(key.WithKeys("`"),
+				key.WithHelp("`", "last agent"),
+				KeyEnabled(fe.lastFocusedAgent != "")),
 			key.NewBinding(key.WithKeys("[/]", "[", "]"),
 				key.WithHelp("[/]", "prev/next agent"),
 				KeyEnabled(fe.addressableAgentCount() > 1)),
@@ -3623,7 +3640,7 @@ func (fe *frontendPretty) agentRosterEntries() []AgentRosterEntry {
 	if fe.db == nil {
 		return nil
 	}
-	focused := fe.targetAgentID()
+	focused := fe.focusedAgentID()
 	agents := fe.db.Agents()
 	entries := make([]AgentRosterEntry, 0, len(agents))
 	for _, agent := range agents {
@@ -3658,6 +3675,24 @@ func (fe *frontendPretty) targetAgentID() string {
 		return t.TargetAgentID()
 	}
 	return ""
+}
+
+// focusedAgentID is the agent the CLIENT believes the prompt addresses: the
+// destination of a focus request still in flight, or the handler's settled
+// target when there is none.
+//
+// The handler remains the single source of truth; this is the client's belief
+// about where that truth is heading, and it exists because focus is retargeted
+// asynchronously. Everything a keypress computes from "where focus is" reads
+// this instead of targetAgentID: the roster's own * marker (so the strip moves
+// on the press rather than a round-trip later -- the only feedback [/] has,
+// now that it stays in nav mode), which agent a draft is parked against, and
+// where the next cycle step counts from.
+func (fe *frontendPretty) focusedAgentID() string {
+	if fe.pendingFocusAgent != "" {
+		return fe.pendingFocusAgent
+	}
+	return fe.targetAgentID()
 }
 
 // focusAgentIndex moves focus to the nth roster entry (0-based), the
@@ -3739,11 +3774,18 @@ func (fe *frontendPretty) navFocusAgent(n int) bool {
 // whether there was anywhere to go, so a session with nobody else to talk to
 // leaves the key unclaimed instead of miming a switch that never happened.
 //
+// Unlike the digits and the toggle this does NOT hand the prompt back, and
+// that split is the whole design of the key: a cycle is a survey verb, meant
+// to be tapped until you land on the one you want, and a key that dropped you
+// into the prompt on the first press would type its own second press into the
+// input. The strip's * marker is the feedback instead, and `i` is one
+// keystroke away once you have arrived.
+//
 // §5.1 argues a next/prev cycle is the wrong verb for the two-agent
-// ping-pong, and it still is: alt+l's last-focused toggle remains the key for
-// that, and this does not displace it. The cycle earns its place for the
-// other case -- a roster long enough that finding an agent's number is itself
-// the work -- where stepping along the strip beats counting entries.
+// ping-pong, and it still is: the last-focused toggle answers that, and nav
+// mode binds it too. The cycle earns its place for the other case -- a roster
+// long enough that finding an agent's number is itself the work -- where
+// stepping along the strip beats counting it.
 //
 // Read-only entries are stepped OVER, never onto. focusAgent answers "focus
 // THIS one" for an unaddressable entry with a prompt error, which is the
@@ -3780,47 +3822,61 @@ func (fe *frontendPretty) navCycleAgent(delta int) bool {
 		if entry.Focused || entry.ReadOnly || entry.ID == "" {
 			continue
 		}
-		if !fe.focusAgent(entry) {
-			// Nothing left for focusAgent to refuse but a handler that
-			// cannot retarget at all, and then there is no cycle to run.
-			return false
-		}
-		fe.returnToPromptAfterFocus()
-		return true
+		// Nothing left for focusAgent to refuse but a handler that cannot
+		// retarget at all, and then there is no cycle to run.
+		return fe.focusAgent(entry)
 	}
 	// One agent, or every other entry watch-only: the roster key is a no-op
 	// and must not pretend otherwise by consuming the press.
 	return false
 }
 
-// returnToPromptAfterFocus hands the prompt back after a roster key moved
-// focus from nav mode.
+// navFocusLastAgent is nav mode's last-focused toggle -- prompt mode's alt+l,
+// which §5.1 calls the right verb for the two-agent ping-pong that is the
+// common case. Nav mode would be strictly weaker without it.
 //
-// Focusing an agent is a prelude to typing at it -- that is the entire point
-// of the per-agent draft, saved on blur and restored on focus (§5.1), which
-// only pays off if the next keystroke is the message. Staying in nav mode
-// would cost an `i` every single time and buy nothing: the tree nav mode
-// browses is the whole trace, and focus does not change it. So a roster key
-// in nav mode means "go talk to that agent", not "select it".
+// Like the digits, and unlike the cycle, this names a destination rather than
+// surveying, so it hands the prompt back.
+func (fe *frontendPretty) navFocusLastAgent() bool {
+	if len(fe.navRosterEntries()) == 0 {
+		return false
+	}
+	if !fe.focusLastAgent() {
+		return false
+	}
+	fe.returnToPromptAfterFocus()
+	return true
+}
+
+// returnToPromptAfterFocus hands the prompt back after a roster key NAMED an
+// agent from nav mode -- a digit or the last-focused toggle, never the cycle
+// (see navCycleAgent).
+//
+// Naming an agent is a prelude to typing at it -- that is the entire point of
+// the per-agent draft, saved on blur and restored on focus (§5.1), which only
+// pays off if the next keystroke is the message. Staying in nav mode would
+// cost an `i` every single time and buy nothing: the tree nav mode browses is
+// the whole trace, and focus does not change it. doBranch ends the same way,
+// for the same reason.
 func (fe *frontendPretty) returnToPromptAfterFocus() {
 	fe.enterInsertMode(false)
 }
 
 // focusAgent points the prompt at one roster entry: the draft in the input is
-// saved against the agent being left and the new agent's draft restored, then
-// the handler is asked to retarget, attaching to the agent through a handle
-// rebuilt from the trace when the session is not already driving it.
+// saved against the agent being left and the new agent's draft restored, the
+// client's own belief about focus moves at once, and then the handler is asked
+// to make it true -- attaching to the agent through a handle rebuilt from the
+// trace when the session is not already driving it.
 //
 // Focus moves only by a keypress -- never by an event -- so this is only ever
-// called from a key handler.
+// called from a key handler, or from settleFocus finishing what one started.
 func (fe *frontendPretty) focusAgent(entry AgentRosterEntry) bool {
 	if entry.ID == "" || entry.Focused {
 		return false
 	}
-	targeter, ok := fe.shell.(interface {
+	if _, ok := fe.shell.(interface {
 		FocusAgent(ctx context.Context, agentID, name, encodedID string) error
-	})
-	if !ok {
+	}); !ok {
 		return false
 	}
 	if entry.ReadOnly {
@@ -3841,30 +3897,98 @@ func (fe *frontendPretty) focusAgent(entry AgentRosterEntry) bool {
 	}
 
 	fe.saveAgentDraft()
-	previous := fe.targetAgentID()
+	previous := fe.focusedAgentID()
+	// Believe the switch now and ask the handler to make it true after: the
+	// request is answered on the shell goroutine, so anything that read the
+	// settled target in the meantime would see a focus that has not moved
+	// yet. See focusedAgentID.
+	fe.pendingFocusAgent = entry.ID
 	fe.restoreAgentDraft(entry.ID)
+	fe.updateAgentRoster()
 
+	if fe.focusInFlight {
+		// A request is already out. This press rides along on the belief
+		// above, and settleFocus sends the catch-up request when that one
+		// lands; firing a second now would race the first at the handler.
+		return true
+	}
+	fe.sendFocusRequest(entry, encodedID, previous)
+	return true
+}
+
+// sendFocusRequest asks the handler to retarget at one entry. The client's
+// belief and the drafts have already been moved by the keypress, so this is
+// only the part that has to reach the handler: the completion either confirms
+// the belief or rolls it back.
+func (fe *frontendPretty) sendFocusRequest(entry AgentRosterEntry, encodedID, previous string) {
+	targeter, ok := fe.shell.(interface {
+		FocusAgent(ctx context.Context, agentID, name, encodedID string) error
+	})
+	if !ok {
+		return
+	}
+	fe.focusInFlight = true
 	fe.runShellAsync(func() {
-		if err := targeter.FocusAgent(fe.shellCtx, entry.ID, entry.Name, encodedID); err != nil {
-			fe.dispatch(func() {
-				// Focus did not move, so neither may the draft: put the line
-				// the user was typing back where they were typing it.
-				fe.saveDraftFor(entry.ID)
-				fe.restoreAgentDraft(previous)
+		err := targeter.FocusAgent(fe.shellCtx, entry.ID, entry.Name, encodedID)
+		fe.dispatch(func() {
+			if err != nil {
+				if fe.pendingFocusAgent == entry.ID {
+					// Focus did not move, so neither may the draft: put the
+					// line the user was typing back where they were typing
+					// it. Only when nothing was pressed since -- otherwise
+					// the drafts already belong to wherever the keys walked.
+					fe.saveDraftFor(entry.ID)
+					fe.restoreAgentDraft(previous)
+				}
 				fe.markAgentUnaddressable(entry.ID)
 				fe.setPromptError(fmt.Errorf("focus %q: %w", entry.Name, err))
-				fe.updateAgentRoster()
-				fe.Update()
-			})
-			return
-		}
-		fe.dispatch(func() {
-			fe.lastFocusedAgent = previous
+			} else {
+				fe.lastFocusedAgent = previous
+			}
+			fe.settleFocus(entry.ID)
 			fe.updateAgentRoster()
 			fe.Update()
 		})
 	})
-	return true
+}
+
+// settleFocus runs when a focus request finishes. It releases the in-flight
+// slot and, when the roster keys walked on while that request was out, sends
+// one more request for wherever they ended up.
+//
+// Coalescing rather than queueing every press is deliberate: a burst of [ ]
+// taps is a survey, and the agents passed over are precisely the ones the
+// user decided NOT to talk to -- attaching to each in turn would be work done
+// on their behalf that they never asked for. It costs one extra round-trip
+// per burst instead of one per tap.
+func (fe *frontendPretty) settleFocus(requested string) {
+	fe.focusInFlight = false
+	if fe.pendingFocusAgent == "" || fe.pendingFocusAgent == requested {
+		// Nothing pressed since this request went out: the handler has
+		// caught up with the client's belief, or -- on failure -- the belief
+		// has been rolled back to where the handler still is.
+		fe.pendingFocusAgent = ""
+		return
+	}
+	for _, entry := range fe.agentRosterEntries() {
+		if entry.ID != fe.pendingFocusAgent {
+			continue
+		}
+		encodedID, err := encodedIDForCallDigest(fe.db, fe.agentCallDigest(entry.ID))
+		if err != nil {
+			// It rebuilt when the key was pressed; if it no longer does,
+			// the belief has to come back to where the handler actually is.
+			fe.markAgentUnaddressable(entry.ID)
+			fe.setPromptError(fmt.Errorf("agent %q cannot be addressed: %w", entry.Name, err))
+			fe.pendingFocusAgent = ""
+			fe.restoreAgentDraft(fe.targetAgentID())
+			return
+		}
+		fe.sendFocusRequest(entry, encodedID, requested)
+		return
+	}
+	// The agent left the roster while the request was out.
+	fe.pendingFocusAgent = ""
 }
 
 // agentCallDigest is the digest the engine advertised for an agent's value.
@@ -3888,9 +4012,13 @@ func (fe *frontendPretty) markAgentUnaddressable(agentID string) {
 }
 
 // saveAgentDraft parks the half-typed line against the agent it was being
-// typed at, so a switch mid-sentence does not eat the sentence.
+// typed at, so a switch mid-sentence does not eat the sentence. It is the
+// agent the client BELIEVES it is on: with a focus request still in flight
+// the handler's target still names the agent already left, and saving there
+// would overwrite that agent's real draft with the one being carried away
+// from it.
 func (fe *frontendPretty) saveAgentDraft() {
-	fe.saveDraftFor(fe.targetAgentID())
+	fe.saveDraftFor(fe.focusedAgentID())
 }
 
 // saveDraftFor parks the input's current line against a specific agent.
@@ -4980,13 +5108,39 @@ func (fe *frontendPretty) handleNavKeyUV(ev uv.KeyPressEvent) {
 		// where unmodified keys are the vocabulary, so it can offer the jump
 		// on a key nothing upstream can intercept (§5.1). The alt+ bindings
 		// stay: this adds a path that always works, it does not replace one.
+		//
+		// Accepted cost: nav mode is otherwise vim-flavoured (hjkl, gg, G,
+		// /, n/N), and spending the digits here forecloses ever adding vim's
+		// count prefixes (5j). Deliberate -- there is no motion here long
+		// enough to want counting, and a switcher you can reach is worth
+		// more than one you might one day want to repeat.
 		if fe.navFocusAgent(int(keyStr[0] - '1')) {
 			return
 		}
+	case "`":
+		// Last-focused toggle: nav mode's alt+l, and by §5.1 the RIGHT verb
+		// for the two-agent ping-pong that is the common case -- without it
+		// nav mode would be strictly weaker than the prompt. tmux's own `l`
+		// is taken here (nav l = expand), so: ` is free, sits next to 1, and
+		// reads as "the other one". (`\` is free too, but neighbours ctrl+\'s
+		// SIGQUIT -- bad company for a key you tap.)
+		if fe.navFocusLastAgent() {
+			return
+		}
 	case "[", "]":
-		// Previous/next agent. Emphatically NOT ctrl+[, the usual pairing:
-		// it transmits 0x1B, which IS the escape byte, so a terminal cannot
-		// tell it apart from the esc that got the user into nav mode.
+		// Previous/next agent -- and NOT ctrl+[, the obvious pairing. Not
+		// because it cannot be read: tuist turns on the Kitty keyboard
+		// protocol's disambiguate mode unconditionally (tuist's
+		// terminal_unix.go / terminal_windows.go), and under it esc arrives
+		// as CSI 27 u while ctrl+[ arrives as CSI 91;5u -- two genuinely
+		// distinct keys. The problem is that it is AMBIGUOUS: on every
+		// terminal without that protocol (Terminal.app, older xterm,
+		// tmux/screen, conhost) ctrl+[ is the bare 0x1B byte and decodes as
+		// plain "esc", and nothing here consults tuist's HasKittyKeyboard to
+		// tell the two worlds apart. It would be a real key for some users
+		// and a silent Esc for the rest. And even where it works it is
+		// muscle memory for Esc, so taking it would break Esc for exactly
+		// the users whose terminal is good enough to let us have it.
 		delta := 1
 		if keyStr == "[" {
 			delta = -1
