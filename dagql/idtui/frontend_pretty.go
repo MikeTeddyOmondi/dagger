@@ -126,8 +126,29 @@ type frontendPretty struct {
 	historyIndex    int      // -1 = not browsing history
 	historySaved    string   // saved input when browsing history
 	autoModeSwitch  bool
-	shellRunning    bool
-	shellLock       sync.Mutex
+	// turnsRunning counts the handler turns in flight. Prompt turns are no
+	// longer serialized -- each runs server-side in its own agent runtime --
+	// so several can overlap, and "is anything running" is a count, not a
+	// flag.
+	turnsRunning int
+	// serialRunning marks a turn that occupies the handler's single
+	// interpreter (a shell command, or a prompt-mode /command). Only those
+	// take shellLock, and only those make a submitted message queue.
+	serialRunning bool
+	shellLock     sync.Mutex
+
+	// agentDrafts holds the half-typed line of each agent the user has
+	// focused, keyed by agent instance ID: saved on blur, restored on focus,
+	// so switching agents mid-sentence does not eat the sentence (§5.1).
+	agentDrafts map[string]string
+	// lastFocusedAgent is the agent focused before the current one, for the
+	// tmux-style last-agent toggle: the two-agent ping-pong is the common
+	// case, and a next/prev cycle is the wrong verb for it.
+	lastFocusedAgent string
+	// unaddressableAgents remembers agents whose handle could not be rebuilt
+	// from the trace, so the roster can render them as read-only rather than
+	// letting a failed rebuild look like a working entry.
+	unaddressableAgents map[string]bool
 
 	// logProvider lazily fetches a span's logs on demand (e.g. on expand, or
 	// when a failure is surfaced). The bool is whether to roll up descendant
@@ -977,7 +998,7 @@ func (fe *frontendPretty) startShell(ctx context.Context, handler ShellHandler) 
 		profile:   fe.profile,
 		data:      fe.statusLineData, // seed from the last SetStatusLine (e.g. a resumed session)
 		liveStats: fe.llmLiveStats,
-		inFlight:  func() bool { return fe.shellRunning },
+		inFlight:  func() bool { return fe.turnsRunning > 0 },
 	}
 	fe.tui.RemoveChild(fe.keymapBar)
 	fe.promptFrame = NewPromptFrame(fe.textInput, fe.profile)
@@ -2323,6 +2344,15 @@ func (fe *frontendPretty) keys(out *termenv.Output) []key.Binding {
 				key.NewBinding(key.WithKeys("alt+up"), key.WithHelp("alt+↑", "edit queued")),
 			)
 		}
+		// Roster focus, shown only once there is more than one agent to
+		// switch between -- the same threshold the strip itself uses.
+		if fe.agentRoster != nil && fe.agentRoster.Visible() {
+			bnds = append(bnds,
+				key.NewBinding(key.WithKeys("alt+1"), key.WithHelp("alt+1…9", "focus agent")),
+				key.NewBinding(key.WithKeys(agentLastKey), key.WithHelp("alt+l", "last agent"),
+					KeyEnabled(fe.lastFocusedAgent != "")),
+			)
+		}
 		if fe.shell != nil {
 			bnds = append(bnds, fe.shell.KeyBindings(out)...)
 		}
@@ -3573,6 +3603,7 @@ func (fe *frontendPretty) agentRosterEntries() []AgentRosterEntry {
 	if fe.db == nil {
 		return nil
 	}
+	focused := fe.targetAgentID()
 	agents := fe.db.Agents()
 	entries := make([]AgentRosterEntry, 0, len(agents))
 	for _, agent := range agents {
@@ -3581,12 +3612,172 @@ func (fe *frontendPretty) agentRosterEntries() []AgentRosterEntry {
 			name = "agent"
 		}
 		entries = append(entries, AgentRosterEntry{
+			ID:        agent.ID,
 			Name:      name,
 			State:     agent.State,
 			WaitingOn: agent.WaitingOn,
+			Focused:   agent.ID != "" && agent.ID == focused,
+			// An agent whose loop span carries no call digest was never
+			// addressable, and one whose handle failed to rebuild has been
+			// proven not to be. Either way the entry is watch-only, and says
+			// so rather than pretending it can be spoken to.
+			ReadOnly: agent.CallDigest == "" || fe.unaddressableAgents[agent.ID],
 		})
 	}
 	return entries
+}
+
+// targetAgentID is the instance ID of the agent the prompt addresses, as
+// reported by the handler -- the single source of truth for focus, so the
+// strip and the routing can never disagree.
+func (fe *frontendPretty) targetAgentID() string {
+	if fe.shell == nil {
+		return ""
+	}
+	if t, ok := fe.shell.(interface{ TargetAgentID() string }); ok {
+		return t.TargetAgentID()
+	}
+	return ""
+}
+
+// focusAgentIndex moves focus to the nth roster entry (0-based), the
+// tmux-style numbered jump. Reports whether the key was handled.
+func (fe *frontendPretty) focusAgentIndex(n int) bool {
+	entries := fe.agentRosterEntries()
+	if n < 0 || n >= len(entries) {
+		return false
+	}
+	return fe.focusAgent(entries[n])
+}
+
+// focusLastAgent toggles back to the previously focused agent -- tmux's
+// last-window, because the two-agent ping-pong is the common case and a
+// next/prev cycle is the wrong verb for it.
+func (fe *frontendPretty) focusLastAgent() bool {
+	if fe.lastFocusedAgent == "" {
+		return false
+	}
+	for _, entry := range fe.agentRosterEntries() {
+		if entry.ID == fe.lastFocusedAgent {
+			return fe.focusAgent(entry)
+		}
+	}
+	return false
+}
+
+// focusAgent points the prompt at one roster entry: the draft in the input is
+// saved against the agent being left and the new agent's draft restored, then
+// the handler is asked to retarget, attaching to the agent through a handle
+// rebuilt from the trace when the session is not already driving it.
+//
+// Focus moves only by a keypress -- never by an event -- so this is only ever
+// called from a key handler.
+func (fe *frontendPretty) focusAgent(entry AgentRosterEntry) bool {
+	if entry.ID == "" || entry.Focused {
+		return false
+	}
+	targeter, ok := fe.shell.(interface {
+		FocusAgent(ctx context.Context, agentID, name, encodedID string) error
+	})
+	if !ok {
+		return false
+	}
+	if entry.ReadOnly {
+		fe.setPromptError(fmt.Errorf("agent %q cannot be addressed from this trace", entry.Name))
+		return true
+	}
+
+	// The handle is rebuilt from the trace the client already ingests: the
+	// loop span advertises the digest of the call that produced the agent
+	// value, and that call's payload is on a span like any other (§9).
+	encodedID, err := encodedIDForCallDigest(fe.db, fe.agentCallDigest(entry.ID))
+	if err != nil {
+		// A frame whose span never reached this client cannot be rebuilt; the
+		// entry is read-only from here on, and says so.
+		fe.markAgentUnaddressable(entry.ID)
+		fe.setPromptError(fmt.Errorf("agent %q cannot be addressed: %w", entry.Name, err))
+		return true
+	}
+
+	fe.saveAgentDraft()
+	previous := fe.targetAgentID()
+	fe.restoreAgentDraft(entry.ID)
+
+	fe.runShellAsync(func() {
+		if err := targeter.FocusAgent(fe.shellCtx, entry.ID, entry.Name, encodedID); err != nil {
+			fe.dispatch(func() {
+				// Focus did not move, so neither may the draft: put the line
+				// the user was typing back where they were typing it.
+				fe.saveDraftFor(entry.ID)
+				fe.restoreAgentDraft(previous)
+				fe.markAgentUnaddressable(entry.ID)
+				fe.setPromptError(fmt.Errorf("focus %q: %w", entry.Name, err))
+				fe.Update()
+			})
+			return
+		}
+		fe.dispatch(func() {
+			fe.lastFocusedAgent = previous
+			fe.Update()
+		})
+	})
+	return true
+}
+
+// agentCallDigest is the digest the engine advertised for an agent's value.
+func (fe *frontendPretty) agentCallDigest(agentID string) string {
+	if fe.db == nil {
+		return ""
+	}
+	for _, agent := range fe.db.Agents() {
+		if agent.ID == agentID {
+			return agent.CallDigest
+		}
+	}
+	return ""
+}
+
+func (fe *frontendPretty) markAgentUnaddressable(agentID string) {
+	if fe.unaddressableAgents == nil {
+		fe.unaddressableAgents = map[string]bool{}
+	}
+	fe.unaddressableAgents[agentID] = true
+}
+
+// saveAgentDraft parks the half-typed line against the agent it was being
+// typed at, so a switch mid-sentence does not eat the sentence.
+func (fe *frontendPretty) saveAgentDraft() {
+	fe.saveDraftFor(fe.targetAgentID())
+}
+
+// saveDraftFor parks the input's current line against a specific agent.
+func (fe *frontendPretty) saveDraftFor(agentID string) {
+	if fe.textInput == nil || agentID == "" {
+		return
+	}
+	if fe.agentDrafts == nil {
+		fe.agentDrafts = map[string]string{}
+	}
+	fe.agentDrafts[agentID] = fe.textInput.Value()
+}
+
+// restoreAgentDraft puts the newly focused agent's parked line back in the
+// input.
+func (fe *frontendPretty) restoreAgentDraft(agentID string) {
+	if fe.textInput == nil {
+		return
+	}
+	fe.textInput.SetValue(fe.agentDrafts[agentID])
+	fe.syncPrompt()
+}
+
+// setPromptError surfaces an error above the prompt, the same place a failed
+// turn reports.
+func (fe *frontendPretty) setPromptError(err error) {
+	fe.promptErr = err
+	if fe.promptErrLabel != nil {
+		fe.promptErrLabel.SetError(err)
+	}
 }
 
 // agentRosterHeight returns the line count of the roster strip, which
@@ -4339,9 +4530,7 @@ func (fe *frontendPretty) interceptEditlineKey(ctx tuist.Context, ev uv.KeyPress
 		}
 		return false // let TextInput handle ctrl+d (delete char) when input non-empty
 	case "ctrl+c":
-		if fe.shellInterrupt != nil {
-			fe.shellInterrupt(errors.New("interrupted"))
-		}
+		fe.interruptCurrent()
 		fe.textInput.SetValue("")
 		fe.syncPrompt()
 		return true
@@ -4392,6 +4581,19 @@ func (fe *frontendPretty) interceptEditlineKey(ctx tuist.Context, ev uv.KeyPress
 			return true
 		}
 	default:
+		// Roster focus: tmux's numbered jump targets and last-window toggle,
+		// aliased onto alt+ so the digits themselves keep typing. tab is
+		// unavailable (input-mode binding, and the completion menu eats it),
+		// and a next/prev cycle is deliberately absent: the two-agent
+		// ping-pong wants a toggle, not a rotation (§5.1).
+		if n, ok := agentJumpKey(keyStr); ok {
+			if fe.focusAgentIndex(n) {
+				return true
+			}
+		}
+		if keyStr == agentLastKey && fe.focusLastAgent() {
+			return true
+		}
 		if fe.shell != nil {
 			if work := fe.shell.ReactToInput(fe.shellCtx, ev, fe.textInput.Value(), true); work != nil {
 				fe.runShellAsync(work)
@@ -4401,6 +4603,19 @@ func (fe *frontendPretty) interceptEditlineKey(ctx tuist.Context, ev uv.KeyPress
 	}
 
 	return false // let TextInput handle it
+}
+
+// agentLastKey toggles back to the previously focused agent (tmux's
+// last-window, prefix+l).
+const agentLastKey = "alt+l"
+
+// agentJumpKey maps alt+1..alt+9 to a 0-based roster index.
+func agentJumpKey(keyStr string) (int, bool) {
+	rest, ok := strings.CutPrefix(keyStr, "alt+")
+	if !ok || len(rest) != 1 || rest[0] < '1' || rest[0] > '9' {
+		return 0, false
+	}
+	return int(rest[0] - '1'), true
 }
 
 // handleNavKeyUV handles key events in navigation mode.
@@ -4418,9 +4633,7 @@ func (fe *frontendPretty) handleNavKeyUV(ev uv.KeyPressEvent) {
 			fe.closeLogPager()
 		case "ctrl+c":
 			if fe.shell != nil {
-				if fe.shellInterrupt != nil {
-					fe.shellInterrupt(errors.New("interrupted"))
-				}
+				fe.interruptCurrent()
 			} else {
 				fe.quitAction(ErrInterrupted)
 			}
@@ -4452,9 +4665,7 @@ func (fe *frontendPretty) handleNavKeyUV(ev uv.KeyPressEvent) {
 			fe.closeTestsMode()
 		case "ctrl+c":
 			if fe.shell != nil {
-				if fe.shellInterrupt != nil {
-					fe.shellInterrupt(errors.New("interrupted"))
-				}
+				fe.interruptCurrent()
 			} else {
 				fe.quitAction(ErrInterrupted)
 			}
@@ -4484,9 +4695,7 @@ func (fe *frontendPretty) handleNavKeyUV(ev uv.KeyPressEvent) {
 	switch keyStr {
 	case "q", "ctrl+c":
 		if fe.shell != nil {
-			if fe.shellInterrupt != nil {
-				fe.shellInterrupt(errors.New("interrupted"))
-			}
+			fe.interruptCurrent()
 		} else {
 			fe.quitAction(ErrInterrupted)
 		}
@@ -4672,18 +4881,20 @@ func (fe *frontendPretty) handleInputComplete() {
 	// reset now that we've accepted input
 	fe.textInput.SetValue("")
 
-	// If a turn is already running, hand the message to it rather than
-	// blocking on a new one. A prompt turn accepts it immediately: the shell
-	// sends it to the agent runtime driving the turn (fire-and-forget -- the
-	// engine records it and its reply arrives within the same turn), so there
-	// is nothing left pending client-side. Any other running turn (a shell
-	// command, a prompt-mode /command) can't absorb input, so the message is
-	// queued and replayed as a new turn when the current one finishes (see
+	// Route the message. WHO gets it is the handler's business -- the focused
+	// conversation -- and never an inference from what happens to be running:
+	// with a roster, the busy agent and the focused agent are routinely
+	// different agents (§5.1). The target's own in-flight turn absorbs the
+	// message if it has one (the engine records it immediately and its reply
+	// arrives within that turn, so nothing stays pending client-side).
+	if fe.submitToTarget(value) {
+		return
+	}
+	// Otherwise it opens a new turn -- unless the handler's one interpreter is
+	// busy with a shell command or a /command, which can't absorb input, so
+	// the message is queued and replayed when that turn finishes (see
 	// handleShellDone).
-	if fe.shellRunning {
-		if ij, ok := fe.shell.(interface{ Interject(string) bool }); ok && ij.Interject(value) {
-			return
-		}
+	if fe.serialRunning {
 		if _, ok := fe.shell.(interface{ QueueMessage(string) }); ok {
 			fe.setQueuedMessage(value)
 			return
@@ -4691,6 +4902,34 @@ func (fe *frontendPretty) handleInputComplete() {
 	}
 
 	fe.startShellHandle(value)
+}
+
+// submitToTarget offers the message to the focused conversation's in-flight
+// turn, reporting whether it was absorbed.
+func (fe *frontendPretty) submitToTarget(value string) bool {
+	if fe.shell == nil {
+		return false
+	}
+	sub, ok := fe.shell.(interface{ SubmitToTarget(string) bool })
+	return ok && sub.SubmitToTarget(value)
+}
+
+// interruptCurrent is Ctrl-C. A serial turn (a shell command or a /command)
+// is cancelled client-side, since that turn IS the client. Otherwise the
+// FOCUSED agent's runtime is interrupted server-side -- explicitly, by
+// address, rather than by re-pointing a cancel at whichever turn happens to
+// hold the handler: an agent that is running but is not the one blocking the
+// client would otherwise be unreachable, and the agent the user is looking at
+// is the only one Ctrl-C may touch (§5.1).
+func (fe *frontendPretty) interruptCurrent() {
+	if !fe.serialRunning && fe.shell != nil {
+		if it, ok := fe.shell.(interface{ InterruptTarget() bool }); ok && it.InterruptTarget() {
+			return
+		}
+	}
+	if fe.shellInterrupt != nil {
+		fe.shellInterrupt(errors.New("interrupted"))
+	}
 }
 
 // setQueuedMessage stores a message on the shell handler to be run as a new
@@ -4721,30 +4960,45 @@ func (fe *frontendPretty) clearQueuedMessage() string {
 // startShellHandle runs a shell turn for value in the background. It is used
 // both for freshly submitted input and to drain a message that was queued
 // after the previous turn's prompt loop finished consuming interjects.
+//
+// A SERIAL turn -- a shell command or a prompt-mode /command -- occupies the
+// handler's single mvdan/sh interpreter, so those are still serialized behind
+// shellLock. A prompt turn is not: it runs server-side in its own agent
+// runtime, and holding the lock would mean an agent that is running blocks
+// every other agent from being spoken to.
 func (fe *frontendPretty) startShellHandle(value string) {
 	if fe.shell == nil {
 		return
 	}
+	serial := true
+	if sh, ok := fe.shell.(interface{ Serial(string) bool }); ok {
+		serial = sh.Serial(value)
+	}
 	ctx, cancel := context.WithCancelCause(fe.shellCtx)
 	fe.shellInterrupt = cancel
-	fe.shellRunning = true
+	fe.turnsRunning++
+	if serial {
+		fe.serialRunning = true
+	}
 
 	// switch back to following the bottom and re-enter nav mode
 	fe.goEnd()
 	fe.enterNavMode(true)
 
 	go func() {
-		fe.shellLock.Lock()
-		defer fe.shellLock.Unlock()
+		if serial {
+			fe.shellLock.Lock()
+			defer fe.shellLock.Unlock()
+		}
 		err := fe.shell.Handle(ctx, value)
 		fe.dispatch(func() {
-			fe.handleShellDone(err)
+			fe.handleShellDone(err, serial)
 			fe.Update()
 		})
 	}()
 }
 
-func (fe *frontendPretty) handleShellDone(err error) {
+func (fe *frontendPretty) handleShellDone(err error, serial bool) {
 	fe.promptErr = err
 	if fe.promptErrLabel != nil {
 		fe.promptErrLabel.SetError(err)
@@ -4758,12 +5012,19 @@ func (fe *frontendPretty) handleShellDone(err error) {
 		fe.enterInsertMode(true)
 	}
 	fe.syncPrompt()
-	fe.shellRunning = false
+	if fe.turnsRunning > 0 {
+		fe.turnsRunning--
+	}
+	if serial {
+		fe.serialRunning = false
+	}
 
 	// The turn is done: if a message was queued behind it (submitted while a
-	// non-prompt turn ran), run it now as a new turn so it is not left stale.
-	if queued := fe.clearQueuedMessage(); queued != "" {
-		fe.startShellHandle(queued)
+	// serial turn ran), run it now as a new turn so it is not left stale.
+	if !fe.serialRunning {
+		if queued := fe.clearQueuedMessage(); queued != "" {
+			fe.startShellHandle(queued)
+		}
 	}
 }
 
@@ -5036,20 +5297,48 @@ func (fe *frontendPretty) llmBranchID(span *dagui.Span) string {
 	if digest == "" {
 		return ""
 	}
-	// Find a span in the DB whose CallDigest matches the LLMCallDigest. This is
-	// the dagql call span (e.g. LLM.withPrompt) that produced the LLM state we
-	// want to branch from.
-	for _, s := range fe.db.Spans.Map {
-		if s.CallDigest == digest {
-			id, err := loadIDFromSpan(s)
-			if err != nil {
-				slog.Debug("failed to load ID from LLM call span", "err", err)
-				continue
-			}
-			return id
-		}
+	id, err := encodedIDForCallDigest(fe.db, digest)
+	if err != nil {
+		slog.Debug("failed to load ID from LLM call span", "err", err)
+		return ""
 	}
-	return ""
+	return id
+}
+
+// encodedIDForCallDigest rebuilds the ID of the dagql call with the given
+// digest from the call payloads this client has ingested, and encodes it.
+//
+// This is the one proven digest→handle path, shared by branch-from-message
+// (which finds an LLM.withPrompt/withResponse call) and roster addressing
+// (which finds the pinned agent(id:, name:) lookup a loop span advertises).
+// It fails loudly when a frame's span never reached this client -- ID.decode
+// reports "call digest %q not found" -- which is the read-only signal a
+// caller must surface rather than treat as a working handle.
+func encodedIDForCallDigest(db *dagui.DB, digest string) (string, error) {
+	if digest == "" {
+		return "", fmt.Errorf("no call digest")
+	}
+	if db == nil {
+		return "", fmt.Errorf("no trace to rebuild from")
+	}
+	var firstErr error
+	for _, s := range db.Spans.Map {
+		if s.CallDigest != digest {
+			continue
+		}
+		id, err := loadIDFromSpan(s)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		return id, nil
+	}
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return "", fmt.Errorf("no span carries call digest %s", digest)
 }
 
 func loadIDFromSpan(span *dagui.Span) (string, error) {

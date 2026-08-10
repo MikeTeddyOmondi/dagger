@@ -52,7 +52,7 @@ func TestAgentRosterHiddenBelowTwoAgents(t *testing.T) {
 }
 
 // TestAgentRosterRendersEveryAgent covers the strip's whole job: every agent
-// present, each with a state flag, on one line.
+// present, each with a jump number and a state flag, on one line.
 func TestAgentRosterRendersEveryAgent(t *testing.T) {
 	line := renderRoster(t, 100, []AgentRosterEntry{
 		{Name: "chief", State: "RUNNING"},
@@ -63,11 +63,11 @@ func TestAgentRosterRendersEveryAgent(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"chief ●run",
-		"scout ○idle",
-		"docs ‖paused",
-		"tests !needs you",
-		"bench ✘failed",
+		"1:chief ●run",
+		"2:scout ○idle",
+		"3:docs ‖paused",
+		"4:tests !needs you",
+		"5:bench ✘failed",
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("expected %q in roster, got:\n%q", want, line)
@@ -75,6 +75,48 @@ func TestAgentRosterRendersEveryAgent(t *testing.T) {
 	}
 	if got := strings.Count(line, "\n"); got != 0 {
 		t.Fatalf("roster must stay one line, got %d newlines:\n%q", got, line)
+	}
+}
+
+// TestAgentRosterMarksFocusAndReachability keeps the two switcher facts
+// legible without color: which agent the prompt addresses (tmux's
+// current-window mark), and which agents can be addressed at all — an entry
+// whose handle the client could not rebuild is watch-only, and must not look
+// like one you can talk to.
+func TestAgentRosterMarksFocusAndReachability(t *testing.T) {
+	line := renderRoster(t, 100, []AgentRosterEntry{
+		{ID: "a", Name: "chief", State: "IDLE"},
+		{ID: "b", Name: "scout", State: "RUNNING", Focused: true},
+		{ID: "c", Name: "ghost", State: "RUNNING", ReadOnly: true},
+	})
+
+	if !strings.Contains(line, "2:scout*") {
+		t.Fatalf("expected the focused agent to be marked, got:\n%q", line)
+	}
+	if strings.Contains(line, "1:chief*") {
+		t.Fatalf("only the focused agent may be marked, got:\n%q", line)
+	}
+	if !strings.Contains(line, "3:ghost·") {
+		t.Fatalf("expected the unaddressable agent to be marked, got:\n%q", line)
+	}
+}
+
+// TestAgentRosterNumbersOnlyJumpableEntries: the numbers are jump targets
+// (alt+1…9), so an entry past the ninth gets none rather than advertising a
+// key that does nothing.
+func TestAgentRosterNumbersOnlyJumpableEntries(t *testing.T) {
+	entries := make([]AgentRosterEntry, 0, 10)
+	for _, name := range []string{
+		"a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10",
+	} {
+		entries = append(entries, AgentRosterEntry{Name: name, State: "IDLE"})
+	}
+	line := renderRoster(t, 400, entries)
+	if !strings.Contains(line, "9:a9") {
+		t.Fatalf("expected the ninth agent to be numbered, got:\n%q", line)
+	}
+	if strings.Contains(line, "10:a10") || !strings.Contains(line, "a10 ") {
+		t.Fatalf("the tenth agent must be listed without a jump number, got:\n%q", line)
 	}
 }
 

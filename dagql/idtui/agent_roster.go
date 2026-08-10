@@ -1,6 +1,7 @@
 package idtui
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
@@ -8,27 +9,39 @@ import (
 	"github.com/vito/tuist"
 )
 
-// AgentRosterEntry is one agent's line in the roster: its display name and
-// the lifecycle state the engine last published for it.
+// AgentRosterEntry is one agent's line in the roster: its identity, its
+// display name, and the lifecycle state the engine last published for it.
 type AgentRosterEntry struct {
-	Name  string
+	// ID is the agent's spawn-minted instance ID — the address a focus
+	// request names. It is never the display name, which carries no identity.
+	ID   string
+	Name string
+	// State is the lifecycle state the engine last published.
 	State string
 	// WaitingOn is what the agent is parked on when State is WAITING_INPUT.
 	WaitingOn string
+	// Focused marks the entry the prompt currently addresses.
+	Focused bool
+	// ReadOnly marks an agent this client cannot address: the engine never
+	// advertised a call digest for it, or the handle failed to rebuild from
+	// the trace. Such an entry can be watched, not spoken to, and says so.
+	ReadOnly bool
 }
 
 // AgentRoster renders a tmux-style strip of the session's live agents
-// directly above the prompt — name plus a state flag each, on one line:
+// directly above the prompt — a jump number, name and state flag each, on one
+// line, with the focused entry marked and inverted:
 //
-//	chief ●run   scout ○idle   docs ●run   tests !needs you
+//	1:chief* ●run   2:scout ○idle   3:docs ●run   4:tests !needs you
 //
 // It sits next to the prompt rather than in the sidebar because "who is
 // running, and who needs me" is a question asked while typing, and the
 // sidebar is a top-right overlay that occludes the tree it summarizes and
 // has no selection model to grow into a switcher.
 //
-// This is the read-only half: the roster surfaces agents but does not yet
-// bind the prompt to one. Nothing here may steal focus.
+// Focus moves only by a keypress (alt+1…9, alt+l), never by an event: an
+// agent that needs the user advertises attention on its entry and waits.
+// Nothing here may steal focus.
 type AgentRoster struct {
 	tuist.Compo
 
@@ -76,12 +89,40 @@ func (r *AgentRoster) Render(ctx tuist.Context) {
 	}
 
 	out := NewOutput(new(strings.Builder), termenv.WithProfile(r.profile))
-	parts := make([]string, 0, len(r.Entries()))
-	for _, entry := range r.Entries() {
+	entries := r.Entries()
+	parts := make([]string, 0, len(entries))
+	for i, entry := range entries {
 		glyph, label, color := agentStateDisplay(entry.State)
-		name := out.String(entry.Name).Foreground(termenv.ANSIWhite).String()
+
+		// Jump numbers only where a jump key exists (alt+1…9); beyond that
+		// the entry is still listed, just not directly addressable by key.
+		var prefix string
+		if i < 9 {
+			prefix = strconv.Itoa(i+1) + ":"
+		}
+
+		name := entry.Name
+		switch {
+		case entry.Focused:
+			// tmux's current-window marker: a textual mark, so focus is
+			// legible on a terminal (or in a test) that keeps no styling.
+			name += "*"
+		case entry.ReadOnly:
+			// Watch-only: the client holds no handle for it, so mark it
+			// rather than letting it look like something you can talk to.
+			name += "·"
+		}
+
+		nameStyle := out.String(prefix + name)
+		if entry.Focused {
+			nameStyle = nameStyle.Reverse().Bold()
+		} else if entry.ReadOnly {
+			nameStyle = nameStyle.Foreground(termenv.ANSIBrightBlack)
+		} else {
+			nameStyle = nameStyle.Foreground(termenv.ANSIWhite)
+		}
 		flag := out.String(glyph + label).Foreground(color).String()
-		parts = append(parts, name+" "+flag)
+		parts = append(parts, nameStyle.String()+" "+flag)
 	}
 
 	line := strings.Join(parts, out.String("   ").String())
