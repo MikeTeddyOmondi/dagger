@@ -1480,7 +1480,10 @@ What is NOT built — threads to pull, each self-contained:
     to decode, so the next occurrence names the frame and says whether it hung
     off the receiver spine or an argument (`dagql/dagui/extract.go`,
     `extract_test.go`). Reproducing against a build with that in is step one;
-    it should identify the frame outright.
+    it should identify the frame outright. (Since extended, §11.2 measurement
+    1: the referring frame now carries its own digest and arguments, so it is
+    findable in the trace rather than merely named — the errors quoted below
+    are the older field-and-type-only shape.)
     **Unproven, and the first thing to measure.** The error bottoms out behind
     an **argument**, not on the receiver spine. `modules/staff` passes
     post-evaluation objects around (`source: Workspace!`, the bound
@@ -1693,14 +1696,28 @@ client-issued composition, which is most of the search space gone.
 
 **Mode A: the next two measurements, in order.**
 
-1. **Cheap, do it first regardless.** Make the walk report the referring
-   call's own digest and arguments next to the missing receiver's digest
-   (`dagql/dagui/extract.go`, `missingCall`/`frameLabel`). Today it names the
-   referrer only by field and type — "some `directory` call" — while the
-   missing receiver survives as a bare digest that identifies nothing. With
-   the referrer's digest and args in hand the frame is findable in the trace
-   and the receiver is identifiable by inspection. This round was lost to
-   hypothesis where inspection would have settled it in minutes.
+1. **DONE.** The walk now reports the referring call's own digest and
+   arguments next to the missing receiver's digest (`dagql/dagui/extract.go`:
+   `missingCall`, `frameRef`, `frameDetail`; covered by `extract_test.go`).
+   It used to name the referrer by field and type alone — "some `directory`
+   call", of which a real chain has several — while the missing receiver
+   survives only as a digest, because its payload is precisely what never
+   arrived. A gap now reads
+
+       cannot rebuild ID for "agent" (Agent): call xxh3:b034a1d294a17bec
+       never reached this client, referenced as receiver of "directory"
+       (Directory) xxh3:1a2b3c4d5e6f7a8b(path: "/src", include: ["**/*.go"])
+
+   so the referring frame is greppable in the trace and its arguments
+   normally identify the missing receiver by inspection. An ID-literal
+   argument renders as the digest it points at, which is what traces a gap
+   behind an argument to the argument holding it; every unbounded lane
+   (string length, list length, argument count) is capped, since an argument
+   can carry a whole file and this lands in an error message. Two notes for
+   readers: "never reached this client" moved next to the digest it is about,
+   so the strings quoted in item 16 and under MODE A above are the OLD shape;
+   and this has not yet been exercised against a live MODE A failure, which
+   is measurement 2's job.
 2. **Then reproduce on the untested dimension**: `TestRosterAddressingFromModule`
    with a host-backed workspace threaded through the module. That is the
    shape the live failure actually had and the one no test covers — a chain
@@ -1708,13 +1725,11 @@ client-issued composition, which is most of the search space gone.
    host reads routed through `withWorkspaceHostReadContext` for another
    client.
 
-**Lost work worth recreating (~150 lines).** A probe test,
-`TestRosterAddressingHostWorkspace`, was written and measured but lost with
-its worker's workspace before it could be harvested. It is
-`TestRosterAddressing` plus a host-backed workspace bound via
-`spawnOpts.wsID`, with the session pointed at a temp-dir git repo via
-`dagger.WithWorkdir`, in three cases. Recorded here so it can be rebuilt
-without re-deriving the design:
+**Lost work, RECREATED.** A probe test, `TestRosterAddressingHostWorkspace`,
+was written and measured but lost with its worker's workspace before it could
+be harvested. It is `TestRosterAddressing` plus a host-backed workspace bound
+via `spawnOpts.wsID`, with the session pointed at a temp-dir git repo via
+`dagger.WithWorkdir`, in three cases:
 
 | case | workspace | result |
 |---|---|---|
@@ -1728,6 +1743,28 @@ state — Mode B. `withNewFile` is the workspace edit verb
 (core/schema/workspace.go:130). The nested-session skip does NOT trigger under
 the engine-dev test container, which sets `_EXPERIMENTAL_DAGGER_RUNNER_HOST`
 rather than `DAGGER_SESSION_PORT`, so these tests really run there.
+
+It now lives in `core/integration/agent_runtime_test.go`, and a run against a
+from-source engine reproduced that table exactly, failure message included —
+so nothing about Mode B has moved. Two things about its shape, because they
+are the reason it can sit in a green tree:
+
+- **The assertions are split at the seam, not skipped wholesale.** Everything
+  through the rebuild and the literal-derived identity (`name`, `instanceID`)
+  RUNS in all three cases — that half is genuine Mode A coverage, and it
+  passing is the measurement that says a workspace in the seed does not break
+  the walk. Only the runtime-identity assertions past it (`state`, the
+  transcript marker, the QUEUED send) are skipped for the two
+  `currentWorkspace` cases, with a `known-broken:` message naming this
+  section — the convention item 15 set. Note a mid-test `t.Skip` does not
+  hide earlier failures: the test still reports FAIL if anything before it
+  failed.
+- **To re-measure the defect, delete the skip.** The assertions it guards are
+  the CORRECT expectations, so when the registry stops keying on the value
+  digest the whole change here is removing three lines. Nothing in the test
+  asserts the broken behaviour, deliberately: an assertion adjusted until it
+  passes would have to be un-adjusted by exactly the person least able to
+  tell it apart from intent.
 
 **Two hazards for whoever picks this up.** Do not open the investigation by
 calling a `modules/staff` tool on a resumed session (§11.1, item 13) — it
