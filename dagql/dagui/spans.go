@@ -162,7 +162,19 @@ func (span *Span) CallID() (*call.ID, error) {
 		RootDigest:    spanCall.Digest,
 		CallsByDigest: map[string]*callpbv1.Call{},
 	}
-	extractIntoDAG(recipe, span.db, spanCall.Digest)
+	// Report the gap here rather than letting decode trip over it below: this
+	// is the only layer that knows which frame referenced the missing call,
+	// and a chain deep enough to matter turns the decode error into a stack of
+	// "failed to decode receiver Call" with a bare digest at the bottom.
+	//
+	// A gap means some frame's span never reached this client -- it carries no
+	// DagCallAttr payload, or was never ingested at all -- so the ID is not
+	// rebuildable and the caller must degrade (a read-only roster entry, no
+	// branch-from-message) rather than act on a truncated chain.
+	if missing := extractIntoDAG(recipe, span.db, spanCall.Digest); len(missing) > 0 {
+		return nil, fmt.Errorf("cannot rebuild ID for %s: %s never reached this client",
+			frameLabel(spanCall), missing[0])
+	}
 	dag := &callpbv1.DAG{
 		Value: &callpbv1.DAG_Recipe{
 			Recipe: recipe,
