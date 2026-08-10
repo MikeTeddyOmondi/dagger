@@ -780,6 +780,13 @@ core/integration/agent_runtime_test.go), ratified here:
   worker composed inside a module carries no module frame at all unless one
   rides in on an argument — e.g. a module object bound with `withTools`,
   which is how a chief's own conversation gets one.
+  **Scope correction, measured later:** "verified end to end" covers what
+  those two tests compose, and a live session found a staff worker whose
+  chain could NOT be rebuilt — the gap sitting behind an ID-literal argument,
+  in the same session that spawned it (item 16). Neither test carries a
+  post-evaluation object argument; every staff worker does. Treat the
+  guarantee as holding for the compositions it was measured on until item 16
+  is root-caused.
 - **Identity rides span attributes; state rides log records.** The split is
   forced by the export model, not chosen for tidiness. A live span is
   exported as a *snapshot taken at span start* (`LiveSpanProcessor.OnStart`
@@ -1368,6 +1375,64 @@ What is NOT built — threads to pull, each self-contained:
     Worth pairing with item 10 (workers not knowing their own name), which
     also wants to interpolate into `workerPrompt` and would move the same
     seed boundary.
+16. **A staff-spawned worker can be unaddressable from the roster in the SAME
+    session** (§3.3, §9) — distinct from item 13, which needs a restart.
+    Observed live: a worker spawned through `modules/staff` rendered on the
+    roster carrying the read-only marker, and focusing it failed with
+
+        agent "scout" cannot be addressed: failed to decode DAG: failed to
+        decode receiver Call: <×13> … failed to decode argument: failed to
+        decode argument value: failed to decode literal Call: failed to
+        decode receiver Call: call digest "xxh3:76d54f087f21f29e" not found
+
+    No restart, no resume, no saved recipe: the agent was spawned minutes
+    earlier in the same client process, and stayed fully drivable through the
+    chief's held handle the whole time — `sendTo` delivered `STEERED` into its
+    open turn, `collect` and the whole harvest family worked. So this is not
+    item 13's revival: the runtime is live and correct, and it is *addressing*
+    that fails — the one thing §9 claimed was verified end to end rather than
+    argued.
+    **Established.** `focusAgent` rebuilds a handle via
+    `encodedIDForCallDigest` → `Span.CallID` → `extractIntoDAG`, and the walk
+    needs a call payload for every frame the chain references, including
+    frames buried inside ID-literal arguments. `extractIntoDAG` dropped
+    unresolvable frames *silently*, so the gap only surfaced later inside
+    `ID.decode` as `call digest %q not found` (dagql/call/id.go:767-770),
+    wrapped once per frame it unwound through — a wall of identical wrappers
+    naming a digest but never the frame that wanted it. The payload was never
+    ingested rather than evicted: `DB.CallPayloads` has no pruning path.
+    **Fixed, the diagnostic half only**: the walk now records the referring
+    frame and `Span.CallID` fails there instead of handing a truncated recipe
+    to decode, so the next occurrence names the frame and says whether it hung
+    off the receiver spine or an argument (`dagql/dagui/extract.go`,
+    `extract_test.go`). Reproducing against a build with that in is step one;
+    it should identify the frame outright.
+    **Unproven, and the first thing to measure.** The error bottoms out behind
+    an **argument**, not on the receiver spine. `modules/staff` passes
+    post-evaluation objects around (`source: Workspace!`, the bound
+    `[Agent!]`), and §4.1 and §9 both measured that a post-evaluation
+    `Result.ID()` is the HANDLE form — an engine-local shared-result reference
+    (`call.NewEngineResultID`, dagql/cache.go:2250) which is not a call recipe
+    and which no span ever publishes. If a handle-form ID can be embedded as
+    an argument in a recorded call, then no trace can ever resolve it, and
+    roster addressing is broken *by construction* for any composition that
+    routes an object through a module function — which is every staff worker,
+    making this the common case rather than an edge.
+    Runners-up, ruled out by reading and not by measurement: a frame whose
+    sole emission happened in a nested module session this client never
+    ingested; and `ShouldEmitTelemetry`'s per-session dedupe
+    (dagql/telemetry.go:48-64) losing that sole emission — it emits
+    unconditionally for `DoNotCache` calls, so it should always emit at least
+    once.
+    Why it matters past one keypress: §3.3 renounced `Query.agents` *because*
+    telemetry is the directory, so there is no fallback. An unaddressable
+    agent can be watched but never focused, prompted or stopped from the UI,
+    and the spawning chief's held handle is the only thing that can still
+    reach it — which means a worker whose chief is gone is unreachable, full
+    stop. If the handle-form reading is right, this also retires §9's
+    "verified end to end" as scoped to compositions that carry no
+    post-evaluation object argument, which the two roster tests happen to
+    satisfy and real staff sessions do not.
 
 ### 11.1 Notes for live QA
 
@@ -1390,6 +1455,11 @@ session by hand:
 - **Harvest inside the session that spawned the worker** (item 12): a
   tombstone re-selected later projects IDLE-from-absence with the seed as its
   snapshot, so harvest silently reports "nothing new" rather than failing.
+- **A worker you spawned this session may still be roster-unaddressable**
+  (item 16). The strip marks it read-only (`·` after the name) and focusing it
+  fails with a wall of `failed to decode receiver Call`. Nothing is wrong with
+  the worker: steer and harvest it through the chief's tools as usual. Do not
+  read the marker as "the agent died".
 - **A worker's commit on this document may be unpullable, via item 14.** When
   the changeset machinery loses tracked-ness, a small prose edit is recorded
   as a whole-file ADD, and `pullConflicted` then refuses it — an add cannot
