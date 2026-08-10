@@ -655,6 +655,22 @@ core/integration/agent_runtime_test.go), ratified here:
   pinned chain (~24 bytes, an engine-local shared-result reference), while
   the trace-rebuilt one is the *recipe* form (~350 bytes for a bare `llm`
   seed, growing with the composition) — different encodings, same instance.
+  The headline case — an agent spawned INSIDE a module call, which the user
+  never spawned and holds no handle to — is covered by
+  `TestRosterAddressingFromModule` (fixture
+  `testdata/modules/go/agent-hirer`), and closes too: a chain mixing client
+  calls, calls the module issued from its nested session, and a module
+  provenance frame all rebuild, because every dagql call span carries its
+  payload wherever it was issued. Two notes for whoever wires the UI. The
+  walk's failure mode is loud, not silent — `ID.decode` errors with `call
+  digest %q not found` (dagql/call/id.go:767-770), so a roster entry
+  degrading to read-only is detectable rather than a wrong handle. And
+  module frames are rarer in agent chains than expected: provenance attaches
+  to module-DEFINED fields (core/object.go:1107), and a module function
+  returning a core object hands back that object's own core recipe, so a
+  worker composed inside a module carries no module frame at all unless one
+  rides in on an argument — e.g. a module object bound with `withTools`,
+  which is how a chief's own conversation gets one.
 - **Identity rides span attributes; state rides log records.** The split is
   forced by the export model, not chosen for tidiness. A live span is
   exported as a *snapshot taken at span start* (`LiveSpanProcessor.OnStart`
@@ -872,7 +888,8 @@ What is BUILT (see also §9 for ratified semantics):
   (15 cases, including the drift, dirty-refusal, cascade and hand-merge
   cases), plus a live end-to-end pass of the whole loop against real
   workers.
-- **Tests**: `core/integration/agent_runtime_test.go` +
+- **Tests**: `core/integration/agent_runtime_test.go` (fixture
+  `testdata/modules/go/agent-hirer`, for the module-internal roster case) +
   `agent_injection_test.go` (fixture
   `testdata/modules/go/agent-poker`) + `staff_test.go` (E2E over the
   served `modules/staff`: spawn → askChief steering into the chief's open
@@ -896,8 +913,13 @@ What is NOT built — threads to pull, each self-contained:
    when the digest does not resolve; then the rest of §5.1 — focus with
    per-agent drafts, the tmux keymap, and the `LLMSession` send-routing
    refactor, which must land as one change. The risky half is de-risked:
-   that path is proven to yield a handle on the live runtime
-   (`TestRosterAddressing`, §9), so what remains here is UI wiring.
+   that path yields a handle on the live runtime for a client-composed
+   agent (`TestRosterAddressing`, §9) AND for the module-internal one the
+   roster exists for (`TestRosterAddressingFromModule`), so what remains
+   here is UI wiring. The one contract to honour when wiring it: rebuild
+   errors — a frame whose span never reached this client
+   (dagql/call/id.go:767) — are the read-only signal, so surface them as
+   such rather than letting a failed rebuild look like a working entry.
 2. **Enqueue guards** (§3.3): depth limiting, self-send rejection, cycle
    detection — none exist. Central point: the enqueue path in
    `AgentRuntimes` (`Send`). Until then `modules/staff` documents the
