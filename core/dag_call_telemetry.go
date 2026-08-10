@@ -45,8 +45,8 @@ const CallPayloadInstrumentationScope = "dagger.io/dag.call"
 // makes this at most one closure walk per distinct call digest per session.
 //
 // Everything here is best-effort. A payload that cannot be built or encoded is
-// dropped with a warning rather than failing the call; the consequence is a
-// client that cannot rebuild that one chain, which is exactly the status quo.
+// dropped rather than failing the call; the consequence is a client that
+// cannot rebuild that one chain, which is exactly the status quo.
 func recordCallPayloads(
 	ctx context.Context,
 	store dagql.TelemetrySeenKeyStore,
@@ -91,14 +91,19 @@ func recordCallPayloads(
 			// carried by this call's own span, and claimed above
 			continue
 		}
-		// Encode BEFORE claiming: a digest claimed for a payload that then
-		// fails to encode would never be published by anyone.
+		// Claim before encoding, not after: the frames of a chain are mostly
+		// claimed already by the time any given call walks it, and encoding
+		// each one just to discard it would make the walk cost proportional
+		// to the whole chain's size every time. The trade is that a payload
+		// whose encoding fails is claimed and therefore never published by
+		// anyone — acceptable for a proto marshal that cannot fail for a
+		// well-formed frame, and which would fail identically next time.
+		if !dagql.ShouldEmitCallPayload(store, dgst) {
+			continue
+		}
 		payload, err := callPB.Encode()
 		if err != nil {
 			slog.WarnContext(ctx, "failed to encode call payload", "digest", dgst, "err", err)
-			continue
-		}
-		if !dagql.ShouldEmitCallPayload(store, dgst) {
 			continue
 		}
 		rec := log.Record{}
