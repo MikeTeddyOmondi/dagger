@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/dagger/dagger/dagql/call/callpbv1"
 	"github.com/dagger/dagger/dagql/dagui"
 	"github.com/stretchr/testify/require"
-	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/vito/tuist"
 )
 
@@ -101,13 +101,28 @@ func (h *focusShellHandler) DequeueMessage() string {
 	return msg
 }
 
-func (h *focusShellHandler) snapshot() (submitted, handled, focused []string, interrupts int) {
+func (h *focusShellHandler) submittedMessages() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return append([]string(nil), h.submitted...),
-		append([]string(nil), h.handled...),
-		append([]string(nil), h.focused...),
-		h.interrupts
+	return append([]string(nil), h.submitted...)
+}
+
+func (h *focusShellHandler) handledInput() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.handled...)
+}
+
+func (h *focusShellHandler) focusedAgents() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.focused...)
+}
+
+func (h *focusShellHandler) interruptCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.interrupts
 }
 
 // focusTestFrontend brings up a headless shell frontend around handler.
@@ -137,9 +152,8 @@ func TestSubmitAsksTheTargetFirst(t *testing.T) {
 	fe.textInput.SetValue("steer the focused agent")
 	fe.handleInputComplete()
 
-	submitted, handled, _, _ := handler.snapshot()
-	require.Equal(t, []string{"steer the focused agent"}, submitted)
-	require.Empty(t, handled, "an absorbed message must not open a turn")
+	require.Equal(t, []string{"steer the focused agent"}, handler.submittedMessages())
+	require.Empty(t, handler.handledInput(), "an absorbed message must not open a turn")
 
 	// With nothing to absorb it, the same message opens a turn instead.
 	handler.mu.Lock()
@@ -149,7 +163,7 @@ func TestSubmitAsksTheTargetFirst(t *testing.T) {
 	fe.textInput.SetValue("open a new turn")
 	fe.handleInputComplete()
 	require.Eventually(t, func() bool {
-		_, handled, _, _ := handler.snapshot()
+		handled := handler.handledInput()
 		return len(handled) == 1 && handled[0] == "open a new turn"
 	}, 5*time.Second, 10*time.Millisecond)
 }
@@ -167,8 +181,7 @@ func TestMessageQueuesOnlyBehindASerialTurn(t *testing.T) {
 	fe.textInput.SetValue("wait your turn")
 	fe.handleInputComplete()
 
-	_, handled, _, _ := handler.snapshot()
-	require.Empty(t, handled)
+	require.Empty(t, handler.handledInput())
 	require.Equal(t, "wait your turn", fe.queuedMsgLabel.Message())
 
 	// Nothing serial running: the message opens its own turn immediately,
@@ -178,7 +191,7 @@ func TestMessageQueuesOnlyBehindASerialTurn(t *testing.T) {
 	fe.textInput.SetValue("straight through")
 	fe.handleInputComplete()
 	require.Eventually(t, func() bool {
-		_, handled, _, _ := handler.snapshot()
+		handled := handler.handledInput()
 		return len(handled) == 1 && handled[0] == "straight through"
 	}, 5*time.Second, 10*time.Millisecond)
 }
@@ -194,15 +207,14 @@ func TestCtrlCPreemptsTheFocusedAgent(t *testing.T) {
 	fe.shellInterrupt = func(error) { canceled++ }
 
 	pressEditlineKey(t, fe, uv.Key{Code: 'c', Mod: uv.ModCtrl})
-	_, _, _, interrupts := handler.snapshot()
-	require.Equal(t, 1, interrupts)
+	require.Equal(t, 1, handler.interruptCount())
 	require.Zero(t, canceled, "the focused agent is interrupted server-side")
 
 	// A shell command owns the client, so Ctrl-C cancels it as before.
 	fe.serialRunning = true
 	pressEditlineKey(t, fe, uv.Key{Code: 'c', Mod: uv.ModCtrl})
-	_, _, _, interrupts = handler.snapshot()
-	require.Equal(t, 1, interrupts, "no agent is interrupted while a shell command runs")
+	require.Equal(t, 1, handler.interruptCount(),
+		"no agent is interrupted while a shell command runs")
 	require.Equal(t, 1, canceled)
 }
 
@@ -212,8 +224,21 @@ func TestCtrlCPreemptsTheFocusedAgent(t *testing.T) {
 func rosterDB(t *testing.T) *dagui.DB {
 	t.Helper()
 	db := dagui.NewDB()
+	calls, snapshots := rosterTrace()
+	for digest, call := range calls {
+		db.Calls[digest] = call
+	}
+	db.ImportSnapshots(snapshots)
+	return db
+}
+
+// rosterTrace is the raw material of rosterDB: the call payloads a client
+// ingests, and the spans that carry them.
+func rosterTrace() (map[string]*callpbv1.Call, []dagui.SpanSnapshot) {
 	start := time.Unix(100, 0)
 	traceID := prettyTestTraceID()
+	calls := map[string]*callpbv1.Call{}
+	var snapshots []dagui.SpanSnapshot
 
 	for i, agent := range []struct {
 		name   string
@@ -225,13 +250,13 @@ func rosterDB(t *testing.T) *dagui.DB {
 		{"chief", "agent-chief", "sha256:chief", 1, 2},
 		{"scout", "agent-scout", "sha256:scout", 3, 4},
 	} {
-		db.Calls[agent.digest] = &callpbv1.Call{
+		calls[agent.digest] = &callpbv1.Call{
 			Digest: agent.digest,
 			Field:  "agent",
 			Type:   &callpbv1.Type{NamedType: "Agent"},
 		}
-		db.ImportSnapshots([]dagui.SpanSnapshot{
-			{
+		snapshots = append(snapshots,
+			dagui.SpanSnapshot{
 				ID:        prettyTestSpanID(agent.span),
 				TraceID:   traceID,
 				Name:      "agent: " + agent.name,
@@ -244,16 +269,16 @@ func rosterDB(t *testing.T) *dagui.DB {
 				AgentCallDigest: agent.digest,
 				AgentState:      "IDLE",
 			},
-			{
+			dagui.SpanSnapshot{
 				ID:         prettyTestSpanID(agent.call),
 				TraceID:    traceID,
 				Name:       "agent(id:)",
 				StartTime:  start.Add(time.Duration(i) * time.Second),
 				CallDigest: agent.digest,
 			},
-		})
+		)
 	}
-	return db
+	return calls, snapshots
 }
 
 // TestFocusKeyRetargetsAndKeepsDrafts covers the switcher: a numbered jump
@@ -273,7 +298,7 @@ func TestFocusKeyRetargetsAndKeepsDrafts(t *testing.T) {
 	fe.textInput.SetValue("half a thought")
 	require.True(t, pressEditlineKey(t, fe, uv.Key{Code: '2', Mod: uv.ModAlt}))
 	require.Eventually(t, func() bool {
-		_, _, focused, _ := handler.snapshot()
+		focused := handler.focusedAgents()
 		return len(focused) == 1 && focused[0] == "agent-scout"
 	}, 5*time.Second, 10*time.Millisecond)
 	fe.tui.Step()
@@ -287,7 +312,7 @@ func TestFocusKeyRetargetsAndKeepsDrafts(t *testing.T) {
 	fe.textInput.SetValue("for the scout")
 	require.True(t, pressEditlineKey(t, fe, uv.Key{Code: 'l', Mod: uv.ModAlt}))
 	require.Eventually(t, func() bool {
-		_, _, focused, _ := handler.snapshot()
+		focused := handler.focusedAgents()
 		return len(focused) == 2 && focused[1] == "agent-chief"
 	}, 5*time.Second, 10*time.Millisecond)
 	fe.tui.Step()
@@ -295,8 +320,7 @@ func TestFocusKeyRetargetsAndKeepsDrafts(t *testing.T) {
 
 	require.True(t, pressEditlineKey(t, fe, uv.Key{Code: '2', Mod: uv.ModAlt}))
 	require.Eventually(t, func() bool {
-		_, _, focused, _ := handler.snapshot()
-		return len(focused) == 3
+		return len(handler.focusedAgents()) == 3
 	}, 5*time.Second, 10*time.Millisecond)
 	fe.tui.Step()
 	require.Equal(t, "for the scout", fe.textInput.Value())
@@ -314,8 +338,8 @@ func TestUnaddressableAgentIsReadOnly(t *testing.T) {
 	fe := focusTestFrontend(t, db, handler)
 
 	require.True(t, pressEditlineKey(t, fe, uv.Key{Code: '2', Mod: uv.ModAlt}))
-	_, _, focused, _ := handler.snapshot()
-	require.Empty(t, focused, "focus must not move to an agent with no handle")
+	require.Empty(t, handler.focusedAgents(),
+		"focus must not move to an agent with no handle")
 	require.Error(t, fe.promptErr)
 
 	entries := fe.agentRosterEntries()
@@ -323,7 +347,33 @@ func TestUnaddressableAgentIsReadOnly(t *testing.T) {
 	require.True(t, entries[0].Focused, "focus stays where it was")
 
 	// And the strip says so, rather than rendering a normal-looking entry.
-	fe.agentRoster.Update()
+	// (Going through updateAgentRoster is the real path: the strip's content
+	// comes from the trace, so something has to push it.)
+	fe.updateAgentRoster()
 	frame := strings.Join(fe.tui.Step(), "\n")
 	require.Contains(t, frame, "scout·")
+}
+
+// TestRosterRendersWhenAgentsAppear: the strip's content comes from the trace
+// rather than from a setter, so a component that is never marked dirty renders
+// once -- empty -- and never again. The trace push is what makes it visible at
+// all.
+func TestRosterRendersWhenAgentsAppear(t *testing.T) {
+	handler := &focusShellHandler{target: "agent-chief"}
+	fe := focusTestFrontend(t, dagui.NewDB(), handler)
+
+	frame := strings.Join(fe.tui.Step(), "\n")
+	require.NotContains(t, frame, "chief", "a session with no agents has no strip")
+
+	// The agents arrive on the trace, exactly as the exporters deliver them.
+	calls, snapshots := rosterTrace()
+	for digest, call := range calls {
+		fe.db.Calls[digest] = call
+	}
+	fe.db.ImportSnapshots(snapshots)
+	fe.updateAgentRoster()
+
+	frame = strings.Join(fe.tui.Step(), "\n")
+	require.Contains(t, frame, "1:chief*")
+	require.Contains(t, frame, "2:scout")
 }

@@ -378,13 +378,6 @@ func (a *sessionAgent) endTurn() {
 	}
 }
 
-// inTurn reports whether a prompt turn is in flight on this conversation.
-func (a *sessionAgent) inTurn() bool {
-	a.turnL.Lock()
-	defer a.turnL.Unlock()
-	return a.turnCancel != nil
-}
-
 // Submit hands a message to this conversation's in-flight turn, reporting
 // whether there was one. The send is fire-and-forget: the engine records it
 // immediately (absorbing it into the running turn at the next step boundary --
