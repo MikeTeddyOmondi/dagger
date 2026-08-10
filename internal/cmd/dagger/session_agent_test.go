@@ -151,21 +151,40 @@ func TestSubmitGoesToTheFocusedAgentNotTheBusyOne(t *testing.T) {
 	require.Zero(t, sent, "the chief must not have received anything")
 }
 
-// TestSubmitNeedsBothATurnAndARuntime covers the two ways there is nothing to
-// absorb a message: no turn is open, or the conversation never spawned.
-func TestSubmitNeedsBothATurnAndARuntime(t *testing.T) {
+// TestSubmitBuffersWhileTheTurnIsStillOpening: sending the prompt takes
+// engine round-trips, and a message typed during that window must join the
+// turn being opened rather than open a rival one -- a rival submit would
+// re-run reference attachment and auto-compaction, either of which can
+// replace the LLM wholesale and stop the runtime mid-turn.
+func TestSubmitBuffersWhileTheTurnIsStillOpening(t *testing.T) {
+	s, _ := testSession(t)
+	opening := s.newAgent("fresh")
+	s.agents = append(s.agents, opening)
+	s.SetTarget(opening)
+
+	// No turn at all: nothing absorbs the message.
+	require.False(t, s.SubmitToTarget("nobody home"))
+
+	// A turn is opening, but has no runtime yet: accepted and buffered.
+	opening.beginTurn(func(error) {})
+	require.True(t, s.SubmitToTarget("typed while spawning"))
+
+	// The submit that opened the turn flushes the buffer once its runtime
+	// exists, so the message lands on the record behind the prompt.
+	rt := newFakeRuntime()
+	opening.bindRuntime(rt, "agent-fresh", "", true)
+	opening.flushPending(rt)
+	require.Equal(t, "typed while spawning", rt.awaitSend(t))
+}
+
+// TestSubmitNeedsATurn: with no turn open the message is not absorbed, so the
+// caller opens one.
+func TestSubmitNeedsATurn(t *testing.T) {
 	s, agents := testSession(t, "chief")
 	chief := agents[0]
 
 	require.False(t, s.SubmitToTarget("no turn open"))
 
-	unspawned := s.newAgent("fresh")
-	s.agents = append(s.agents, unspawned)
-	s.SetTarget(unspawned)
-	unspawned.beginTurn(func(error) {})
-	require.False(t, s.SubmitToTarget("no runtime"))
-
-	s.SetTarget(chief)
 	chief.beginTurn(func(error) {})
 	require.True(t, s.SubmitToTarget("absorbed"))
 	require.Equal(t, "absorbed", runtimeOf(t, chief).awaitSend(t))

@@ -147,9 +147,12 @@ type sessionAgent struct {
 	attachedID string
 
 	// turnCancel cancels the in-flight turn's await, non-nil only while
-	// WithPrompt blocks. It is per-conversation on purpose: Ctrl-C interrupts
+	// WithPrompt runs. It is per-conversation on purpose: Ctrl-C interrupts
 	// the FOCUSED agent, which is not necessarily the one holding a turn.
+	// pending buffers messages submitted while the turn was still opening,
+	// before there was a runtime to send them to.
 	turnCancel context.CancelCauseFunc
+	pending    []string
 	turnL      sync.Mutex
 
 	autoCompact  bool
@@ -272,10 +275,14 @@ func (a *sessionAgent) currentAgent(ctx context.Context) (agentRuntime, error) {
 	handle := dagger.Ref[*dagger.Agent](a.session.dag, agentID)
 	// Learn the spawn-minted instance ID: it is what the roster keys on, so
 	// without it a focus request naming this very agent would attach a second
-	// conversation to the runtime this one already drives.
+	// conversation to the runtime this one already drives. Best-effort: an
+	// engine older than the field still spawns and prompts perfectly well, it
+	// just cannot be correlated with its roster entry, so this must never
+	// fail a turn.
 	instanceID, err := handle.InstanceID(ctx)
 	if err != nil {
-		return nil, err
+		slog.Debug("agent instance ID unavailable; roster correlation disabled", "error", err)
+		instanceID = ""
 	}
 	rt := liveAgent{dag: a.session.dag, agent: handle}
 	a.bindRuntime(rt, instanceID, "", true)
@@ -339,6 +346,12 @@ func (a *sessionAgent) dropAgent() {
 
 // beginTurn publishes the cancel func of the turn now in flight, making this
 // conversation interruptible and its turn able to absorb submitted messages.
+//
+// It is called at the START of a submit, not when the await opens: sending
+// the prompt takes engine round-trips (compaction, spawn, send), and a message
+// typed during that window must join THIS turn rather than open a rival one --
+// a rival submit would re-run attachReferences and auto-compaction, either of
+// which can replace the LLM wholesale and so stop the runtime mid-turn.
 func (a *sessionAgent) beginTurn(cancel context.CancelCauseFunc) {
 	a.turnL.Lock()
 	a.turnCancel = cancel
@@ -348,7 +361,15 @@ func (a *sessionAgent) beginTurn(cancel context.CancelCauseFunc) {
 func (a *sessionAgent) endTurn() {
 	a.turnL.Lock()
 	a.turnCancel = nil
+	pending := a.pending
+	a.pending = nil
 	a.turnL.Unlock()
+	// Anything still buffered was accepted for a turn that never got to send
+	// it (an error before the runtime existed). Report rather than drop: the
+	// user was told it landed.
+	for _, msg := range pending {
+		slog.Warn("message could not be delivered to the agent", "message", msg)
+	}
 }
 
 // inTurn reports whether a prompt turn is in flight on this conversation.
@@ -363,28 +384,53 @@ func (a *sessionAgent) inTurn() bool {
 // immediately (absorbing it into the running turn at the next step boundary --
 // STEERED -- or queuing it behind a pause), and its reply arrives within the
 // same turn's await, so there is nothing further to wait on here.
+//
+// A turn that is still opening has no runtime to send to yet, so the message
+// is buffered and flushed by the submit that opened it -- accepted either
+// way, since the alternative is opening a rival turn on the same conversation.
 func (a *sessionAgent) Submit(msg string) bool {
-	if !a.inTurn() {
+	a.turnL.Lock()
+	if a.turnCancel == nil {
+		a.turnL.Unlock()
 		return false
 	}
 	rt := a.runtime()
 	if rt == nil {
-		return false
+		a.pending = append(a.pending, msg)
+		a.turnL.Unlock()
+		return true
 	}
-	go func() {
-		handle, err := rt.SendMessage(a.session.plumbingCtx, msg)
-		if err != nil {
-			slog.Error("failed to submit message to agent", "error", err)
-			return
-		}
-		delivery, err := handle.Delivery(a.session.plumbingCtx)
-		if err != nil {
-			slog.Error("failed to read submitted message delivery", "error", err)
-			return
-		}
-		slog.Debug("submitted mid-turn message", "delivery", delivery)
-	}()
+	a.turnL.Unlock()
+	go a.send(rt, msg)
 	return true
+}
+
+// send enqueues one message and logs how it landed.
+func (a *sessionAgent) send(rt agentRuntime, msg string) {
+	handle, err := rt.SendMessage(a.session.plumbingCtx, msg)
+	if err != nil {
+		slog.Error("failed to submit message to agent", "error", err)
+		return
+	}
+	delivery, err := handle.Delivery(a.session.plumbingCtx)
+	if err != nil {
+		slog.Error("failed to read submitted message delivery", "error", err)
+		return
+	}
+	slog.Debug("submitted mid-turn message", "delivery", delivery)
+}
+
+// flushPending sends the messages that arrived while the turn was still
+// opening, in the order they were submitted and after the prompt that opened
+// the turn.
+func (a *sessionAgent) flushPending(rt agentRuntime) {
+	a.turnL.Lock()
+	pending := a.pending
+	a.pending = nil
+	a.turnL.Unlock()
+	for _, msg := range pending {
+		a.send(rt, msg)
+	}
 }
 
 // Interrupt preempts this conversation, reporting whether there was anything
@@ -452,6 +498,16 @@ func (a *sessionAgent) syncFromAgent(rt agentRuntime) error {
 // so history, /commands, and session saving keep operating on the honest
 // chain.
 func (a *sessionAgent) WithPrompt(ctx context.Context, input string) error {
+	// The turn's context is this conversation's own, so an interrupt aimed at
+	// this agent stops this turn and no other. It is published before any of
+	// the work below: from here on the conversation is busy, so a message
+	// typed while the prompt is still being sent joins this turn instead of
+	// opening a rival one.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	a.beginTurn(cancel)
+	defer a.endTurn()
+
 	// Resolve any @-path references in the prompt: paths already inside the
 	// workspace are rewritten to workspace-relative paths, and the rest are
 	// mounted read-only in the workspace with the prompt annotated with their
@@ -483,16 +539,15 @@ func (a *sessionAgent) WithPrompt(ctx context.Context, input string) error {
 		return err
 	}
 
-	// The turn's context is this conversation's own, so an interrupt aimed at
-	// this agent stops this turn and no other.
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-
 	// Enqueue the prompt on the record.
 	msg, err := rt.SendMessage(ctx, input)
 	if err != nil {
 		return err
 	}
+
+	// Anything submitted while this turn was opening goes on the record
+	// behind the prompt, in the order it was typed.
+	a.flushPending(rt)
 
 	// Un-park the agent: a no-op unless it is paused (a prior Ctrl-C
 	// interrupt) or failed (resume retries), in which case the suspended turn
@@ -501,12 +556,6 @@ func (a *sessionAgent) WithPrompt(ctx context.Context, input string) error {
 	if err := rt.Resume(a.session.plumbingCtx); err != nil {
 		return err
 	}
-
-	// The turn is now running server-side; publish it so messages submitted
-	// before it ends are absorbed into it, and so Ctrl-C on this agent can
-	// preempt it.
-	a.beginTurn(cancel)
-	defer a.endTurn()
 
 	// Block until the turn that consumed the prompt ends.
 	_, awaitErr := msg.Await(ctx)
