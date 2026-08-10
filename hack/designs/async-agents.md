@@ -611,6 +611,22 @@ core/integration/agent_runtime_test.go), ratified here:
   `snapshot`. For `spawn` and `send` the returned ID is the pinned lookup
   chain (previous bullets), so re-hydrating it replays the lookup, not the
   mint/enqueue.
+  **Scope correction, measured.** That guarantee covers the ID-returning
+  verbs and nothing else, and it is the ID RETURN that earns it, not the
+  cache policy. Dang forces a lazy chain once per SELECTION off it, not
+  once per `let` binding, so `let x = <object-returning call>` followed by
+  `x.a`, `x.b`, `x.c` runs the chain three times — and when that call is a
+  module function carrying `@cache(policy: Never)`, dagql cannot dedupe it
+  (`core/modfunc.go` gives it `PerCallInput`), so every selection re-runs
+  its side effects. `TestLazyChainForcing`
+  (core/integration/dang_forcing_test.go) measures both halves against a
+  from-source engine with `LLM.spawn` as the witness — DoNotCache and a
+  fresh instance per evaluation, so distinct handles count executions: two
+  selections off an unpinned chain yield 2, the same reads through an
+  ID-returning pin yield 1. The by-hand escape hatch, where a type has no
+  `sync` of its own, is to route the binding through one that does
+  (`modules/staff`'s harvest tools pin the worker's snapshot through
+  `LLM.sync`).
 - **Self-await hazard.** A tool holding its own calling agent's handle (via
   `Agent!` injection) can `send` to it — the message joins the in-flight
   turn as `STEERED` — but awaiting it from inside that same turn's tool call
@@ -959,23 +975,39 @@ What is NOT built — threads to pull, each self-contained:
     within the session. And once the chief SAVES a pulled commit and
     reloads, the origin link is gone (it is engine-side metadata), so a
     re-pull relies on REDUNDANT to notice — a durable fix needs the
-    origin in the commit object, as a trailer or a git note.
+    origin in the commit object, as a trailer or a git note. FIXED since:
+    the torn-snapshot half, where each field a harvest tool read off its
+    `let theirs = workerWorkspace(name)` binding re-forced the chain onto a
+    different live snapshot (§9's scope correction) — `diffOf` alone reads
+    four, so its patch could mix trees, and the tools' documented contract
+    of reading the worker's LAST COMMITTED step was not what they did.
 14. **A session restart silently RE-ANIMATES workers** (§4, §3.3): observed
     live — after restarting a client session, a `modules/staff` chief's
     workers reported `RUNNING` again, while their `snapshot` had degraded to
     the SEED conversation (system prompt plus opening task, none of the work
-    they had actually done). Likely mechanism: re-selecting the chief's held
-    agent IDs re-executed the recorded `send`, and signal-with-start (§3.3)
-    then started a FRESH runtime from the seed — so the agents genuinely were
-    running, redoing their opening task from scratch. Adjacent to item 13's
-    note that a tombstone re-selected in a NEW session projects
-    IDLE-from-absence with the seed as its snapshot, but distinct and worse:
-    there the re-selection is inert, here it has side effects. Cross-session
-    identity is the unresolved question — §4 resumes a *conversation* from
-    the trace and says nothing about a client replaying a chain that contains
-    imperative verbs — and the failure mode is expensive (silent duplicate
-    work) and confusing (a roster full of agents that look busy but have lost
-    their history). A roster (item 1) makes it more visible, not less.
+    they had actually done). A second observation narrows it: only agents
+    spawned BEFORE the resume are affected — a freshly spawned agent yields
+    exactly one loop — and the re-animated loops render beneath the ORIGINAL
+    `spawn()` tool-call span, which is where the recorded chain is anchored,
+    so one worker can appear as several concurrent loops under one hire.
+    The likeliest mechanism is not the recorded `send` (an ID-returning verb,
+    forced once and re-hydrated through its lookup — §9's scope correction)
+    but the recorded `withTools` binding of the chief's rebound tool object:
+    it is loaded lazily, and its handle-form ID is an engine-local
+    shared-result reference that dies with the session, so after a restart
+    the load falls back to walking the recipe — re-executing the `spawn`
+    inside it. Adjacent to item 13's note that a tombstone re-selected in a
+    NEW session projects IDLE-from-absence with the seed as its snapshot, but
+    distinct and worse: there the re-selection is inert, here it has side
+    effects. Cross-session identity is the unresolved question — §4 resumes a
+    *conversation* from the trace and says nothing about a client replaying a
+    chain that contains imperative verbs — and the failure mode is expensive
+    (silent duplicate work) and confusing (a roster full of agents that look
+    busy but have lost their history). A roster (item 1) makes it more
+    visible, not less. Candidate fixes to weigh: make replay of imperative
+    verbs inert (resolve to the recorded result rather than re-executing),
+    mark a restored chain replay-only, or have resume reattach by instance ID
+    instead of re-deriving.
 15. **Changeset replay loses tracked-ness** (known, pre-existing, unexplained
     — started some time ago): the workspace's changeset machinery
     intermittently forgets that a path is already tracked and treats it as
