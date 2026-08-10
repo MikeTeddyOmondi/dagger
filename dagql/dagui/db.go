@@ -429,6 +429,10 @@ func (db DBLogExporter) Export(ctx context.Context, logs []sdklog.Record) error 
 			// agent lifecycle state, not log text
 			continue
 		}
+		if db.ingestCallPayload(log) {
+			// dagql call payload, not log text
+			continue
+		}
 		if log.Body().AsString() == "" {
 			// eof; ignore
 			continue
