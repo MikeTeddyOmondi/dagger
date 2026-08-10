@@ -1392,6 +1392,29 @@ What is NOT built — threads to pull, each self-contained:
     edit, driven through a module-held workspace. If it reports `ADDED`, this
     is the bug, and the fix is to stop sizing a correctness-bearing diff base
     by an optimization's path set.
+    **A seventh sighting, and the sharpest evidence yet, because it caught the
+    two anchors disagreeing at the same instant.** A worker committing a
+    146-line edit to an existing file reported, from `status` immediately
+    before committing, `M +146 -0` — and the commit itself then recorded
+    `A +1488`, the whole file. Same file, same worker, seconds apart. That
+    rules out any theory in which the workspace has simply "forgotten"
+    something globally, because the pending view had it right. The two reads
+    differ only in what they diff against: `Workspace.git.uncommitted` diffs
+    against the staged HEAD, while the staged commit's own changeset diffs
+    against the overlay's `Before` (core/schema/workspace_commit.go:221-250),
+    which is the sparse tree. So the divergence is precisely the anchor
+    difference the comment at :214-220 already describes, and the sparse
+    anchor is the one that lies.
+    It also lands on the predicted population: this was a WORKER, i.e. a
+    module-held workspace, editing a file the CHIEF had never touched — so the
+    path was absent from the chief's `TouchedPaths`, and therefore absent from
+    the sparse `Before` the worker's overlay inherited. That is exactly the
+    `overlayWorkspaceWithMutation` path above, and it upgrades that suspect
+    from "unconfirmed" to "consistent with every worker-side sighting and with
+    a directly observed anchor disagreement". Still not a controlled
+    experiment: what would close it is the confirmation test already described,
+    driven through a module-held workspace whose parent overlay's touched set
+    excludes the edited path.
 15. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
     broken from a session that stopped before resolving it, and it is still
     unknown whether the test or the code is wrong — hence skipped rather
@@ -1495,40 +1518,79 @@ What is NOT built — threads to pull, each self-contained:
     `Directory` has a receiver whose span never carried a payload. Which one
     is not yet measured — the walk names the REFERRING frame by field and
     type, while the missing receiver survives only as a digest, and
-    "`directory`" alone does not identify it. The leading candidate came out
-    of item 14's investigation: `sparseHostBase`
-    (core/schema/workspace.go:2696-2701) selects `host` and then
-    `directory(path:, include:)` off the root, so **`Query.host` is the
-    receiver of a `directory` call in every host-backed workspace chain** —
-    and every staff worker's composition carries one, via the chief's
-    workspace. What makes it fit rather than merely qualify: `host` takes no
-    arguments, so it has exactly ONE call digest for the whole session, and
-    `ShouldEmitTelemetry` dedupes per digest per session (core/telemetry.go:81)
-    — one emission, ever. If that single emission lands where this client
-    cannot ingest it (a nested module session) or under a suppressed context
-    (`IsSkipped`, introspection, `isMeta`), then no host-rooted chain in that
-    session is rebuildable, while the `directory` frame above it still
-    publishes normally from any of its many arg-distinct digests. That is
-    exactly the observed shape: a hole one level up the receiver spine,
-    beneath a frame that resolved fine.
-    It also explains the scope gap §9 admitted without knowing its cause:
-    `TestRosterAddressing`'s bare `llm` seed touches no workspace, so it
-    carries no `host` frame and rebuilds — the tests are not wrong, they are
-    blind to this shape.
-    The mechanism that would produce exactly this: span emission is per
-    selected step in `AroundFunc` (core/telemetry.go:31-105), which returns
-    before recording a payload for introspection frames, `isMeta` frames
-    (`node`, `id`, `sync`, anything returning `Error`) and anything under an
-    inherited `IsSkipped` context. A frame that only ever materializes inside
-    a suppressed subtree publishes nothing, while a later unsuppressed
-    selection of its CHILD still publishes — leaving a hole one level up the
-    receiver spine, which is the shape observed. Unconfirmed.
-    Next measurement, and it is cheaper than the argument-side investigation
-    it replaces: have the walk report the referring call's own digest and
-    arguments alongside the missing receiver's digest. That turns "some
-    `directory` call" into a frame findable in the trace, and the receiver it
-    wanted is then identifiable by inspection rather than by guessing which
-    of two shapes it was.
+    "`directory`" alone does not identify it. A candidate drawn from item 14's
+    investigation — `sparseHostBase` (core/schema/workspace.go:2696-2701)
+    selects `host` then `directory(path:, include:)` off the root, so
+    `Query.host` is the receiver of a `directory` call in every host-backed
+    workspace chain, and being argument-free it has ONE call digest and one
+    per-session emission (`ShouldEmitTelemetry`, core/telemetry.go:81) — was
+    **measured and REFUTED.** A probe against a from-source engine found the
+    client's DB holding TWO spans carrying that digest
+    (`xxh3:37b977856265b79a`), one `internal=true` from the engine's
+    `sparseHostBase` select and one `internal=false` from the client's own
+    chain. The argument-free-implies-one-digest reasoning is right; the
+    conclusion drawn from it was wrong, because the emission is not lost and
+    the dedupe did not starve the client even when the engine-internal read
+    went first. The golden-trace hint that suggested it (`Host.directory` rows
+    with no `Query.host` row) was UI visibility, not payload absence. Recorded
+    at length because it is a plausible-sounding dead end that costs a day:
+    do not re-derive it.
+    **A second, distinct failure mode found while refuting it, and this one
+    is measured.** `TestRosterAddressingHostWorkspace` — `TestRosterAddressing`
+    plus a host-backed workspace bound via `withWorkspace` — fails, but never
+    with a gap: the walk closes, every frame resolves, and the rebuilt handle
+    then reads `IDLE` where the live runtime is `FAILED`. That is
+    IDLE-from-absence: the chain rebuilt fine and addressed a DIFFERENT,
+    inert entry. `name` and `instanceID` still read back correctly, because
+    they come off the chain's own literals — so the handle looks healthy while
+    addressing a corpse, which is strictly worse than the loud gap error.
+    Mechanism: `AgentRuntimes` keys entries on the agent value's content
+    digest (core/agent.go:201-232), the telemetry-rebuilt ID is the RECIPE
+    form (§9), and re-executing a recipe containing `Query.currentWorkspace`
+    does not reproduce the same value — it is `NotReplayable` and carries
+    `PerCallInput`/`PerSessionInput` (core/schema/workspace.go:35-40), so each
+    re-address mints a fresh workspace, the agent's digest moves with it, and
+    the lookup misses. The contrast isolates it: the same test passes when the
+    workspace is `host.directory(…).asWorkspace()`, which is replayable and
+    digest-stable, and fails identically with a bare `currentWorkspace` with
+    NO overlay — **so the sparse overlay is not the trigger, `currentWorkspace`
+    is.**
+    This makes the registry's content-digest key the real defect for
+    addressing, and it generalizes past workspaces: any composition carrying a
+    non-replayable or per-session leaf is unaddressable-by-rebuild, silently.
+    §9 minted `InstanceID` precisely so instances could not collide, and it
+    already rides the pinned chain as a literal — so keying `AgentRuntimes` on
+    `InstanceID`, with the content digest demoted to a corroborating check,
+    would make rebuild-addressing survive any leaf. That trade needs an
+    owner's call, because the digest key is also what stops a forged
+    `agent(id:)` chain with a foreign seed from addressing somebody else's
+    runtime.
+    Both of these say the same thing about §9's "verified end to end": the two
+    roster tests pass because a bare `llm` seed carries no workspace at all,
+    not because the mechanism is sound for real compositions.
+
+    The original gap remains unexplained, and the shape to look for is still
+    this: span emission is per selected step in `AroundFunc`
+    (core/telemetry.go:31-105), which returns before recording a payload for
+    introspection frames, `isMeta` frames (`node`, `id`, `sync`, anything
+    returning `Error`) and anything under an inherited `IsSkipped` context. A
+    frame that only ever materializes inside a suppressed subtree publishes
+    nothing, while a later unsuppressed selection of its CHILD still publishes
+    — a hole one level up the receiver spine. Note the refuted probe narrows
+    where to look rather than reopening everything: whatever the missing frame
+    is, it is NOT reached through the plain client-side workspace chain, which
+    was measured to rebuild completely. The untested dimension the probe could
+    not cover is the one the live failure actually had — a chain built inside
+    a MODULE call, with a module-held `source: Workspace!` and host reads
+    routed through `withWorkspaceHostReadContext` for another client. That is
+    where the next measurement belongs:
+    `TestRosterAddressingFromModule` with a host-backed workspace threaded
+    through the module.
+    Cheap and worth doing first regardless: have the walk report the referring
+    call's own digest and arguments alongside the missing receiver's digest.
+    That turns "some `directory` call" into a frame findable in the trace, and
+    identifies the receiver by inspection instead of by hypothesis — which is
+    how this round was lost.
 
 ### 11.1 Notes for live QA
 
