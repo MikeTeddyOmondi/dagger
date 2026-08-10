@@ -1176,7 +1176,18 @@ What is NOT built — threads to pull, each self-contained:
     `oldPath` too). A tombstone re-selected in a NEW session projects
     IDLE-from-absence and its `snapshot` is the SEED conversation, so
     harvest silently returns "nothing new" rather than erroring; harvest
-    within the session. And once the chief SAVES a pulled commit and
+    within the session. **Observed once, and worse than "nothing new":** a
+    `logOf` issued around a session restart returned a stack of ONE commit
+    carrying the CHIEF's own commit message under a different hash, while the
+    worker's actual commit — made minutes earlier, reported in its own final
+    message — was absent. So the post-restart harvest view is not merely
+    empty, it can be plausible and wrong: a chief that trusted it would pull a
+    re-hashed copy of its own work and never notice the worker's real commit
+    was gone. Timing was not pinned down (the restart and the call raced), so
+    treat the mechanism as unestablished; the practical rule is unchanged and
+    now has teeth — harvest inside the spawning session, and do not believe a
+    stack you read after a restart.
+    And once the chief SAVES a pulled commit and
     reloads, the origin link is gone (it is engine-side metadata), so a
     re-pull relies on REDUNDANT to notice — a durable fix needs the
     origin in the commit object, as a trailer or a git note. FIXED since:
