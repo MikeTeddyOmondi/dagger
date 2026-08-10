@@ -950,14 +950,16 @@ Semantics ratified during implementation:
   at READ time with the changeset applied on top (`resolveHostOverlayRootfs`),
   so its base is live. What is frozen is the changeset, whose diff layer
   carries FULL CONTENT for every touched path and is written with
-  `ReplaceExisting`. So on the paths a worker has touched, its own content
-  wins over whatever the host holds at read time — no patch, no conflict
-  detection, no refusal. Ratified as correct: that is what a pending edit IS,
-  and a worker's edits outranking the checkout is the same rule that governs
-  the chief's. The bounded consequence worth knowing is that a worker whose
-  edits predate a save or a deploy silently outranks the newer content on
-  exactly its touched paths — an argument for harvesting promptly, not for
-  making a worker's overlay patch-based.
+  `ReplaceExisting`. So the split is per path, not per tree: paths the worker
+  has never touched track the host live, and on the paths it HAS touched its
+  own content wins over whatever the host holds at read time — no patch, no
+  conflict detection, no refusal. Ratified as correct: that is what a pending
+  edit IS, and a worker's edits outranking the checkout is the same rule that
+  governs the chief's. A worker is not frozen at spawn; it owns the files it
+  has its hands on, and rolls forward with the host everywhere else. The
+  bounded consequence worth knowing is that a path edited on the host AFTER a
+  worker has touched it keeps the worker's version silently — an argument for
+  harvesting promptly, not for making a worker's overlay patch-based.
 
 ## 9. Alternatives considered
 
