@@ -1603,6 +1603,139 @@ What is NOT built — threads to pull, each self-contained:
     identifies the receiver by inspection instead of by hypothesis — which is
     how this round was lost.
 
+### 11.2 Handoff: fixing roster switching
+
+Written at the end of a session that investigated ONLY this, so the next one
+does not re-derive it. Everything below is about **switching between agents in
+the TUI failing** — item 16's territory. It is deliberately separate from item
+13 (revival on resume), item 14 (ADDED-vs-MODIFIED), and §4.1 (resume from
+trace); those are real and pressing but are NOT this, and conflating them cost
+time here.
+
+**The one fact that scopes the work.** The live failure happened in a FRESH
+session — no restart, no resume, no saved recipe, the agent spawned minutes
+earlier in the same client process. So this is not a durability gap and §4.1
+is not a prerequisite: the client had every payload it should ever need and
+addressing still failed. Fix the implementation, not the persistence story.
+
+**"Switching is broken" is two distinct failures.** Telling them apart is the
+first thing to do with any new report, because they need opposite fixes:
+
+- **MODE A, loud.** `Span.CallID` cannot rebuild the chain and fails with
+  `cannot rebuild ID for "agent" (Agent): call <digest>, referenced as
+  receiver of "directory" (Directory) never reached this client`. The roster
+  marks the entry read-only (`·`). This is the observed live failure.
+  **Not root-caused.**
+- **MODE B, silent and worse.** The chain rebuilds COMPLETELY, and the handle
+  then addresses a different, inert entry: `state` reads `IDLE` while the live
+  runtime is something else, and `name`/`instanceID` read back CORRECTLY
+  because they are literals in the recipe and never touch the registry. A
+  handle that looks healthy and points at nothing. **Root-caused and
+  measured.**
+
+**Mode B: the mechanism, settled.** `AgentRuntimes` keys entries on the
+agent VALUE's content digest (`agentKey` → `ContentPreferredDigest`,
+core/agent.go:226-232). A telemetry-rebuilt ID is the RECIPE form (§9), so
+using it RE-EXECUTES the chain — and `Query.currentWorkspace` is
+`NotReplayable` with `PerCallInput`/`PerSessionInput`
+(core/schema/workspace.go:35-40), i.e. deliberately mints a fresh value every
+evaluation. Fresh workspace → different Seed → different digest → different
+key → lookup miss. The miss is invisible because `Get` never creates and
+IDLE-with-seed-snapshot is the honest projection of a never-started agent, so
+absence and freshness are indistinguishable by construction. Measured
+contrast: the same test PASSES with `host.directory(…).asWorkspace()`, which
+is replayable and digest-stable, and FAILS with a bare `currentWorkspace`
+carrying NO overlay — so the sparse-overlay machinery is NOT involved,
+`currentWorkspace` alone is. This generalizes: ANY non-replayable or
+per-session leaf anywhere in a composition breaks rebuild-addressing the same
+way.
+
+**Mode B: the decision that blocks the fix.** It is not "pick a map key", it
+is "decide what authority to address an agent means", so it wants an owner.
+Today's whole-value digest doubles as proof of possession: you can only
+address a runtime by presenting the entire composition, which is §3.3's
+capability model and §9's "IDs are unforgeable". Options:
+
+- **(a) Key on `InstanceID`.** Simplest, and it survives any leaf — the ID is
+  minted at spawn, unique by construction, and already rides the pinned chain
+  as a literal (which is exactly why `instanceID` reads back correctly today).
+  Cost: `InstanceID` is PUBLISHED in telemetry as `dagger.io/agent.id`, so
+  addressing degrades from "hold the composition" to "know a published
+  string" — anyone who can read the trace could build
+  `someUnrelatedLLM.agent(id: "…", name: "…")` onto a live runtime with a
+  foreign seed.
+- **(b) Key on `InstanceID`, put authority in another layer** — the spawning
+  session, or the ownership flag the CLI already carries (§11 slice 2).
+- **(c) Make the replay digest-stable instead**, by pinning the workspace into
+  the chain rather than re-deriving it. Nobody has evaluated this. It is the
+  only option that costs nothing security-wise, because the capability
+  property survives intact; it conflicts with `currentWorkspace` being
+  deliberately live, and that conflict is what needs examining.
+
+**Do not "keep the digest as a corroborating check".** It was proposed and it
+does not work: the rebuilt recipe's digest legitimately differs, which is the
+entire defect, so any check strong enough to be security-relevant also
+rejects the legitimate rebuild it was added to enable.
+
+**The fact that decides between (a) and (c)**, and it is a much smaller job
+than either fix: can a module enumerate the PARENT session's agent IDs from
+the trace? If it cannot, (a)'s exposure is close to theoretical, since the
+registry and the telemetry are both session-scoped and an attacker is already
+inside the session. Unestablished.
+
+**Mode A: what is ruled out, so it is not re-derived.** The hypothesis that
+`Query.host`'s single per-session telemetry emission goes missing was
+MEASURED AND REFUTED — the client's DB held two spans carrying that digest,
+one internal from `sparseHostBase` and one from the client's own chain (see
+item 16). More usefully, the same probe established that the plain
+client-side workspace chain rebuilds COMPLETELY. So the gap is not in a
+client-issued composition, which is most of the search space gone.
+
+**Mode A: the next two measurements, in order.**
+
+1. **Cheap, do it first regardless.** Make the walk report the referring
+   call's own digest and arguments next to the missing receiver's digest
+   (`dagql/dagui/extract.go`, `missingCall`/`frameLabel`). Today it names the
+   referrer only by field and type — "some `directory` call" — while the
+   missing receiver survives as a bare digest that identifies nothing. With
+   the referrer's digest and args in hand the frame is findable in the trace
+   and the receiver is identifiable by inspection. This round was lost to
+   hypothesis where inspection would have settled it in minutes.
+2. **Then reproduce on the untested dimension**: `TestRosterAddressingFromModule`
+   with a host-backed workspace threaded through the module. That is the
+   shape the live failure actually had and the one no test covers — a chain
+   built inside a module call, with a module-held `source: Workspace!` and
+   host reads routed through `withWorkspaceHostReadContext` for another
+   client.
+
+**Lost work worth recreating (~150 lines).** A probe test,
+`TestRosterAddressingHostWorkspace`, was written and measured but lost with
+its worker's workspace before it could be harvested. It is
+`TestRosterAddressing` plus a host-backed workspace bound via
+`spawnOpts.wsID`, with the session pointed at a temp-dir git repo via
+`dagger.WithWorkdir`, in three cases. Recorded here so it can be rebuilt
+without re-deriving the design:
+
+| case | workspace | result |
+|---|---|---|
+| session workspace | `currentWorkspace` | FAIL |
+| session workspace overlay | `currentWorkspace.withNewFile(…)` | FAIL |
+| host directory workspace | `host.directory(workdir).asWorkspace()` | PASS |
+| baseline | none (`TestRosterAddressing`) | PASS |
+
+The failure is `expected: "FAILED", actual: "IDLE"` on the rebuilt handle's
+state — Mode B. `withNewFile` is the workspace edit verb
+(core/schema/workspace.go:130). The nested-session skip does NOT trigger under
+the engine-dev test container, which sets `_EXPERIMENTAL_DAGGER_RUNNER_HOST`
+rather than `DAGGER_SESSION_PORT`, so these tests really run there.
+
+**Two hazards for whoever picks this up.** Do not open the investigation by
+calling a `modules/staff` tool on a resumed session (§11.1, item 13) — it
+revives workers on receiver load, including reads. And expect item 14 to
+misreport your own commits as whole-file adds; it did so twice in this
+session and once caused a worker's commit to be unpullable. Neither is this
+issue; both will waste your time if unexpected.
+
 ### 11.1 Notes for live QA
 
 Hazards learned the expensive way, worth reading before driving a staff
