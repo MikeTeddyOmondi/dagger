@@ -423,6 +423,55 @@ Resume = locate the turn-tip call digest (already findable via
 Within a session, nothing is needed at all: stopped agents are tombstones in
 the runtime table.
 
+### 4.1 Resume from trace — the next thread
+
+**This is the next piece of work.** Everything above describes resume as a
+capability the trace already affords; what exists in practice is the local
+save file, and a live QA session (item 13) demonstrated that route failing in
+both directions at once — re-animating dismissed workers *and* leaving them
+unaddressable. The two failures share a cause: the durable artifact is a
+recipe of recorded calls held on one machine, when it should be the trace.
+
+What is already proven, within a session: a client reconstructs a *sendable*
+handle from a carried call digest, and the rebuilt handle observes the LIVE
+runtime — `TestRosterAddressing`, and `TestRosterAddressingFromModule` for an
+agent spawned inside a module call (§9). The mechanism works. What it lacks
+is durability across client processes: a restarted client builds a fresh
+`dagui.DB`, so every call payload emitted before the restart is simply
+absent, `ID.decode` fails with `call digest not found`, and the roster
+degrades every pre-restart agent to watch-only. Cloud already receives and
+persists the traces (§4), so the store exists; nothing reads a roster back
+out of it.
+
+The work, in the order the constraints force:
+
+- **Read the directory from the persisted trace**, not only from the
+  in-process DB. This is the part that needs no new schema — §9's
+  renunciation of `Query.agents` holds, because the roster stays a projection
+  of the trace; the trace just stops being per-process.
+- **Resume must not re-execute recorded imperative verbs.** Item 13's
+  non-atomic replay finding is the constraint: a chain load that fails
+  partway leaves a world that never existed, and the compensating verb is
+  the one most likely skipped. Reattach by instance ID (item 13's
+  recommended fix) rather than replaying `spawn`.
+- **Persist the recipe form, not the handle form.** A post-evaluation
+  `Result.ID()` is an engine-local shared-result reference that dies with its
+  session (`call.NewEngineResultID`; measured — loading one later on the same
+  engine fails with "missing shared result"). §9 measured both encodings:
+  ~24 bytes for the handle, ~350 for the recipe of a bare `llm` seed.
+
+Two boundaries to settle before promising cross-machine migration:
+
+- **Lifetime.** §4 dodges "when does an agent outlive every session that can
+  see it?" and Cloud makes that urgent rather than optional: once an agent is
+  addressable from anywhere, its lifetime is no longer bounded by the session
+  that spawned it, and something has to own the answer.
+- **Leaves.** The trace carries recipes, not snapshots, so `host.directory(...)`,
+  moved git refs, and session resources re-*evaluate*. Migration is clean for
+  conversations and for content-addressed leaves; a workspace rooted in
+  machine A's host is what bounds "trivially". Worth deciding which half is
+  being promised before it ships.
+
 ## 5. UI and shell impact
 
 The shell's client-driven step loop, its single-slot `queuedMsg`, and the
@@ -870,6 +919,17 @@ Semantics ratified during implementation:
   workspace is classified without routing to its client. Only receiver reads
   go through the host. Preserve this: pulling the source's host in would make
   the operation depend on a second live client.
+- **The patch-based rule is applied in ONE direction only, and the other one
+  is a live defect.** Everything above governs a changeset moving INTO the
+  receiver. A worker's OWN workspace is still a whole-tree value snapshotted
+  at spawn and re-materialized as an overlay — exactly the `withChanges`
+  semantics the first bullet renounces — so when the checkout moves beneath a
+  live worker (a save, a deploy) and that worker later re-materializes, it
+  writes spawn-time content over a tree that has moved on. Observed
+  corrupting a source file badly enough to break a module parse (item 14).
+  The fix is to give a worker's own workspace the same "patch against current
+  content" treatment the harvest already has, rather than teaching `ctrl+s`
+  about the staff (item 13).
 
 ## 10. Alternatives considered
 
@@ -1149,12 +1209,45 @@ What is NOT built — threads to pull, each self-contained:
     Note what §9's pinning does NOT cover: it is `Staff.spawn` that gets
     re-executed, not `Agent.send` — the chief's conversation never records
     one. Pinning makes re-*hydrating a result ID* inert; it says nothing
-    about re-*executing a recorded call*. Left open: whether the replayed
-    load re-executes the spawn outright or cache-hits, which only decides
-    whether the duplicate boots on resume or on the first steer. Either way a
-    resumed chief is lied to meanwhile — `status` and `read` read through
-    `Get`, which never creates, so they report IDLE-from-absence right up
-    until the chief steers.
+    about re-*executing a recorded call*.
+    **Settled by a later live session, and the answer was neither option.**
+    The trigger is **receiver load**, not resume and not the first steer: a
+    single `status` call — a `Get`-never-creates read designed precisely not
+    to revive anything — brought three workers back, and *the call itself
+    failed*. The error's own shape is the evidence, `load bound object of
+    type "Staff": load xxh3:…: inputs: load xxh3:…: inputs: …`, i.e. the
+    bound object's ID chain being re-hydrated input by input. The revival
+    lands while assembling the receiver, one level below the field, so no
+    amount of care in the read protects it: any tool call on that object
+    revives, including a read built to be safe, and an aborting error does
+    not roll it back. Three runtimes booted out of a call that returned
+    nothing but a parse failure.
+    **Dismissal does not survive either**, and the reason generalizes. All
+    three workers had been dismissed before the restart. The layers split:
+    agent runtimes are core values that revive through `GetOrCreate` on chain
+    load, while `dismiss` is module-held state (`modules/staff` moving a
+    handle from `members` to `tombstones`, and stopping the runtime) — and in
+    that session the module was exactly what failed to parse (item 14). The
+    layer that knows about dismissal never replayed; the core runtimes booted
+    anyway. Hence the general finding, which outlives this crash:
+    **replaying a chain of imperative verbs is not atomic.** A failure
+    partway leaves a world that never existed — spawned but never dismissed —
+    and the compensating verb is the one most likely to be skipped, because
+    it comes later in the chain. Any fix that keeps re-executing recorded
+    verbs inherits this; it is the constraint §4.1 is built around.
+    **Re-animated workers are also unreachable**, which compounds it into
+    something worse than duplicate work. The roster rendered all three, each
+    marked watch-only, and focusing one gave `agent "skimmer" cannot be
+    addressed from this trace`. That is `focusAgent`'s read-only branch,
+    reached when `encodedIDForCallDigest` cannot rebuild a handle: addressing
+    is a projection of the trace (§9), the payloads were emitted in the
+    PREVIOUS session, and a restarted client's `dagui.DB` is fresh, so
+    `ID.decode` reports `call digest not found`. §3.3 renounced
+    `Query.agents` *because* telemetry is the directory, so there is no
+    fallback: the agents run, consume tokens, and can be watched but never
+    addressed or stopped from the UI. The blast radius is bounded per session
+    — the registry dies with it — but the recipe on disk resurrects them next
+    time, so the cause is not bounded at all.
     Fix, recommended: **reattach by instance ID** — make registry lookup
     session-independent, keyed on the spawn-minted `InstanceID` that already
     rides the pinned chain, so a resumed session finds the live entry instead
@@ -1168,13 +1261,25 @@ What is NOT built — threads to pull, each self-contained:
     containing an imperative verb at all — the honest stopgap, turning silent
     duplicate work into a loud save-time failure. None landed: this is a hole
     in §4's cross-session identity story rather than a defect in `send`, and
-    every option changes engine-wide semantics.
+    every option changes engine-wide semantics. Note the receiver-load
+    finding raises the stakes on the runner-up: resolving imperative verbs to
+    their recorded results also fixes the "a read revived it" case, which
+    reattach-by-instance-ID alone does not, since a reattached entry still
+    has to exist somewhere to be found.
     Adjacent to item 12's note that a tombstone re-selected in a NEW session
     projects IDLE-from-absence with the seed as its snapshot, but distinct
     and worse: there the re-selection is inert, here it has side effects. The
     failure mode is expensive (silent duplicate work) and confusing (a roster
     full of agents that look busy but have lost their history). A roster
     (item 1) makes it more visible, not less.
+    **Not the fix: making `ctrl+s` reach the staff.** Considered live and
+    rejected. Workers have their own workspaces by design — the premise
+    §9.1 rests on, and why taking their work is a deliberate `pull` — so a
+    save that exported N divergent trees over one checkout would be either
+    last-writer-wins (item 1's save-identity problem, worse) or a silent
+    discard of worker WIP; and a staff-wide reset has `dismiss`'s shape with
+    none of its bookkeeping. The real defect is narrower and lives in the
+    §9.1 asymmetry recorded under item 14.
 14. **Changeset replay loses tracked-ness** (known, pre-existing, unexplained
     — started some time ago): the workspace's changeset machinery
     intermittently forgets that a path is already tracked and treats it as
@@ -1205,6 +1310,28 @@ What is NOT built — threads to pull, each self-contained:
     agent-specific — it is a workspace-layer defect — but recorded here
     because the staff workflow (spawn, harvest, pull) is where it keeps
     surfacing.
+    **A fourth sighting, with a mechanism candidate and a compounding
+    consequence.** After a restart, `modules/staff/main.dang` itself was
+    corrupted on the host checkout — parse failure at `175:1`, in the blank
+    line directly above where a worker's edit had been inserted, matching
+    (iii)'s observation that markers land exactly at the chief's insertion
+    point. The workspace copy was clean, so the divergence was host-side.
+    Candidate mechanism, and it fits every sighting: `ctrl+s` moves the
+    checkout, but nothing moves the WORKERS — their workspaces are values
+    snapshotted at spawn — so a worker re-materializing (here, re-animated by
+    item 13) replays a spawn-time changeset over content that has since
+    moved underneath it. Which points at a real asymmetry rather than
+    intermittency: **§9.1 already learned this lesson in one direction and
+    never applied it in the other.** Harvesting INTO the chief is patch-based
+    precisely so a commit still lands when the receiver has moved on —
+    "patch application is the merge; `withChanges` is only the write" — but a
+    worker's own workspace is still a whole-tree value re-materialized as an
+    overlay, which is the semantics §9.1 renounced. Fixing that asymmetry
+    would remove this class without `ctrl+s` needing to know the staff exists
+    (item 13). The compounding consequence is why it is worth prioritizing:
+    the corrupted file broke the module parse, and the broken parse is what
+    stranded item 13's dismisses, so a workspace-layer defect disabled the
+    cleanup path for an agent-layer one.
 15. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
     broken from a session that stopped before resolving it, and it is still
     unknown whether the test or the code is wrong — hence skipped rather
@@ -1228,4 +1355,30 @@ What is NOT built — threads to pull, each self-contained:
     Worth pairing with item 10 (workers not knowing their own name), which
     also wants to interpolate into `workerPrompt` and would move the same
     seed boundary.
+
+### 11.1 Notes for live QA
+
+Hazards learned the expensive way, worth reading before driving a staff
+session by hand:
+
+- **On a RESUMED session, do not call a staff tool to "just check".** Item
+  13's revival triggers on receiver load, so any call on the bound `Staff`
+  object — including `status`, which is built never to create — re-animates
+  every worker baked into the restored recipe, and each resume adds another
+  round. Establish what you want to know before touching it.
+- **`staff.read` is the wrong tool for watching a working agent.** It omits
+  tool calls by design, so a worker in a long tool-call stretch shows almost
+  nothing, and SYSTEM-role padding used to consume the window (fixed).
+  `ReadLogs` on the worker's span is what actually shows progress.
+- **Pulling a fix to `modules/staff` does not fix the RUNNING session**: the
+  loaded module is the one from session start, so a harvested change to the
+  staff tools takes effect only after a reload. Expect to dogfood one version
+  behind.
+- **Harvest inside the session that spawned the worker** (item 12): a
+  tombstone re-selected later projects IDLE-from-absence with the seed as its
+  snapshot, so harvest silently reports "nothing new" rather than failing.
+- **This document is untracked upstream**, so its changesets record as
+  whole-file adds. A worker's doc commit therefore cannot be applied with
+  `pullConflicted` onto a tree that already has the file — replay the prose
+  by hand and commit it yourself, at the cost of the worker's authorship.
 
