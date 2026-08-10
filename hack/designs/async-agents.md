@@ -475,25 +475,23 @@ conversation it is describing.
 Build order is **roster first, attention second**. Slice 1 is the engine's
 telemetry publication plus a read-only roster strip — no focus, no change
 to routing (both built; §11). Slice 2 is focus, per-agent drafts, and the
-`LLMSession` refactor (it holds exactly one agent today:
-`currentAgent`/`dropAgent`/`setTurnAgent`/`Interject`/`syncFromAgent`,
-internal/cmd/dagger/llm.go:241-343), which must land *together with* the
-send-routing change: bolting focus onto the current `shellRunning →
-Interject` latch (frontend_pretty.go:4684) would silently deliver
-messages to whichever agent happens to own the in-flight turn. Slice 3 is
+`LLMSession` refactor (it held exactly one agent), which had to land
+*together with* the send-routing change: bolting focus onto the old
+`shellRunning → Interject` latch would silently deliver messages to
+whichever agent happened to own the in-flight turn (built; §11). Slice 3 is
 the parked-question/attention work (§3.4), which is what makes the roster
 worth having — a roster where nobody can ever say "I need you" is only a
 progress display.
 
 Four constraints surfaced while building slice 2's routing half, each of
 which the plan above understated. **Ctrl-C cannot simply "follow focus":**
-interrupt today is a client-side context cancel of the shell handle's
-`WithPrompt` await, so it necessarily hits the agent owning the in-flight
+interrupt used to be a client-side context cancel of the shell handle's
+`WithPrompt` await, so it necessarily hit the agent owning the in-flight
 turn — the very inference this section outlaws for messages — and since
-`shellLock` serializes handles, an agent that is running but is not the one
-blocking the handle cannot be interrupted from the client at all. Slice 2
-must turn Ctrl-C into an explicit `interrupt` on the focused agent's
-runtime, not re-point a cancel. **Session save/load stays session-wide:**
+`shellLock` serialized handles, an agent that is running but is not the one
+blocking the handle could not be interrupted from the client at all. Slice 2
+turned Ctrl-C into an explicit `interrupt` on the focused agent's runtime,
+not a re-pointed cancel (§11). **Session save/load stays session-wide:**
 `initialPrompt`/`sessionUUID` live on the shell handler, so the auto-save
 writes one file per SESSION while this section scopes `/save` to a
 conversation — with two agents, the last to step wins the file. That needs
@@ -732,6 +730,34 @@ core/integration/agent_runtime_test.go), ratified here:
   open — so the tombstone-sealing transition in `stop`, which runs after the
   loop has already returned, still reaches a client's roster instead of
   leaving a FAILED agent apparently retryable forever.
+- **A handle can be asked which instance it is.** `Agent.instanceID` returns
+  the spawn-minted ID — the same value the loop span publishes as
+  `dagger.io/agent.id`. It was added for focus (§5.1): a client that
+  discovers agents through telemetry keys its roster on that ID, and without
+  a way to ask its own handle, it cannot tell a rostered agent apart from one
+  it is already driving — so focusing your own agent from the strip would
+  attach a second conversation to a runtime you already hold. It grants no
+  new reach (you still need the handle to ask), so §3.3's capability model is
+  untouched, and clients tolerate its absence: an older engine still spawns
+  and prompts, it just cannot be correlated with its roster entry.
+- **Routing follows FOCUS, never the busy turn.** The client's rule, forced
+  by the same argument as everything else in §5.1: a submitted message goes
+  to the focused conversation's own in-flight turn, and opens a new turn if
+  it has none — the previous "hand it to whatever turn is running" latch
+  delivered the user's words to whichever agent happened to be mid-step.
+  Three consequences settled while building it. Prompt turns stopped being
+  serialized behind the client's single interpreter (only a shell line or a
+  `/command` is), because otherwise a running agent makes every other agent
+  unreachable — so the client tracks turns as a count, and only a serial turn
+  makes a submission queue. A message typed while a turn is still OPENING
+  (reference attachment, auto-compaction, spawn, send: all round trips) is
+  buffered and flushed onto the record behind the prompt, rather than opening
+  a rival turn — a rival's own compaction or rebinding can replace the LLM
+  wholesale and stop the runtime the first turn is running on. And Ctrl-C
+  cancels an in-flight client turn, but with none it interrupts the focused
+  runtime only if that runtime is actually RUNNING: interrupt on an idle
+  agent is equivalent to pause, and the key's commonest use is clearing a
+  half-typed line.
 
 ### 9.1 Harvesting a worker's work
 
@@ -877,14 +903,35 @@ What is BUILT (see also §9 for ratified semantics):
   reveal. `dagql/idtui/agent_roster.go` renders it as the strip above the
   prompt, hidden below two agents so single-agent sessions are untouched.
   Tests: `dagql/dagui/agents_test.go`, `dagql/idtui/agent_roster_test.go`.
-  Read-only: the strip surfaces agents but does not yet bind the prompt to
-  one (NOT-built 1).
-- **CLI prompt mode** (`internal/cmd/dagger/llm.go`, `shell.go`,
+- **Roster addressing and focus** (§5.1, slice 2): the strip is a switcher.
+  `internal/cmd/dagger/session_agent.go` splits the CLI session in two — a
+  `sessionAgent` is ONE conversation (LLM value, runtime handle behind the
+  `agentRuntime` interface, turn state, model, references, auto-compact,
+  context baselines), and `LLMSession` (llm.go) owns the conversations plus
+  the session-wide plumbing, resolving routing in exactly one place:
+  `Target()`. Ownership is one flag, read where a handle leaves a
+  conversation, so `dropAgent` stops only what the session spawned and
+  clearing an attached conversation can never kill somebody else's worker.
+  Frontend half in `dagql/idtui/frontend_pretty.go`: `alt+1…9` jump to a
+  roster entry and `alt+l` toggles back to the last (tmux's idioms, minus
+  the next/prev cycle), each agent keeps its own draft, and an agent the
+  session does not already drive is attached to through a handle rebuilt
+  from the trace via `encodedIDForCallDigest` — factored out of
+  `llmBranchID`, so branch-from-message and roster addressing share the one
+  proven path. A failed rebuild marks the entry read-only rather than faking
+  a handle. Submission asks the target first and queues only behind a serial
+  turn; Ctrl-C interrupts the focused runtime (§9). `Agent.instanceID` is
+  what correlates a held handle with its roster entry. Tests:
+  `internal/cmd/dagger/session_agent_test.go` (routing, ownership and
+  interrupt policy against a fake runtime, no engine) and
+  `dagql/idtui/agent_focus_test.go` (routing, Ctrl-C, focus keys, drafts,
+  read-only entries, and the trace push that makes the strip re-render).
+- **CLI prompt mode** (`internal/cmd/dagger/session_agent.go`, `shell.go`,
   `dagql/idtui/frontend_pretty.go`): submit = send + resume + await,
-  re-rooting on `snapshot` at turn end; interjections send immediately
-  (STEERED); Ctrl-C → `interrupt` (PAUSED, prefix kept), next submit
-  resumes; wholesale LLM replacement stops the stale runtime and the next
-  submit spawns afresh — instance uniqueness comes from `spawn` itself,
+  re-rooting on `snapshot` at turn end; mid-turn submissions send
+  immediately (STEERED); Ctrl-C → `interrupt` (PAUSED, prefix kept), next
+  submit resumes; wholesale LLM replacement stops the stale runtime and the
+  next submit spawns afresh — instance uniqueness comes from `spawn` itself,
   so the session's old entropy naming is gone.
 - **Async orchestration module** (§3.3 Team sketch, realized):
   `modules/staff` — spawn/sendTo/ask/status/read/collect/interruptWorker/
@@ -926,60 +973,21 @@ What is BUILT (see also §9 for ratified semantics):
 
 What is NOT built — threads to pull, each self-contained:
 
-1. **Addressing the roster** (§3.3, §5.1): the engine publishes the
-   directory and the client renders it (both BUILT above), but the strip is
-   read-only — the prompt is still bound to the one agent the session
-   spawned, so an agent the user did not start can be watched and not
-   spoken to. Missing: handle reconstruction from `AgentCallDigestAttr`
-   through the existing `loadIDFromSpan` → `dagger.Ref` path
-   (dagql/idtui/frontend_pretty.go:5055), degrading to a read-only entry
-   when the digest does not resolve; then the rest of §5.1 — focus with
-   per-agent drafts, the tmux keymap, and the `LLMSession` send-routing
-   refactor, which must land as one change. The risky half is de-risked:
-   that path yields a handle on the live runtime for a client-composed
-   agent (`TestRosterAddressing`, §9) AND for the module-internal one the
-   roster exists for (`TestRosterAddressingFromModule`), so what remains
-   here is UI wiring. The one contract to honour when wiring it: rebuild
-   errors — a frame whose span never reached this client
-   (dagql/call/id.go:767) — are the read-only signal, so surface them as
-   such rather than letting a failed rebuild look like a working entry.
-   The routing half was built once and lost to item 15 before it could be
-   harvested; its design is recorded here so a rebuild need not re-derive
-   it. Split `LLMSession` in two. A `sessionAgent` is ONE conversation: its
-   `llm` value, its runtime handle, `turnAgent`, model, references,
-   auto-compact, `initialLLM`, context baselines, and every method that
-   describes one conversation — `WithPrompt`, `Clear`, `Compact`, `Model`,
-   `Effort`, `History`, `Export`/`ResetWorkspace`, `LoadSession`,
-   `AutoSaveSession`, `BranchSummary`, and the status-line / changes /
-   references refreshes, which no-op unless that conversation is the
-   target. `LLMSession` keeps its name and becomes the owner: the
-   session-wide plumbing (`dag`, `shell`, `frontend`, plumbing span,
-   `onStep`, the subscription-label and workspace-host-path caches) plus
-   `agents []*sessionAgent` and `target`. Routing then resolves in exactly
-   one place — `Target()` — and every submit path names it: `shell.Handle`
-   opens turns on `s.Target().WithPrompt(...)`, and `SubmitToTarget(msg)`
-   asks THE TARGET whether it has a turn to absorb the message, with the
-   frontend routing on that answer instead of on `shellRunning`.
-   `shellRunning`/`shellLock` survive for what is genuinely serial — shell
-   commands and prompt-mode `/commands` share the one mvdan/sh interpreter
-   and mutate handler state — but stop deciding WHO gets a message.
-   Ownership is one `owned` flag (plus the `attachedID` an attached handle
-   was rebuilt from), set in the single place a handle enters a
-   conversation and read in the single place one leaves: `detachAgent`
-   returns the handle only when owned, so `dropAgent` — the choke point for
-   every wholesale LLM replacement — stops only what the session spawned,
-   and clearing a conversation you merely attached to can never kill
-   somebody else's worker. `Attach` roots its conversation on the runtime's
-   pinned `snapshot` ID, dedupes on re-attach, and never becomes the
-   target, since focus moves only by keypress. Hold the handle behind a
-   small `agentRuntime` interface (send / resume / interrupt / waitFor /
-   snapshot / stop) so both policies — who a message routes to, and whose
-   business it is to stop a runtime — are testable against a fake with no
-   engine. Factor the digest→ID step out of `llmBranchID` (as
-   `encodedIDForCallDigest`) so attach and branch-from-message share the
-   one proven path. Land it with behaviour unchanged — the target is always
-   the session's own agent — so the refactor is separable from the focus
-   feature it enables.
+1. **Roster follow-ups** (§5.1): addressing itself is BUILT (above), but
+   three threads it exposes are not. **Attaching prompts a runtime the
+   session does not own**: submit is send + resume + await, and that resume
+   un-pauses somebody else's worker — whether that is right ("prompt it
+   exactly like your own") or wants a resume-only-if-owned rule is
+   undecided. **Save identity is still session-wide**: `initialPrompt`/
+   `sessionUUID` live on the shell handler, so with two conversations
+   stepping, the last to step wins the auto-save file; a per-conversation
+   save identity does not exist yet. **The status line does not follow focus
+   for session-wide totals**: the frontend's live rollup covers all models
+   and sub-agents while the per-conversation snapshot does not, so those
+   totals belong in a roster header rather than on a line that describes one
+   conversation. Also unwired: the roster shows only name + state, so an
+   agent's `waitingOn` question is carried but never rendered (blocked on
+   item 4), and entries are flat — a chief and its workers look alike.
 2. **Enqueue guards** (§3.3): depth limiting, self-send rejection, cycle
    detection — none exist. Central point: the enqueue path in
    `AgentRuntimes` (`Send`). Until then `modules/staff` documents the
