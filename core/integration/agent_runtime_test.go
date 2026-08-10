@@ -527,9 +527,19 @@ func (AgentRuntimeSuite) TestSpawnInstances(ctx context.Context, t *testctx.T) {
 	require.NotEqual(t, first.agentID, second.agentID,
 		"two spawns of an identical composition must mint distinct instances")
 
-	// Same display name — a label, not an identity.
-	require.Equal(t, "twin", first.mustRun(ctx, t, `name`).Get("name").String())
-	require.Equal(t, "twin", second.mustRun(ctx, t, `name`).Get("name").String())
+	// Same display name — a label, not an identity. The instance ID is the
+	// identity, and reading it off the handle is how a client correlates an
+	// agent it drives with the entry the trace publishes for it (the loop
+	// span's dagger.io/agent.id is this same value).
+	firstIdentity := first.mustRun(ctx, t, `name instanceID`)
+	secondIdentity := second.mustRun(ctx, t, `name instanceID`)
+	require.Equal(t, "twin", firstIdentity.Get("name").String())
+	require.Equal(t, "twin", secondIdentity.Get("name").String())
+	require.NotEmpty(t, firstIdentity.Get("instanceID").String())
+	require.NotEqual(t,
+		firstIdentity.Get("instanceID").String(),
+		secondIdentity.Get("instanceID").String(),
+		"twins share a label but never an instance identity")
 
 	// Open a turn on the first instance only. The second's runtime is
 	// independent: it stays IDLE on the bare seed while the first dwells
@@ -1193,6 +1203,11 @@ func (AgentRuntimeSuite) TestRosterAddressing(ctx context.Context, t *testctx.T)
 	// (4) The reconstructed handle addresses the SAME runtime, not a fresh
 	// inert one derived from the same composition.
 	require.Equal(t, "rostered", rebuilt.mustRun(ctx, t, `name`).Get("name").String())
+	// And it reports the very identity the roster keyed its entry on — the
+	// correlation a client needs to tell a rostered agent apart from one it
+	// already drives.
+	require.Equal(t, node.ID,
+		rebuilt.mustRun(ctx, t, `instanceID`).Get("instanceID").String())
 	require.Equal(t, "FAILED", rebuilt.state(ctx, t))
 	transcript, _ := rebuilt.snapshot(ctx, t)
 	require.Contains(t, transcript, marker)
