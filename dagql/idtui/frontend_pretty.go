@@ -2462,7 +2462,7 @@ func (fe *frontendPretty) keys(out *termenv.Output) []key.Binding {
 	if fe.FocusedSpan.IsValid() {
 		focused = fe.db.Spans.Map[fe.FocusedSpan]
 	}
-	return []key.Binding{
+	binds := []key.Binding{
 		key.NewBinding(key.WithKeys("i", "tab"),
 			key.WithHelp("i", "input mode"),
 			KeyEnabled(fe.shell != nil)),
@@ -2514,6 +2514,19 @@ func (fe *frontendPretty) keys(out *termenv.Output) []key.Binding {
 			key.WithHelp("N", "prev"),
 			KeyEnabled(fe.searchQuery != "")),
 	}
+	// Roster focus, on unmodified keys because nav mode is the one place
+	// they are free -- and shown only once there is more than one agent to
+	// switch between, the same threshold the strip itself uses.
+	if fe.agentRoster != nil && fe.agentRoster.Visible() {
+		binds = append(binds,
+			key.NewBinding(key.WithKeys("1…9", "1", "2", "3", "4", "5", "6", "7", "8", "9"),
+				key.WithHelp("1…9", "focus agent")),
+			key.NewBinding(key.WithKeys("[/]", "[", "]"),
+				key.WithHelp("[/]", "prev/next agent"),
+				KeyEnabled(fe.addressableAgentCount() > 1)),
+		)
+	}
+	return binds
 }
 
 func (fe *frontendPretty) escHelp() string {
@@ -3648,7 +3661,8 @@ func (fe *frontendPretty) targetAgentID() string {
 }
 
 // focusAgentIndex moves focus to the nth roster entry (0-based), the
-// tmux-style numbered jump. Reports whether the key was handled.
+// tmux-style numbered jump behind prompt mode's alt+<digit>. Reports whether
+// the key was handled.
 func (fe *frontendPretty) focusAgentIndex(n int) bool {
 	entries := fe.agentRosterEntries()
 	if n < 0 || n >= len(entries) {
@@ -3659,7 +3673,8 @@ func (fe *frontendPretty) focusAgentIndex(n int) bool {
 
 // focusLastAgent toggles back to the previously focused agent -- tmux's
 // last-window, because the two-agent ping-pong is the common case and a
-// next/prev cycle is the wrong verb for it.
+// next/prev cycle is the wrong verb for it. (Nav mode does bind a cycle as
+// well; see navCycleAgent for why that does not make this key redundant.)
 func (fe *frontendPretty) focusLastAgent() bool {
 	if fe.lastFocusedAgent == "" {
 		return false
@@ -3670,6 +3685,125 @@ func (fe *frontendPretty) focusLastAgent() bool {
 		}
 	}
 	return false
+}
+
+// navRosterEntries returns the entries nav mode's roster keys may address,
+// or nil when the strip is not on screen.
+//
+// Nav mode's bindings are unmodified keys, so they are only allowed to claim
+// a keypress while the user can SEE what they are addressing -- the same
+// "more than one agent" threshold the strip itself and its help line use.
+// Digits that address an invisible strip would be a switcher operated blind.
+func (fe *frontendPretty) navRosterEntries() []AgentRosterEntry {
+	if fe.agentRoster == nil || !fe.agentRoster.Visible() {
+		return nil
+	}
+	return fe.agentRoster.Entries()
+}
+
+// addressableAgentCount is how many roster entries focus can actually move
+// between. An entry the client holds no handle for can be watched but not
+// spoken to, so it is not a cycle target; the count is what tells the help
+// line whether [/] has anywhere to go.
+func (fe *frontendPretty) addressableAgentCount() int {
+	var n int
+	for _, entry := range fe.navRosterEntries() {
+		if entry.ID != "" && !entry.ReadOnly {
+			n++
+		}
+	}
+	return n
+}
+
+// navFocusAgent is nav mode's numbered jump: prompt mode's alt+<digit> on the
+// bare digit (0-based here). Reports whether the digit named a roster entry
+// at all -- a digit past the end of the strip names nothing, and nav mode
+// leaves it unclaimed rather than swallowing it.
+//
+// The key is claimed even when focus does not move (the named agent was
+// already focused, or is read-only and says so): the user pointed at an entry
+// that is right there on the strip, so "take me to that agent's prompt" is
+// answered either way.
+func (fe *frontendPretty) navFocusAgent(n int) bool {
+	entries := fe.navRosterEntries()
+	if n < 0 || n >= len(entries) {
+		return false
+	}
+	fe.focusAgent(entries[n])
+	fe.returnToPromptAfterFocus()
+	return true
+}
+
+// navCycleAgent moves focus one step along the roster -- delta +1 for the
+// next entry, -1 for the previous -- wrapping around at the ends. Reports
+// whether there was anywhere to go, so a session with nobody else to talk to
+// leaves the key unclaimed instead of miming a switch that never happened.
+//
+// §5.1 argues a next/prev cycle is the wrong verb for the two-agent
+// ping-pong, and it still is: alt+l's last-focused toggle remains the key for
+// that, and this does not displace it. The cycle earns its place for the
+// other case -- a roster long enough that finding an agent's number is itself
+// the work -- where stepping along the strip beats counting entries.
+//
+// Read-only entries are stepped OVER, never onto. focusAgent answers "focus
+// THIS one" for an unaddressable entry with a prompt error, which is the
+// honest reply when the user named it by number; a cycle names nobody in
+// particular, so stopping there would answer "next agent" with an error about
+// an agent the user never asked for -- once per press, all the way along. An
+// entry is only PROVEN unaddressable by a rebuild that failed, so the cycle
+// can still walk onto one the first time and report it; from then on the
+// strip has it marked and the cycle passes it by.
+func (fe *frontendPretty) navCycleAgent(delta int) bool {
+	entries := fe.navRosterEntries()
+	n := len(entries)
+	if n == 0 {
+		return false
+	}
+	start := -1
+	for i, entry := range entries {
+		if entry.Focused {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		// Nothing focused yet: start just off the near end, so ] lands on
+		// the first entry and [ on the last.
+		if delta > 0 {
+			start = -1
+		} else {
+			start = 0
+		}
+	}
+	for i := 1; i <= n; i++ {
+		entry := entries[((start+i*delta)%n+n)%n]
+		if entry.Focused || entry.ReadOnly || entry.ID == "" {
+			continue
+		}
+		if !fe.focusAgent(entry) {
+			// Nothing left for focusAgent to refuse but a handler that
+			// cannot retarget at all, and then there is no cycle to run.
+			return false
+		}
+		fe.returnToPromptAfterFocus()
+		return true
+	}
+	// One agent, or every other entry watch-only: the roster key is a no-op
+	// and must not pretend otherwise by consuming the press.
+	return false
+}
+
+// returnToPromptAfterFocus hands the prompt back after a roster key moved
+// focus from nav mode.
+//
+// Focusing an agent is a prelude to typing at it -- that is the entire point
+// of the per-agent draft, saved on blur and restored on focus (§5.1), which
+// only pays off if the next keystroke is the message. Staying in nav mode
+// would cost an `i` every single time and buy nothing: the tree nav mode
+// browses is the whole trace, and focus does not change it. So a roster key
+// in nav mode means "go talk to that agent", not "select it".
+func (fe *frontendPretty) returnToPromptAfterFocus() {
+	fe.enterInsertMode(false)
 }
 
 // focusAgent points the prompt at one roster entry: the draft in the input is
@@ -4613,9 +4747,10 @@ func (fe *frontendPretty) interceptEditlineKey(ctx tuist.Context, ev uv.KeyPress
 	default:
 		// Roster focus: tmux's numbered jump targets and last-window toggle,
 		// aliased onto alt+ so the digits themselves keep typing. tab is
-		// unavailable (input-mode binding, and the completion menu eats it),
-		// and a next/prev cycle is deliberately absent: the two-agent
-		// ping-pong wants a toggle, not a rotation (§5.1).
+		// unavailable (input-mode binding, and the completion menu eats it).
+		// alt+<digit> is widely stolen upstream, which is why nav mode binds
+		// the bare digits (and a [/] cycle) to the same jumps -- see
+		// handleNavKeyUV; these bindings stay for everyone they do reach.
 		if n, ok := agentJumpKey(keyStr); ok {
 			if fe.focusAgentIndex(n) {
 				return true
@@ -4636,10 +4771,12 @@ func (fe *frontendPretty) interceptEditlineKey(ctx tuist.Context, ev uv.KeyPress
 }
 
 // agentLastKey toggles back to the previously focused agent (tmux's
-// last-window, prefix+l).
+// last-window, prefix+l). Prompt mode only; nav mode's roster keys are the
+// bare digits and [/] (see handleNavKeyUV).
 const agentLastKey = "alt+l"
 
-// agentJumpKey maps alt+1..alt+9 to a 0-based roster index.
+// agentJumpKey maps prompt mode's alt+1..alt+9 to a 0-based roster index.
+// Nav mode reaches the same jumps without the modifier.
 func agentJumpKey(keyStr string) (int, bool) {
 	rest, ok := strings.CutPrefix(keyStr, "alt+")
 	if !ok || len(rest) != 1 || rest[0] < '1' || rest[0] > '9' {
@@ -4834,6 +4971,29 @@ func (fe *frontendPretty) handleNavKeyUV(ev uv.KeyPressEvent) {
 	case "tab", "i":
 		fe.enterInsertMode(false)
 		return
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+		// Roster focus on bare digits. Prompt mode has to hide the same jump
+		// behind alt+ so the digits keep typing, and alt+<digit> is the most
+		// contested chord there is -- editors, browsers and terminal
+		// emulators all bind it to tab switching -- so for plenty of users
+		// the keypress never reaches us at all. Nav mode is a modal context
+		// where unmodified keys are the vocabulary, so it can offer the jump
+		// on a key nothing upstream can intercept (§5.1). The alt+ bindings
+		// stay: this adds a path that always works, it does not replace one.
+		if fe.navFocusAgent(int(keyStr[0] - '1')) {
+			return
+		}
+	case "[", "]":
+		// Previous/next agent. Emphatically NOT ctrl+[, the usual pairing:
+		// it transmits 0x1B, which IS the escape byte, so a terminal cannot
+		// tell it apart from the esc that got the user into nav mode.
+		delta := 1
+		if keyStr == "[" {
+			delta = -1
+		}
+		if fe.navCycleAgent(delta) {
+			return
+		}
 	case "t":
 		fe.terminal()
 		return

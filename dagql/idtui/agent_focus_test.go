@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/dagger/dagger/dagql/call/callpbv1"
 	"github.com/dagger/dagger/dagql/dagui"
 	"github.com/stretchr/testify/require"
@@ -142,6 +144,32 @@ func pressEditlineKey(t *testing.T, fe *frontendPretty, key uv.Key) bool {
 	return fe.interceptEditlineKey(tuist.Context{}, uv.KeyPressEvent(key))
 }
 
+// pressNavKey drives one nav-mode keypress, the way HandleKeyPress does when
+// the span tree holds tuist's focus.
+func pressNavKey(t *testing.T, fe *frontendPretty, r rune) {
+	t.Helper()
+	fe.handleNavKeyUV(uv.KeyPressEvent(uv.Key{Code: r, Text: string(r)}))
+}
+
+// awaitFocus waits for the handler to have been asked to focus exactly the
+// given agents, in order -- focus is retargeted on the shell goroutine.
+func awaitFocus(t *testing.T, handler *focusShellHandler, want ...string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		focused := handler.focusedAgents()
+		if len(focused) != len(want) {
+			return false
+		}
+		for i, id := range want {
+			if focused[i] != id {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 10*time.Millisecond,
+		"waiting for focus %v, got %v", want, handler.focusedAgents())
+}
+
 // TestSubmitAsksTheTargetFirst covers the routing order: the focused
 // conversation's own in-flight turn absorbs the message, and only when there
 // is nothing to absorb it does the frontend open a new turn.
@@ -235,46 +263,45 @@ func rosterDB(t *testing.T) *dagui.DB {
 // rosterTrace is the raw material of rosterDB: the call payloads a client
 // ingests, and the spans that carry them.
 func rosterTrace() (map[string]*callpbv1.Call, []dagui.SpanSnapshot) {
+	return rosterTraceFor("chief", "scout")
+}
+
+// rosterTraceFor is rosterTrace for a roster of a given size, in the order
+// the agents were born -- which is the order the strip numbers them in.
+func rosterTraceFor(names ...string) (map[string]*callpbv1.Call, []dagui.SpanSnapshot) {
 	start := time.Unix(100, 0)
 	traceID := prettyTestTraceID()
 	calls := map[string]*callpbv1.Call{}
 	var snapshots []dagui.SpanSnapshot
 
-	for i, agent := range []struct {
-		name   string
-		id     string
-		digest string
-		span   byte
-		call   byte
-	}{
-		{"chief", "agent-chief", "sha256:chief", 1, 2},
-		{"scout", "agent-scout", "sha256:scout", 3, 4},
-	} {
-		calls[agent.digest] = &callpbv1.Call{
-			Digest: agent.digest,
+	for i, name := range names {
+		id := "agent-" + name
+		digest := "sha256:" + name
+		calls[digest] = &callpbv1.Call{
+			Digest: digest,
 			Field:  "agent",
 			Type:   &callpbv1.Type{NamedType: "Agent"},
 		}
 		snapshots = append(snapshots,
 			dagui.SpanSnapshot{
-				ID:        prettyTestSpanID(agent.span),
+				ID:        prettyTestSpanID(byte(2*i + 1)),
 				TraceID:   traceID,
-				Name:      "agent: " + agent.name,
+				Name:      "agent: " + name,
 				StartTime: start.Add(time.Duration(i) * time.Second),
 				Agent:     true,
-				AgentID:   agent.id,
-				AgentName: agent.name,
+				AgentID:   id,
+				AgentName: name,
 				// The identity the loop span publishes, including the digest
 				// of the call that produced the agent value.
-				AgentCallDigest: agent.digest,
+				AgentCallDigest: digest,
 				AgentState:      "IDLE",
 			},
 			dagui.SpanSnapshot{
-				ID:         prettyTestSpanID(agent.call),
+				ID:         prettyTestSpanID(byte(2*i + 2)),
 				TraceID:    traceID,
 				Name:       "agent(id:)",
 				StartTime:  start.Add(time.Duration(i) * time.Second),
-				CallDigest: agent.digest,
+				CallDigest: digest,
 			},
 		)
 	}
@@ -376,4 +403,178 @@ func TestRosterRendersWhenAgentsAppear(t *testing.T) {
 	frame = strings.Join(fe.tui.Step(), "\n")
 	require.Contains(t, frame, "1:chief*")
 	require.Contains(t, frame, "2:scout")
+}
+
+// TestRosterStaysVisibleInNavMode is the precondition for nav mode's roster
+// keys: the digits address entries by their position on the strip, so a strip
+// that vanished on esc would leave the user aiming at something they cannot
+// see.
+func TestRosterStaysVisibleInNavMode(t *testing.T) {
+	handler := &focusShellHandler{target: "agent-chief"}
+	fe := focusTestFrontend(t, rosterDB(t), handler)
+	fe.updateAgentRoster()
+
+	fe.enterNavMode(false)
+	frame := ansi.Strip(strings.Join(fe.tui.Step(), "\n"))
+	require.Contains(t, frame, "i input mode", "sanity: this is nav mode's frame")
+	require.Contains(t, frame, "1:chief*")
+	require.Contains(t, frame, "2:scout")
+}
+
+// TestNavDigitFocusesAndReturnsToPrompt covers the binding that always
+// arrives: alt+<digit> is contested all the way up the stack (editors,
+// browsers, terminal emulators), so nav mode offers the same jump on the bare
+// digit. Focusing is a prelude to typing at the agent, so it hands the prompt
+// back -- which is also what makes the per-agent draft worth keeping.
+func TestNavDigitFocusesAndReturnsToPrompt(t *testing.T) {
+	handler := &focusShellHandler{target: "agent-chief"}
+	fe := focusTestFrontend(t, rosterDB(t), handler)
+
+	fe.textInput.SetValue("half a thought")
+	fe.enterNavMode(false)
+	require.False(t, fe.editlineFocused)
+
+	pressNavKey(t, fe, '2')
+	awaitFocus(t, handler, "agent-scout")
+	fe.tui.Step()
+
+	require.True(t, fe.editlineFocused, "a roster key means 'go talk to that agent'")
+	require.Equal(t, "", fe.textInput.Value(), "the scout has no draft yet")
+
+	// The drafts follow the agents exactly as they do in prompt mode.
+	fe.textInput.SetValue("for the scout")
+	fe.enterNavMode(false)
+	pressNavKey(t, fe, '1')
+	awaitFocus(t, handler, "agent-scout", "agent-chief")
+	fe.tui.Step()
+	require.True(t, fe.editlineFocused)
+	require.Equal(t, "half a thought", fe.textInput.Value())
+}
+
+// TestNavDigitWithoutAnEntryIsUnclaimed: nav mode's digits are unmodified
+// keys, so they may only speak for the roster when there is a roster on
+// screen to speak for. A digit past the end of the strip -- or any digit at
+// all in an ordinary single-agent session, where the strip is hidden -- must
+// pass through untouched rather than silently dropping the user at a prompt.
+func TestNavDigitWithoutAnEntryIsUnclaimed(t *testing.T) {
+	handler := &focusShellHandler{target: "agent-chief"}
+	fe := focusTestFrontend(t, rosterDB(t), handler)
+	fe.enterNavMode(false)
+
+	pressNavKey(t, fe, '3')
+	require.Empty(t, handler.focusedAgents())
+	require.False(t, fe.editlineFocused, "a digit naming nobody must not switch modes")
+
+	solo := focusTestFrontend(t, dagui.NewDB(), &focusShellHandler{target: "agent-chief"})
+	solo.enterNavMode(false)
+	pressNavKey(t, solo, '1')
+	require.False(t, solo.editlineFocused, "no strip, no digit bindings")
+}
+
+// TestNavCycleWalksTheRoster covers [/]: one step per press, wrapping at both
+// ends. (Not ctrl+[ -- that transmits 0x1B, the escape byte itself, so a
+// terminal cannot tell it apart from the esc that enters nav mode.)
+func TestNavCycleWalksTheRoster(t *testing.T) {
+	db := dagui.NewDB()
+	calls, snapshots := rosterTraceFor("chief", "scout", "docs")
+	for digest, call := range calls {
+		db.Calls[digest] = call
+	}
+	db.ImportSnapshots(snapshots)
+
+	handler := &focusShellHandler{target: "agent-chief"}
+	fe := focusTestFrontend(t, db, handler)
+
+	// Forward from the first entry to the last, then over the end.
+	for _, want := range [][]string{
+		{"agent-scout"},
+		{"agent-scout", "agent-docs"},
+		{"agent-scout", "agent-docs", "agent-chief"},
+	} {
+		fe.enterNavMode(false)
+		pressNavKey(t, fe, ']')
+		awaitFocus(t, handler, want...)
+		fe.tui.Step()
+		require.True(t, fe.editlineFocused, "cycling lands at the prompt too")
+	}
+
+	// And backwards, wrapping off the front the same way.
+	fe.enterNavMode(false)
+	pressNavKey(t, fe, '[')
+	awaitFocus(t, handler,
+		"agent-scout", "agent-docs", "agent-chief", "agent-docs")
+	fe.tui.Step()
+}
+
+// TestNavCycleWithNobodyToCycleTo: with one addressable agent the cycle has
+// nowhere to go, and must say so rather than consuming the key to mime a
+// switch that never happened.
+func TestNavCycleWithNobodyToCycleTo(t *testing.T) {
+	// One agent: the strip is hidden, so the keys are not bound at all.
+	solo := focusTestFrontend(t, dagui.NewDB(), &focusShellHandler{target: "agent-chief"})
+	solo.enterNavMode(false)
+	require.False(t, solo.navCycleAgent(1))
+	require.False(t, solo.navCycleAgent(-1))
+	require.False(t, solo.editlineFocused)
+
+	// Two agents, one of them watch-only: the strip is up, but there is still
+	// only one agent focus can move to -- itself.
+	db := rosterDB(t)
+	delete(db.Calls, "sha256:scout")
+	handler := &focusShellHandler{target: "agent-chief"}
+	fe := focusTestFrontend(t, db, handler)
+	require.True(t, pressEditlineKey(t, fe, uv.Key{Code: '2', Mod: uv.ModAlt}))
+	require.Error(t, fe.promptErr, "naming a read-only entry reports why")
+
+	fe.setPromptError(nil)
+	fe.enterNavMode(false)
+	pressNavKey(t, fe, ']')
+	require.Empty(t, handler.focusedAgents())
+	require.False(t, fe.editlineFocused)
+	// A cycle names nobody in particular, so it steps over the entry it
+	// cannot address instead of answering with an error about an agent the
+	// user never asked for.
+	require.NoError(t, fe.promptErr)
+}
+
+// TestNavRosterKeysAreAdvertised: the keys are only useful if the keymap bar
+// names them, and only honest if it names them exactly when they are bound --
+// the same "more than one agent" threshold the strip itself uses.
+func TestNavRosterKeysAreAdvertised(t *testing.T) {
+	out := NewOutput(io.Discard)
+
+	solo := focusTestFrontend(t, dagui.NewDB(), &focusShellHandler{target: "agent-chief"})
+	solo.enterNavMode(false)
+	require.NotContains(t, navKeyHelp(solo.keys(out)), "focus agent")
+
+	handler := &focusShellHandler{target: "agent-chief"}
+	fe := focusTestFrontend(t, rosterDB(t), handler)
+	fe.enterNavMode(false)
+	help := navKeyHelp(fe.keys(out))
+	require.Contains(t, help, "1…9 focus agent")
+	require.Contains(t, help, "[/] prev/next agent")
+
+	// With the second entry watch-only there is nobody to cycle to, so the
+	// cycle greys out while the numbered jump -- which can still report why
+	// that entry is unreachable -- stays.
+	readOnly := rosterDB(t)
+	delete(readOnly.Calls, "sha256:scout")
+	ro := focusTestFrontend(t, readOnly, &focusShellHandler{target: "agent-chief"})
+	require.True(t, pressEditlineKey(t, ro, uv.Key{Code: '2', Mod: uv.ModAlt}))
+	ro.enterNavMode(false)
+	help = navKeyHelp(ro.keys(out))
+	require.Contains(t, help, "1…9 focus agent")
+	require.NotContains(t, help, "prev/next agent")
+}
+
+// navKeyHelp renders the enabled bindings the way the keymap bar does.
+func navKeyHelp(binds []key.Binding) string {
+	var help []string
+	for _, b := range binds {
+		if !b.Enabled() {
+			continue
+		}
+		help = append(help, b.Help().Key+" "+b.Help().Desc)
+	}
+	return strings.Join(help, " | ")
 }

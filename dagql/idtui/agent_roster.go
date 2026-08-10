@@ -39,9 +39,9 @@ type AgentRosterEntry struct {
 // sidebar is a top-right overlay that occludes the tree it summarizes and
 // has no selection model to grow into a switcher.
 //
-// Focus moves only by a keypress (alt+1…9, alt+l), never by an event: an
-// agent that needs the user advertises attention on its entry and waits.
-// Nothing here may steal focus.
+// Focus moves only by a keypress (alt+1…9 or alt+l from the prompt, 1…9 or
+// [/] in nav mode), never by an event: an agent that needs the user
+// advertises attention on its entry and waits. Nothing here may steal focus.
 type AgentRoster struct {
 	tuist.Compo
 
@@ -94,8 +94,9 @@ func (r *AgentRoster) Render(ctx tuist.Context) {
 	for i, entry := range entries {
 		glyph, label, color := agentStateDisplay(entry.State)
 
-		// Jump numbers only where a jump key exists (alt+1…9); beyond that
-		// the entry is still listed, just not directly addressable by key.
+		// Jump numbers only where a jump key exists (alt+1…9 from the
+		// prompt, 1…9 in nav mode); beyond that the entry is still listed,
+		// just not directly addressable by key -- [/] still walks onto it.
 		var prefix string
 		if i < 9 {
 			prefix = strconv.Itoa(i+1) + ":"

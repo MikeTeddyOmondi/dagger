@@ -102,8 +102,8 @@ func TestAgentRosterMarksFocusAndReachability(t *testing.T) {
 }
 
 // TestAgentRosterNumbersOnlyJumpableEntries: the numbers are jump targets
-// (alt+1…9), so an entry past the ninth gets none rather than advertising a
-// key that does nothing.
+// (alt+1…9 from the prompt, 1…9 in nav mode), so an entry past the ninth gets
+// none rather than advertising a key that does nothing.
 func TestAgentRosterNumbersOnlyJumpableEntries(t *testing.T) {
 	entries := make([]AgentRosterEntry, 0, 10)
 	for _, name := range []string{
