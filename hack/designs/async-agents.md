@@ -988,26 +988,56 @@ What is NOT built — threads to pull, each self-contained:
     they had actually done). A second observation narrows it: only agents
     spawned BEFORE the resume are affected — a freshly spawned agent yields
     exactly one loop — and the re-animated loops render beneath the ORIGINAL
-    `spawn()` tool-call span, which is where the recorded chain is anchored,
-    so one worker can appear as several concurrent loops under one hire.
-    The likeliest mechanism is not the recorded `send` (an ID-returning verb,
-    forced once and re-hydrated through its lookup — §9's scope correction)
-    but the recorded `withTools` binding of the chief's rebound tool object:
-    it is loaded lazily, and its handle-form ID is an engine-local
-    shared-result reference that dies with the session, so after a restart
-    the load falls back to walking the recipe — re-executing the `spawn`
-    inside it. Adjacent to item 13's note that a tombstone re-selected in a
-    NEW session projects IDLE-from-absence with the seed as its snapshot, but
-    distinct and worse: there the re-selection is inert, here it has side
-    effects. Cross-session identity is the unresolved question — §4 resumes a
-    *conversation* from the trace and says nothing about a client replaying a
-    chain that contains imperative verbs — and the failure mode is expensive
-    (silent duplicate work) and confusing (a roster full of agents that look
-    busy but have lost their history). A roster (item 1) makes it more
-    visible, not less. Candidate fixes to weigh: make replay of imperative
-    verbs inert (resolve to the recorded result rather than re-executing),
-    mark a restored chain replay-only, or have resume reattach by instance ID
-    instead of re-deriving.
+    `spawn()` tool-call span, so one worker can appear as several concurrent
+    loops under one hire.
+    Mechanism, established: **the runtime registry is per-session**
+    (`engine/server/session.go:532` allocates a fresh `NewAgentRuntimes()`).
+    Keys are stable across sessions — the agent's content digest, minted
+    `InstanceID` included — but the table they index is not, so the same key
+    resolves to a FRESH entry. Every creating verb routes through
+    `GetOrCreate` (core/agent.go:250) and mints from `Seed` rather than
+    reattaching; `send` then signal-with-starts it. That is exactly "RUNNING
+    again, snapshot back to the seed". The chief's saved recipe is what
+    carries the spawn call back: `AutoSaveSession` persists `LLM.portableID`
+    (internal/cmd/dagger/llm.go:953) and `recipeSelectors` (core/llm.go:2460)
+    emits `withTools(object: …staff!spawn(…))`, in RECIPE form — it must be,
+    since a post-evaluation `Result.ID()` is an engine-local handle
+    (`call.NewEngineResultID`, dagql/cache.go:2250) that dies with its
+    session (measured: loading one later on the same engine fails with
+    "missing shared result"). A worker is therefore re-animated iff its
+    `spawn` was baked into the restored recipe — i.e. iff it existed at save
+    time — and each resume adds one more loop. All of them render under the
+    original row because the replayed call ID is byte-identical, recorded
+    per-call nonce included, so its `dagger.io/dag.digest` is too.
+    Note what §9's pinning does NOT cover: it is `Staff.spawn` that gets
+    re-executed, not `Agent.send` — the chief's conversation never records
+    one. Pinning makes re-*hydrating a result ID* inert; it says nothing
+    about re-*executing a recorded call*. Left open: whether the replayed
+    load re-executes the spawn outright or cache-hits, which only decides
+    whether the duplicate boots on resume or on the first steer. Either way a
+    resumed chief is lied to meanwhile — `status` and `read` read through
+    `Get`, which never creates, so they report IDLE-from-absence right up
+    until the chief steers.
+    Fix, recommended: **reattach by instance ID** — make registry lookup
+    session-independent, keyed on the spawn-minted `InstanceID` that already
+    rides the pinned chain, so a resumed session finds the live entry instead
+    of minting one. It is the only option where resume means what a user
+    expects (the worker keeps running, and keeps its history), and §9 already
+    made that identity unforgeable and collision-free. It needs an owner for
+    the lifetime question §4 dodges: when does an agent outlive every session
+    that can see it? Runners-up: make imperative verbs in a restored chain
+    resolve to their recorded result (smaller, stops the duplicate work, but
+    leaves the chief holding corpses); or refuse to serialize a chain
+    containing an imperative verb at all — the honest stopgap, turning silent
+    duplicate work into a loud save-time failure. None landed: this is a hole
+    in §4's cross-session identity story rather than a defect in `send`, and
+    every option changes engine-wide semantics.
+    Adjacent to item 13's note that a tombstone re-selected in a NEW session
+    projects IDLE-from-absence with the seed as its snapshot, but distinct
+    and worse: there the re-selection is inert, here it has side effects. The
+    failure mode is expensive (silent duplicate work) and confusing (a roster
+    full of agents that look busy but have lost their history). A roster
+    (item 1) makes it more visible, not less.
 15. **Changeset replay loses tracked-ness** (known, pre-existing, unexplained
     — started some time ago): the workspace's changeset machinery
     intermittently forgets that a path is already tracked and treats it as
