@@ -1038,4 +1038,27 @@ What is NOT built — threads to pull, each self-contained:
     agent-specific — it is a workspace-layer defect — but recorded here
     because the staff workflow (spawn, harvest, pull) is where it keeps
     surfacing.
+16. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
+    broken from a session that stopped before resolving it, and it is still
+    unknown whether the test or the code is wrong — hence skipped rather
+    than deleted or "fixed" by adjusting the assertion until it passes. It
+    covers the whole orchestration loop (spawn → askChief steering into the
+    chief's open turn → collect), so leaving it red would mask real
+    regressions in everything around it. What a run establishes: the worker
+    fails at its first step with `message history diverges at index 0`, the
+    replayer expecting `SYSTEM` (the `workerPrompt`) where the live history
+    has `USER` (the opening task) — i.e. the worker's seed is one message
+    short at the front. The compose chain is not obviously at fault: the
+    trace shows `withSystemPrompt` applied (with the exact prompt text)
+    immediately before `spawn`, in the right order, and real staff workers
+    outside the test demonstrably DO carry their system prompt. So suspicion
+    falls on how a spawned agent's `Seed` materializes its messages versus
+    what the replayer compares against, not on `modules/staff`. Two
+    consequences if the code side turns out to be wrong: it would mean an
+    agent's recorded history can disagree with what it actually sends, which
+    §3.2's influence⇔append rule forbids; and the `replay/` provider's
+    byte-for-byte history matching would be the only thing that ever notices.
+    Worth pairing with item 11 (workers not knowing their own name), which
+    also wants to interpolate into `workerPrompt` and would move the same
+    seed boundary.
 
