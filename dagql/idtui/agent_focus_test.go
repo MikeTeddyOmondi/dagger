@@ -170,6 +170,19 @@ func awaitFocus(t *testing.T, handler *focusShellHandler, want ...string) {
 		"waiting for focus %v, got %v", want, handler.focusedAgents())
 }
 
+// focusedRosterName is the agent the STRIP says is focused -- the client's
+// belief, which moves on the keypress rather than when the handler catches up.
+// It is what the user reads, and what the next roster key steps from.
+func focusedRosterName(t *testing.T, fe *frontendPretty) string {
+	t.Helper()
+	for _, entry := range fe.agentRosterEntries() {
+		if entry.Focused {
+			return entry.Name
+		}
+	}
+	return ""
+}
+
 // TestSubmitAsksTheTargetFirst covers the routing order: the focused
 // conversation's own in-flight turn absorbs the message, and only when there
 // is nothing to absorb it does the frontend open a new turn.
@@ -253,6 +266,19 @@ func rosterDB(t *testing.T) *dagui.DB {
 	t.Helper()
 	db := dagui.NewDB()
 	calls, snapshots := rosterTrace()
+	for digest, call := range calls {
+		db.Calls[digest] = call
+	}
+	db.ImportSnapshots(snapshots)
+	return db
+}
+
+// threeAgentDB is rosterDB with one more agent, so a cycle has somewhere to
+// wrap around from.
+func threeAgentDB(t *testing.T) *dagui.DB {
+	t.Helper()
+	db := dagui.NewDB()
+	calls, snapshots := rosterTraceFor("chief", "scout", "docs")
 	for digest, call := range calls {
 		db.Calls[digest] = call
 	}
@@ -472,38 +498,63 @@ func TestNavDigitWithoutAnEntryIsUnclaimed(t *testing.T) {
 }
 
 // TestNavCycleWalksTheRoster covers [/]: one step per press, wrapping at both
-// ends. (Not ctrl+[ -- that transmits 0x1B, the escape byte itself, so a
-// terminal cannot tell it apart from the esc that enters nav mode.)
+// ends, WITHOUT leaving nav mode. A cycle is a survey verb -- you tap it until
+// you land on the one you want -- so the presses here are consecutive, with no
+// mode switch in between. That is the shape that catches both ways this can
+// break: a cycle that returned to the prompt would type its own second press
+// into the input, and one that counted from the handler's settled target would
+// step to the same agent three times, since focus is retargeted asynchronously.
 func TestNavCycleWalksTheRoster(t *testing.T) {
-	db := dagui.NewDB()
-	calls, snapshots := rosterTraceFor("chief", "scout", "docs")
-	for digest, call := range calls {
-		db.Calls[digest] = call
-	}
-	db.ImportSnapshots(snapshots)
-
 	handler := &focusShellHandler{target: "agent-chief"}
-	fe := focusTestFrontend(t, db, handler)
+	fe := focusTestFrontend(t, threeAgentDB(t), handler)
+	fe.enterNavMode(false)
 
-	// Forward from the first entry to the last, then over the end.
-	for _, want := range [][]string{
-		{"agent-scout"},
-		{"agent-scout", "agent-docs"},
-		{"agent-scout", "agent-docs", "agent-chief"},
-	} {
-		fe.enterNavMode(false)
+	// Three taps in a row: chief -> scout -> docs -> back to chief.
+	for _, want := range []string{"scout", "docs", "chief"} {
 		pressNavKey(t, fe, ']')
-		awaitFocus(t, handler, want...)
-		fe.tui.Step()
-		require.True(t, fe.editlineFocused, "cycling lands at the prompt too")
+		require.Equal(t, want, focusedRosterName(t, fe))
+		require.False(t, fe.editlineFocused,
+			"a cycle key must stay in nav mode, or its next press types itself")
 	}
 
-	// And backwards, wrapping off the front the same way.
-	fe.enterNavMode(false)
+	// And backwards, off the front of the list.
 	pressNavKey(t, fe, '[')
-	awaitFocus(t, handler,
-		"agent-scout", "agent-docs", "agent-chief", "agent-docs")
+	require.Equal(t, "docs", focusedRosterName(t, fe))
+	require.False(t, fe.editlineFocused)
+}
+
+// TestNavCycleCoalescesRequests: only one focus request is allowed out at a
+// time, so a burst of taps asks the handler to attach to where the user landed
+// rather than to every agent walked past -- and never twice to the same one,
+// which is what a cycle counting from the stale target would do.
+func TestNavCycleCoalescesRequests(t *testing.T) {
+	handler := &focusShellHandler{target: "agent-chief"}
+	fe := focusTestFrontend(t, threeAgentDB(t), handler)
+	fe.enterNavMode(false)
+
+	pressNavKey(t, fe, ']')
+	pressNavKey(t, fe, ']')
+	pressNavKey(t, fe, ']')
+	require.Equal(t, "chief", focusedRosterName(t, fe), "the walk wrapped all the way round")
+
+	// The first request goes out on the press; the rest ride on the client's
+	// belief until it lands, and then one catch-up request is sent.
+	require.Eventually(t, func() bool {
+		return len(handler.focusedAgents()) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
 	fe.tui.Step()
+	require.Eventually(t, func() bool {
+		focused := handler.focusedAgents()
+		return len(focused) > 0 && focused[len(focused)-1] == "agent-chief"
+	}, 5*time.Second, 10*time.Millisecond)
+	fe.tui.Step()
+
+	focused := handler.focusedAgents()
+	require.Less(t, len(focused), 3, "taps behind an in-flight request coalesce")
+	for i := 1; i < len(focused); i++ {
+		require.NotEqual(t, focused[i-1], focused[i],
+			"the same agent must never be requested twice in a row")
+	}
 }
 
 // TestNavCycleWithNobodyToCycleTo: with one addressable agent the cycle has
@@ -539,6 +590,32 @@ func TestNavCycleWithNobodyToCycleTo(t *testing.T) {
 	require.NoError(t, fe.promptErr)
 }
 
+// TestNavToggleReturnsToLastAgent: nav mode gets the last-focused toggle too,
+// or it would be strictly weaker than the prompt at the very thing §5.1 calls
+// the common case. Unlike the cycle it names a destination, so it hands the
+// prompt back.
+func TestNavToggleReturnsToLastAgent(t *testing.T) {
+	handler := &focusShellHandler{target: "agent-chief"}
+	fe := focusTestFrontend(t, rosterDB(t), handler)
+	fe.enterNavMode(false)
+
+	// Nothing focused before, so there is nothing to toggle back to yet.
+	pressNavKey(t, fe, '`')
+	require.Empty(t, handler.focusedAgents())
+	require.False(t, fe.editlineFocused, "an unarmed toggle must not switch modes")
+
+	pressNavKey(t, fe, '2')
+	awaitFocus(t, handler, "agent-scout")
+	fe.tui.Step()
+
+	fe.enterNavMode(false)
+	pressNavKey(t, fe, '`')
+	awaitFocus(t, handler, "agent-scout", "agent-chief")
+	fe.tui.Step()
+	require.True(t, fe.editlineFocused, "the toggle names an agent, so it lands at the prompt")
+	require.Equal(t, "chief", focusedRosterName(t, fe))
+}
+
 // TestNavRosterKeysAreAdvertised: the keys are only useful if the keymap bar
 // names them, and only honest if it names them exactly when they are bound --
 // the same "more than one agent" threshold the strip itself uses.
@@ -555,6 +632,16 @@ func TestNavRosterKeysAreAdvertised(t *testing.T) {
 	help := navKeyHelp(fe.keys(out))
 	require.Contains(t, help, "1…9 focus agent")
 	require.Contains(t, help, "[/] prev/next agent")
+	require.NotContains(t, help, "last agent",
+		"the toggle greys out until there is somewhere to toggle back to")
+
+	// Once focus has moved, the toggle has a destination and lights up. (The
+	// digit landed us at the prompt, so go back to nav mode to read its bar.)
+	pressNavKey(t, fe, '2')
+	awaitFocus(t, handler, "agent-scout")
+	fe.tui.Step()
+	fe.enterNavMode(false)
+	require.Contains(t, navKeyHelp(fe.keys(out)), "` last agent")
 
 	// With the second entry watch-only there is nobody to cycle to, so the
 	// cycle greys out while the numbered jump -- which can still report why
