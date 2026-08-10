@@ -46,6 +46,8 @@ type agentRuntime interface {
 	Interrupt(ctx context.Context) error
 	// WaitFor blocks until the runtime reaches the given state.
 	WaitFor(ctx context.Context, state dagger.AgentState) error
+	// State is the runtime's projected lifecycle state.
+	State(ctx context.Context) (dagger.AgentState, error)
 	// SnapshotID is the ID of the runtime's last committed conversation --
 	// the honest chain the client re-roots on.
 	SnapshotID(ctx context.Context) (dagger.ID, error)
@@ -92,6 +94,10 @@ func (l liveAgent) Interrupt(ctx context.Context) error {
 func (l liveAgent) WaitFor(ctx context.Context, state dagger.AgentState) error {
 	_, err := l.agent.WaitFor(ctx, dagger.AgentWaitForOpts{State: state})
 	return err
+}
+
+func (l liveAgent) State(ctx context.Context) (dagger.AgentState, error) {
+	return l.agent.State(ctx)
 }
 
 func (l liveAgent) SnapshotID(ctx context.Context) (dagger.ID, error) {
@@ -439,8 +445,10 @@ func (a *sessionAgent) flushPending(rt agentRuntime) {
 //
 // With a turn in flight, canceling its await is enough -- WithPrompt then
 // issues the server-side interrupt and re-roots on the kept prefix. Without
-// one (an attached agent running on its own) the runtime is interrupted
-// directly, since there is no client-side await to unblock.
+// one the runtime may still be working on its own (an attached agent), so it
+// is interrupted directly -- but only if it is actually busy: interrupt on an
+// idle agent is equivalent to pause, and Ctrl-C to clear a half-typed line
+// must not park somebody's worker.
 func (a *sessionAgent) Interrupt() bool {
 	a.turnL.Lock()
 	cancel := a.turnCancel
@@ -453,8 +461,27 @@ func (a *sessionAgent) Interrupt() bool {
 	if rt == nil {
 		return false
 	}
-	go a.interruptAgent(rt)
+	go a.interruptIfBusy(rt)
 	return true
+}
+
+// interruptIfBusy preempts a runtime this session is not currently driving,
+// after checking that it has work to preempt.
+func (a *sessionAgent) interruptIfBusy(rt agentRuntime) {
+	ctx, cancel := context.WithTimeout(
+		context.WithoutCancel(a.session.plumbingCtx), agentInterruptGrace)
+	defer cancel()
+	state, err := rt.State(ctx)
+	if err != nil {
+		slog.Debug("could not read agent state for interrupt", "error", err)
+		return
+	}
+	switch state {
+	case dagger.AgentStateRunning, dagger.AgentStateWaitingInput:
+		a.interruptAgent(rt)
+	default:
+		slog.Debug("nothing to interrupt", "state", state)
+	}
 }
 
 // interruptAgent preempts the agent's in-flight step server-side. It runs on a

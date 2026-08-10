@@ -22,13 +22,17 @@ type fakeRuntime struct {
 	interrupts int
 	resumes    int
 	stops      int
+	state      dagger.AgentState
 	delivered  chan string
 }
 
 var _ agentRuntime = (*fakeRuntime)(nil)
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{delivered: make(chan string, 8)}
+	return &fakeRuntime{
+		state:     dagger.AgentStateRunning,
+		delivered: make(chan string, 8),
+	}
 }
 
 func (f *fakeRuntime) SendMessage(_ context.Context, msg string) (agentMessage, error) {
@@ -54,6 +58,18 @@ func (f *fakeRuntime) Interrupt(context.Context) error {
 }
 
 func (f *fakeRuntime) WaitFor(context.Context, dagger.AgentState) error { return nil }
+
+func (f *fakeRuntime) State(context.Context) (dagger.AgentState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state, nil
+}
+
+func (f *fakeRuntime) setState(state dagger.AgentState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.state = state
+}
 
 func (f *fakeRuntime) SnapshotID(context.Context) (dagger.ID, error) { return "", nil }
 
@@ -209,6 +225,30 @@ func TestInterruptTargetPreemptsTheFocusedAgent(t *testing.T) {
 
 	_, scoutInterrupts, _ := runtimeOf(t, scout).counts()
 	require.Zero(t, scoutInterrupts, "the busy agent must be left alone")
+}
+
+// TestInterruptSkipsAnIdleRuntime: interrupt on an idle agent is equivalent to
+// pause, so Ctrl-C on a quiet prompt -- which is mostly how it is used, to
+// clear a half-typed line -- must not park the agent.
+func TestInterruptSkipsAnIdleRuntime(t *testing.T) {
+	s, agents := testSession(t, "chief")
+	chief := agents[0]
+	rt := runtimeOf(t, chief)
+	rt.setState(dagger.AgentStateIdle)
+
+	require.True(t, s.InterruptTarget())
+	require.Never(t, func() bool {
+		_, interrupts, _ := rt.counts()
+		return interrupts > 0
+	}, 200*time.Millisecond, 10*time.Millisecond)
+
+	// Once it is genuinely working, the same keypress preempts it.
+	rt.setState(dagger.AgentStateRunning)
+	require.True(t, s.InterruptTarget())
+	require.Eventually(t, func() bool {
+		_, interrupts, _ := rt.counts()
+		return interrupts == 1
+	}, 5*time.Second, 10*time.Millisecond)
 }
 
 // TestInterruptTargetCancelsItsOwnTurn: with a turn in flight on the focused
