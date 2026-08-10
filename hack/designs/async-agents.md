@@ -485,6 +485,29 @@ the parked-question/attention work (§3.4), which is what makes the roster
 worth having — a roster where nobody can ever say "I need you" is only a
 progress display.
 
+Four constraints surfaced while building slice 2's routing half, each of
+which the plan above understated. **Ctrl-C cannot simply "follow focus":**
+interrupt today is a client-side context cancel of the shell handle's
+`WithPrompt` await, so it necessarily hits the agent owning the in-flight
+turn — the very inference this section outlaws for messages — and since
+`shellLock` serializes handles, an agent that is running but is not the one
+blocking the handle cannot be interrupted from the client at all. Slice 2
+must turn Ctrl-C into an explicit `interrupt` on the focused agent's
+runtime, not re-point a cancel. **Session save/load stays session-wide:**
+`initialPrompt`/`sessionUUID` live on the shell handler, so the auto-save
+writes one file per SESSION while this section scopes `/save` to a
+conversation — with two agents, the last to step wins the file. That needs
+a per-conversation save identity, which does not exist yet. **The status
+line already mixes scopes:** the frontend's live rollup is deliberately
+session-wide (all models and sub-agents) while the per-conversation
+snapshot is not, so moving session-wide totals to the roster header is
+required for the line to stop lying, not a nicety. And **prompting an
+attached agent is not purely additive:** submit is send + resume + await,
+and the resume un-pauses a runtime the session does not own. Whether that
+is correct ("prompt it exactly like your own") or wants a
+resume-only-if-owned rule is undecided; it is the one place attach reaches
+past observation.
+
 ## 6. Naming: freeing `Agent`
 
 `Agent` and `AgentGroup` are currently the *descriptor* types for `@agent`
