@@ -106,6 +106,16 @@ type Agent implements Node {
   id: ID!
 
   """
+  The unique instance identity minted by the spawn that created this agent.
+
+  It is the same value the agent's loop span publishes as dagger.io/agent.id, so
+  a client holding a handle can match it against what it discovers in the trace.
+  Two spawns of an identical composition have different instance IDs; a display
+  name is shared freely.
+  """
+  instanceID: String!
+
+  """
   Preempt the in-flight step, keeping all completed steps, and pause.
 
   The interrupted turn stays open: messages it consumed remain pending, and

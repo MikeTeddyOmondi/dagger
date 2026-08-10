@@ -23,6 +23,16 @@ func (s agentSchema) Install(srv *dagql.Server) {
 		dagql.Func("name", s.name).
 			Doc(`Display label and identity discriminator — not a session-wide address.`),
 
+		// The instance ID is already public: it rides every loop span as
+		// dagger.io/agent.id, which is how a client's roster keys its
+		// entries (design §9). Reading it off a handle is what lets that
+		// client tell whether a rostered agent is one it already drives —
+		// the correlation focus needs — and it grants nothing extra: you
+		// still need the handle to ask, so §3.3's capability model holds.
+		dagql.Func("instanceID", s.instanceID).
+			Doc(`The unique instance identity minted by the spawn that created this agent.`,
+				`It is the same value the agent's loop span publishes as dagger.io/agent.id, so a client holding a handle can match it against what it discovers in the trace. Two spawns of an identical composition have different instance IDs; a display name is shared freely.`),
+
 		dagql.NodeFunc("state", s.state).
 			DoNotCache("Projects live runtime state.").
 			Doc(`Computed lifecycle state; never stored.`,
@@ -118,6 +128,10 @@ func (s agentSchema) Install(srv *dagql.Server) {
 
 func (s agentSchema) name(ctx context.Context, agent *core.Agent, _ struct{}) (string, error) {
 	return agent.Name, nil
+}
+
+func (s agentSchema) instanceID(ctx context.Context, agent *core.Agent, _ struct{}) (string, error) {
+	return agent.InstanceID, nil
 }
 
 func agentRuntimes(ctx context.Context) (*core.AgentRuntimes, error) {

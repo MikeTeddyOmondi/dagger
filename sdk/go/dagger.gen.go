@@ -422,16 +422,17 @@ func (r *Address) AsNode() Node {
 type Agent struct {
 	query *querybuilder.Selection
 
-	id        *ID
-	interrupt *ID
-	name      *string
-	pause     *ID
-	resume    *ID
-	send      *ID
-	start     *ID
-	state     *AgentState
-	stop      *ID
-	waitFor   *ID
+	id         *ID
+	instanceID *string
+	interrupt  *ID
+	name       *string
+	pause      *ID
+	resume     *ID
+	send       *ID
+	start      *ID
+	state      *AgentState
+	stop       *ID
+	waitFor    *ID
 }
 
 func (r *Agent) WithGraphQLQuery(q *querybuilder.Selection) *Agent {
@@ -478,6 +479,21 @@ func (r *Agent) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(id)
+}
+
+// The unique instance identity minted by the spawn that created this agent.
+//
+// It is the same value the agent's loop span publishes as dagger.io/agent.id, so a client holding a handle can match it against what it discovers in the trace. Two spawns of an identical composition have different instance IDs; a display name is shared freely.
+func (r *Agent) InstanceID(ctx context.Context) (string, error) {
+	if r.instanceID != nil {
+		return *r.instanceID, nil
+	}
+	q := r.query.Select("instanceID")
+
+	var response string
+
+	q = q.Bind(&response)
+	return response, q.Execute(ctx)
 }
 
 // Preempt the in-flight step, keeping all completed steps, and pause.
