@@ -943,6 +943,43 @@ What is NOT built — threads to pull, each self-contained:
    errors — a frame whose span never reached this client
    (dagql/call/id.go:767) — are the read-only signal, so surface them as
    such rather than letting a failed rebuild look like a working entry.
+   The routing half was built once and lost to item 15 before it could be
+   harvested; its design is recorded here so a rebuild need not re-derive
+   it. Split `LLMSession` in two. A `sessionAgent` is ONE conversation: its
+   `llm` value, its runtime handle, `turnAgent`, model, references,
+   auto-compact, `initialLLM`, context baselines, and every method that
+   describes one conversation — `WithPrompt`, `Clear`, `Compact`, `Model`,
+   `Effort`, `History`, `Export`/`ResetWorkspace`, `LoadSession`,
+   `AutoSaveSession`, `BranchSummary`, and the status-line / changes /
+   references refreshes, which no-op unless that conversation is the
+   target. `LLMSession` keeps its name and becomes the owner: the
+   session-wide plumbing (`dag`, `shell`, `frontend`, plumbing span,
+   `onStep`, the subscription-label and workspace-host-path caches) plus
+   `agents []*sessionAgent` and `target`. Routing then resolves in exactly
+   one place — `Target()` — and every submit path names it: `shell.Handle`
+   opens turns on `s.Target().WithPrompt(...)`, and `SubmitToTarget(msg)`
+   asks THE TARGET whether it has a turn to absorb the message, with the
+   frontend routing on that answer instead of on `shellRunning`.
+   `shellRunning`/`shellLock` survive for what is genuinely serial — shell
+   commands and prompt-mode `/commands` share the one mvdan/sh interpreter
+   and mutate handler state — but stop deciding WHO gets a message.
+   Ownership is one `owned` flag (plus the `attachedID` an attached handle
+   was rebuilt from), set in the single place a handle enters a
+   conversation and read in the single place one leaves: `detachAgent`
+   returns the handle only when owned, so `dropAgent` — the choke point for
+   every wholesale LLM replacement — stops only what the session spawned,
+   and clearing a conversation you merely attached to can never kill
+   somebody else's worker. `Attach` roots its conversation on the runtime's
+   pinned `snapshot` ID, dedupes on re-attach, and never becomes the
+   target, since focus moves only by keypress. Hold the handle behind a
+   small `agentRuntime` interface (send / resume / interrupt / waitFor /
+   snapshot / stop) so both policies — who a message routes to, and whose
+   business it is to stop a runtime — are testable against a fake with no
+   engine. Factor the digest→ID step out of `llmBranchID` (as
+   `encodedIDForCallDigest`) so attach and branch-from-message share the
+   one proven path. Land it with behaviour unchanged — the target is always
+   the session's own agent — so the refactor is separable from the focus
+   feature it enables.
 2. **Enqueue guards** (§3.3): depth limiting, self-send rejection, cycle
    detection — none exist. Central point: the enqueue path in
    `AgentRuntimes` (`Send`). Until then `modules/staff` documents the
