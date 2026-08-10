@@ -175,8 +175,8 @@ type Staff {
 
   """
   Read the tail of a worker's conversation so far: the text entries of its
-  last committed snapshot, tagged by role. Tool calls and results are
-  omitted — this is the narrative, not the trace.
+  last committed snapshot, tagged by role. Tool calls, results and the
+  system prompt are omitted — this is the narrative, not the trace.
   """
   read(
     """
@@ -191,13 +191,18 @@ type Staff {
     # @cache(Never): the snapshot advances as the worker runs; identical
     # (name, last) args must not replay an old tail.
     let entries: [String!]! = []
-    member(name).snapshot.messages.{{role, content.{{kind, text}}}}.each { m =>
-      m.content.each { block =>
-        if (block.kind == LLMContentBlockKind.TEXT and block.text != "") {
-          entries += [`[${toString(m.role)}] ${block.text}`]
+    # SYSTEM is the worker's prompt boilerplate, and dropping it is what
+    # makes a small `last` useful: otherwise the tail is all preamble and
+    # none of the narrative it is asked for.
+    member(name).snapshot.messages.{{role, content.{{kind, text}}}}
+      .filter { m => m.role != LLMMessageRole.SYSTEM }
+      .each { m =>
+        m.content.each { block =>
+          if (block.kind == LLMContentBlockKind.TEXT and block.text != "") {
+            entries += [`[${toString(m.role)}] ${block.text}`]
+          }
         }
       }
-    }
     if (entries.isEmpty) {
       "(no conversation yet)"
     } else {
