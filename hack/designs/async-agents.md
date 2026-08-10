@@ -106,7 +106,7 @@ is an addressable agent.
 An `Agent` is a **spawned instance**: `llm.spawn` mints a unique instance ID
 per call and pins it into the returned handle's chain via the pure
 `agent(id:)` lookup — Agent joins `AgentMessage` in the minted-and-pinned
-identity family (§9). The value itself stays a pure, content-addressed dagql
+identity family (§8). The value itself stays a pure, content-addressed dagql
 value (seed conversation, minted instance ID, display name), and starting it
 registers a runtime entry — mailbox, loop goroutine on a detached context,
 computed state — in a session-scoped runtime table keyed by the value's
@@ -435,7 +435,7 @@ recipe of recorded calls held on one machine, when it should be the trace.
 What is already proven, within a session: a client reconstructs a *sendable*
 handle from a carried call digest, and the rebuilt handle observes the LIVE
 runtime — `TestRosterAddressing`, and `TestRosterAddressingFromModule` for an
-agent spawned inside a module call (§9). The mechanism works. What it lacks
+agent spawned inside a module call (§8). The mechanism works. What it lacks
 is durability across client processes: a restarted client builds a fresh
 `dagui.DB`, so every call payload emitted before the restart is simply
 absent, `ID.decode` fails with `call digest not found`, and the roster
@@ -446,7 +446,7 @@ out of it.
 The work, in the order the constraints force:
 
 - **Read the directory from the persisted trace**, not only from the
-  in-process DB. This is the part that needs no new schema — §9's
+  in-process DB. This is the part that needs no new schema — §8's
   renunciation of `Query.agents` holds, because the roster stays a projection
   of the trace; the trace just stops being per-process.
 - **Resume must not re-execute recorded imperative verbs.** Item 13's
@@ -457,7 +457,7 @@ The work, in the order the constraints force:
 - **Persist the recipe form, not the handle form.** A post-evaluation
   `Result.ID()` is an engine-local shared-result reference that dies with its
   session (`call.NewEngineResultID`; measured — loading one later on the same
-  engine fails with "missing shared result"). §9 measured both encodings:
+  engine fails with "missing shared result"). §8 measured both encodings:
   ~24 bytes for the handle, ~350 for the recipe of a bare `llm` seed.
 
 Two boundaries to settle before promising cross-machine migration:
@@ -483,12 +483,12 @@ instead of cancelling the turn context and rolling back client-side state.
 `dagger agent` spawns a real Agent and attaches to it; a second terminal (or
 Cloud) attaching to the same session addresses the same agent **by held ID**
 — its telemetry-carried ID, never by re-deriving the composition, which
-would simply spawn a fresh agent (attach-by-rederivation is renounced; §9).
+would simply spawn a fresh agent (attach-by-rederivation is renounced; §8).
 
 ### 5.1 Multi-agent UI: the roster, focus, and attention
 
 One frontend, many live agents: the client folds the `dagger.io/agent.*`
-telemetry (§9) into a **roster** of every agent the trace mentions, and the
+telemetry (§8) into a **roster** of every agent the trace mentions, and the
 user alternates prompting between its entries. The roster is a tmux-style
 switcher strip immediately above the prompt, not a sidebar section. The
 sidebar (`SetSidebarContent`/`SidebarSection`,
@@ -560,7 +560,7 @@ describe one conversation, so they follow focus, and session-wide totals move
 to the roster header. The alternative is a status line that lies about which
 conversation it is describing.
 
-**The tree follows focus too** (built; §11). The strip moved the prompt
+**The tree follows focus too** (built; §10). The strip moved the prompt
 between agents while the tree above it kept showing the whole session, so
 switching told you nothing about what the agent you switched to was doing —
 the roster's own purpose, missing its other half. The scoping rides the
@@ -578,11 +578,11 @@ an empty conversation.
 
 Build order is **roster first, attention second**. Slice 1 is the engine's
 telemetry publication plus a read-only roster strip — no focus, no change
-to routing (both built; §11). Slice 2 is focus, per-agent drafts, and the
+to routing (both built; §10). Slice 2 is focus, per-agent drafts, and the
 `LLMSession` refactor (it held exactly one agent), which had to land
 *together with* the send-routing change: bolting focus onto the old
 `shellRunning → Interject` latch would silently deliver messages to
-whichever agent happened to own the in-flight turn (built; §11). Slice 3 is
+whichever agent happened to own the in-flight turn (built; §10). Slice 3 is
 the parked-question/attention work (§3.4), which is what makes the roster
 worth having — a roster where nobody can ever say "I need you" is only a
 progress display.
@@ -595,7 +595,7 @@ turn — the very inference this section outlaws for messages — and since
 `shellLock` serialized handles, an agent that is running but is not the one
 blocking the handle could not be interrupted from the client at all. Slice 2
 turned Ctrl-C into an explicit `interrupt` on the focused agent's runtime,
-not a re-pointed cancel (§11). **Session save/load stays session-wide:**
+not a re-pointed cancel (§10). **Session save/load stays session-wide:**
 `initialPrompt`/`sessionUUID` live on the shell handler, so the auto-save
 writes one file per SESSION while this section scopes `/save` to a
 conversation — with two agents, the last to step wins the file. That needs
@@ -652,7 +652,7 @@ Middlewares *define* agents; `compose(...).spawn(name)` *instantiates* one.
   than raw `LLM`s; whether the engine should also guard this centrally is
   open.
 
-## 9. As-built ratifications
+## 8. As-built ratifications
 
 Semantics settled during implementation (core/agent.go, core/agent_telemetry.go,
 core/schema/agent.go, engine/telemetryattrs/attrs.go,
@@ -796,13 +796,15 @@ core/integration/agent_runtime_test.go), ratified here:
   worker composed inside a module carries no module frame at all unless one
   rides in on an argument — e.g. a module object bound with `withTools`,
   which is how a chief's own conversation gets one.
-  **Scope correction, measured later:** "verified end to end" covers what
-  those two tests compose, and a live session found a staff worker whose
-  chain could NOT be rebuilt — the gap sitting behind an ID-literal argument,
-  in the same session that spawned it (item 16). Neither test carries a
-  post-evaluation object argument; every staff worker does. Treat the
-  guarantee as holding for the compositions it was measured on until item 16
-  is root-caused.
+  **Scope correction, measured later:** "verified end to end" covered what
+  those two tests compose and no more. A live session found a staff worker
+  whose chain could not be rebuilt in the very session that spawned it
+  (item 16): the span channel alone cannot carry every frame, because a
+  payload only ever rode the span of its own selection and whole classes of
+  frame are never independently spanned. Fixed by giving call payloads a
+  second channel (§10.2, "Mode A: RESOLVED"). The guarantee to state today is
+  therefore that a rebuilt handle RESOLVES — not that it addresses the live
+  runtime, which is Mode B and still open.
 - **Identity rides span attributes; state rides log records.** The split is
   forced by the export model, not chosen for tidiness. A live span is
   exported as a *snapshot taken at span start* (`LiveSpanProcessor.OnStart`
@@ -870,7 +872,7 @@ core/integration/agent_runtime_test.go), ratified here:
   agent is equivalent to pause, and the key's commonest use is clearing a
   half-typed line.
 
-### 9.1 Harvesting a worker's work
+### 8.1 Harvesting a worker's work
 
 Every worker gets its own `Workspace`, so anything it edits or commits is
 invisible to the chief until it is deliberately taken. `Workspace.commitsFrom`
@@ -942,19 +944,22 @@ Semantics ratified during implementation:
   workspace is classified without routing to its client. Only receiver reads
   go through the host. Preserve this: pulling the source's host in would make
   the operation depend on a second live client.
-- **The patch-based rule is applied in ONE direction only, and the other one
-  is a live defect.** Everything above governs a changeset moving INTO the
-  receiver. A worker's OWN workspace is still a whole-tree value snapshotted
-  at spawn and re-materialized as an overlay — exactly the `withChanges`
-  semantics the first bullet renounces — so when the checkout moves beneath a
-  live worker (a save, a deploy) and that worker later re-materializes, it
-  writes spawn-time content over a tree that has moved on. Observed
-  corrupting a source file badly enough to break a module parse (item 14).
-  The fix is to give a worker's own workspace the same "patch against current
-  content" treatment the harvest already has, rather than teaching `ctrl+s`
-  about the staff (item 13).
+- **The patch-based rule governs changesets moving INTO a receiver, and
+  deliberately does not govern a worker's own workspace.** A worker's overlay
+  is not a frozen tree: a host-backed overlay resolves as a sparse host read
+  at READ time with the changeset applied on top (`resolveHostOverlayRootfs`),
+  so its base is live. What is frozen is the changeset, whose diff layer
+  carries FULL CONTENT for every touched path and is written with
+  `ReplaceExisting`. So on the paths a worker has touched, its own content
+  wins over whatever the host holds at read time — no patch, no conflict
+  detection, no refusal. Ratified as correct: that is what a pending edit IS,
+  and a worker's edits outranking the checkout is the same rule that governs
+  the chief's. The bounded consequence worth knowing is that a worker whose
+  edits predate a save or a deploy silently outranks the newer content on
+  exactly its touched paths — an argument for harvesting promptly, not for
+  making a worker's overlay patch-based.
 
-## 10. Alternatives considered
+## 9. Alternatives considered
 
 
 - **Task ledger (A2A-style)**: no resident runtime; immutable `AgentTask`
@@ -973,9 +978,9 @@ Semantics ratified during implementation:
   state machine for UIs, and punts the actual pause/enqueue/resume ask; it
   is subsumed by the agent runtime entry.
 
-## 11. Implementation status
+## 10. Implementation status
 
-What is BUILT (see also §9 for ratified semantics):
+What is BUILT (see also §8 for ratified semantics):
 
 - **Core runtime**: `core/agent.go` (Agent value with spawn-minted
   `InstanceID`, `AgentRuntimes` session registry keyed by content digest —
@@ -987,12 +992,12 @@ What is BUILT (see also §9 for ratified semantics):
   alongside `Services`.
 - **Spawned instance identity**: `LLM.spawn(name)` mints a unique instance
   per call and pins it through the pure `LLM.agent(id:, name:)` lookup
-  (§9), in `core/schema/llm.go`; name is display-only. `asAgent` is gone.
-- **Message identity**: re-exec pinning via `Agent.message(id:)` (§9) —
+  (§8), in `core/schema/llm.go`; name is display-only. `asAgent` is gone.
+- **Message identity**: re-exec pinning via `Agent.message(id:)` (§8) —
   handles are honest chains, cancel-and-re-await works across requests.
 - **ID-returning verbs**: the imperative fields (`spawn`, `start`, `send`,
   `interrupt`, `pause`, `resume`, `waitFor`, `stop`) return `ID!` with
-  `@expectedType`, `Service.start`-style (§9); reads (`agent(id:)`,
+  `@expectedType`, `Service.start`-style (§8); reads (`agent(id:)`,
   `snapshot`, `message(id:)`) stay object-returning. Typed SDKs
   re-hydrate self-returning verbs natively; `spawn`'s agent ID and
   `send`'s message ID re-hydrate via `node(id:)` (`dagger.Ref` in the Go
@@ -1004,7 +1009,7 @@ What is BUILT (see also §9 for ratified semantics):
   planned").
 - **Namespace**: descriptor types renamed `AgentMiddleware` /
   `AgentMiddlewareGroup` (§6).
-- **Agent telemetry publication** (§3.3, §9): the `dagger.io/agent.*`
+- **Agent telemetry publication** (§3.3, §8): the `dagger.io/agent.*`
   vocabulary in `engine/telemetryattrs/attrs.go` (`AgentAttr`, `AgentIDAttr`,
   `AgentNameAttr`, `AgentCallDigestAttr`, `AgentStateAttr`,
   `AgentWaitingOnAttr`), `core/agent_telemetry.go` (`agentSpanAttrs`,
@@ -1053,7 +1058,7 @@ What is BUILT (see also §9 for ratified semantics):
   faking a handle, and the cycle steps over such entries rather than
   reporting one the user never named. Submission asks the target first and
   queues only behind a serial turn; Ctrl-C interrupts the focused runtime
-  (§9). `Agent.instanceID` is what correlates a held handle with its roster
+  (§8). `Agent.instanceID` is what correlates a held handle with its roster
   entry. Tests: `internal/cmd/dagger/session_agent_test.go` (routing,
   ownership and interrupt policy against a fake runtime, no engine) and
   `dagql/idtui/agent_focus_test.go` (routing, Ctrl-C, focus keys in both
@@ -1081,8 +1086,9 @@ What is BUILT (see also §9 for ratified semantics):
   `dagql/idtui/agent_conversation_focus_test.go` (switching re-scopes and
   retracts, zoom is untouched, an agent with nothing said keeps the session).
   NOT verified: `TestTelemetry/TestGolden` renders through this same
-  promotion path but needs an engine to warm up, so it is item 7's
-  outstanding CI confirmation with a live reason to run it.
+  promotion path, but it needs an engine to warm up and has not been run
+  against this change. It is a regression test rather than an iteration
+  one, which is what item 7 proposes to make explicit.
 - **CLI prompt mode** (`internal/cmd/dagger/session_agent.go`, `shell.go`,
   `dagql/idtui/frontend_pretty.go`): submit = send + resume + await,
   re-rooting on `snapshot` at turn end; mid-turn submissions send
@@ -1094,14 +1100,14 @@ What is BUILT (see also §9 for ratified semantics):
   `modules/staff` — spawn/sendTo/ask/status/read/collect/interruptWorker/
   dismiss over module-held `[Agent!]` state (the `modules/editor`
   pattern), with each worker given an `askChief` line home whose answers
-  ride the chief's own record. Deliberately NOT registered in the repo
-  dagger.toml (load with `dagger -m ./modules/staff`). Side-effecting and
+  ride the chief's own record. Registered in the repo dagger.toml as
+  `env.dev.modules.staff`. Side-effecting and
   live-reading tools carry `@cache(policy: FunctionCachePolicy.Never)` —
   load-bearing: dagql otherwise replays identical-arg calls, so a
   zero-arg `status` could never observe a state transition. Windowed
   reads (`read_agent`-style) are the module-side `read` projection over
   `snapshot.messages`, as predicted — no core work needed.
-- **Workspace harvesting** (§9.1): the core API is
+- **Workspace harvesting** (§8.1): the core API is
   `Workspace.commitsFrom` / `withCommitsFrom` (+ the internal
   `__withReplayedCommit`), with `WorkspaceCommitPick` and its
   status/reason enums, `WorkspaceStagedCommit.origin`, and
@@ -1128,7 +1134,10 @@ What is BUILT (see also §9 for ratified semantics):
   `TestSpawnAfterStop` (dismiss-and-rehire works; the predecessor's
   tombstone stays readable by held ID).
 
-What is NOT built — threads to pull, each self-contained:
+What is NOT built — threads to pull, each self-contained. The numbers are
+stable identifiers, cited from code comments and from earlier sessions, so a
+thread that has since been resolved or retired keeps its slot and says so
+rather than being renumbered away:
 
 1. **Roster follow-ups** (§5.1): addressing itself is BUILT (above), but
    three threads it exposes are not. **Attaching prompts a runtime the
@@ -1171,30 +1180,36 @@ What is NOT built — threads to pull, each self-contained:
    "interrupts lose progress" rationale is retired — server-side
    interrupt is prefix-preserving); `startInteractivePromptMode`
    pre-initializes a default LLM that demands provider config even when
-   the entrypoint supplies its own (pre-existing wart); confirm the
-   `TestGolden` TUI snapshots in CI (they replay non-prompt traces and
-   should be unaffected by the prompt-flow rewire).
-8. **Module-call cache staleness** (open investigation): in one live QA
-   session, after a second module reload, identical-arg staff calls
-   (`status`, `read`) replayed stale results DESPITE their
-   `@cache(Never)` annotations — which had verifiably worked right after
-   the first reload. Fresh arg-tuples always read live. Suspects: the
-   module-function cache policy path (`core/modfunc.go`,
-   `derivedCachePolicy`) or reload/re-serve interplay with cached
-   function metadata. A related defect in the same area HAS since been
-   fixed — `Workspace.reloaded` used to mint a result for its own
-   (`PerCallInput`) call, stamping a nonce into the workspace ID that
-   every later edit inherited, so an agent that reloaded once re-declared
-   its modules on every subsequent edit; it now returns its parent's own
-   result. Whether that also explains the staleness is unconfirmed: the
-   staleness has not been reproduced since. Until root-caused, treat
-   repeated same-arg module reads in long reload-heavy sessions with
-   suspicion.
-9. **Chief prompt leak into workers**: the chief's system prompt rides
-   into workers via workspace compose. Known and mitigated by
-   `workerPrompt`'s closing paragraph (observed effective live); the same
-   class as `modules/delegate`'s documented leak. A real fix belongs in
-   composition, not prompting.
+   the entrypoint supplies its own (pre-existing wart); and make
+   `TestTelemetry/TestGolden` skip unless a flag asks for it. The golden
+   snapshots are a regression test, not something local iteration should
+   pay for — they need an engine to warm up — so the follow-up is to stop
+   running them by default rather than to confirm them by hand. They have
+   not been run against the prompt-flow rewire; they replay non-prompt
+   traces and should be unaffected by it.
+8. **Module-call cache staleness** — RETIRED; it was not a cache defect.
+   Filed after a live session where identical-arg staff calls (`status`,
+   `read`) appeared to replay stale results despite their `@cache(Never)`
+   annotations. They were not stale: the session had been resumed, and
+   those calls were honest reads of runtimes that item 13's
+   revival-on-receiver-load had just re-minted from `Seed`. Folded into
+   item 13, which is where the real defect lives; the guidance this item
+   used to carry — treat repeated same-arg module reads with suspicion —
+   was pointing at the wrong layer and is withdrawn. One genuine fix came
+   out of the area and stands on its own: `Workspace.reloaded` used to mint
+   a result for its own (`PerCallInput`) call, stamping a nonce into the
+   workspace ID that every later edit inherited, so an agent that reloaded
+   once re-declared its modules on every subsequent edit; it now returns
+   its parent's own result (`git log -S 'Workspace.reloaded'`).
+9. **Chief prompt leak into workers** — FIXED, and where the item predicted
+   it belonged: in composition rather than prompting.
+   `source.agents(exclude: ["staff"])` (modules/staff/main.dang:87) composes
+   the workspace's agents with staff itself excluded, so neither the chief's
+   orchestration toolset nor its system prompt reaches a worker — a no-op
+   when the module is not installed there. `workerPrompt`'s closing
+   paragraph, which used to be the whole mitigation, is now belt and braces.
+   `modules/delegate`'s documented leak is the same class and is NOT covered
+   by this.
 10. **Workers don't know their own staff name**: `name` is display
     metadata on the runtime and never reaches the worker's conversation,
     so a worker cannot refer to itself the way the chief addresses it.
@@ -1208,7 +1223,7 @@ What is NOT built — threads to pull, each self-contained:
     steers an open turn or wakes the chief, with no polling and none of
     `collect`'s deadlock exposure. Could be a spawn opt-in
     (`notifyOnIdle: true`) or an engine-level watch verb on Agent.
-12. **Harvest limitations worth revisiting** (§9.1): patch scoping
+12. **Harvest limitations worth revisiting** (§8.1): patch scoping
     matches on `DiffStat.path` only, so a renamed file's old path can be
     dropped from a scoped patch, leaving a half-applied rename
     (`modules/review` has the same limitation, but `pullPending`
@@ -1227,15 +1242,15 @@ What is NOT built — threads to pull, each self-contained:
     treat the mechanism as unestablished; the practical rule is unchanged and
     now has teeth — harvest inside the spawning session, and do not believe a
     stack you read after a restart.
-    And once the chief SAVES a pulled commit and
-    reloads, the origin link is gone (it is engine-side metadata), so a
-    re-pull relies on REDUNDANT to notice — a durable fix needs the
-    origin in the commit object, as a trailer or a git note. FIXED since:
-    the torn-snapshot half, where each field a harvest tool read off its
-    `let theirs = workerWorkspace(name)` binding re-forced the chain onto a
-    different live snapshot (§9's scope correction) — `diffOf` alone reads
-    four, so its patch could mix trees, and the tools' documented contract
-    of reading the worker's LAST COMMITTED step was not what they did.
+    And once the chief SAVES a pulled commit and reloads, the origin link is
+    gone (it is engine-side metadata), so a re-pull relies on REDUNDANT to
+    notice — a durable fix needs the origin in the commit object, as a
+    trailer or a git note. Fixed since: the torn-snapshot half, where a
+    harvest tool's `let theirs = workerWorkspace(name)` binding re-forced
+    onto a different live snapshot on every field read, so `diffOf`'s patch
+    could mix trees and the tools' documented contract of reading the
+    worker's LAST COMMITTED step was not what they did; they now pin the
+    snapshot through `LLM.sync` (§8's scope correction on lazy forcing).
 13. **A session restart silently RE-ANIMATES workers** (§4, §3.3): observed
     live — after restarting a client session, a `modules/staff` chief's
     workers reported `RUNNING` again, while their `snapshot` had degraded to
@@ -1264,7 +1279,7 @@ What is NOT built — threads to pull, each self-contained:
     time — and each resume adds one more loop. All of them render under the
     original row because the replayed call ID is byte-identical, recorded
     per-call nonce included, so its `dagger.io/dag.digest` is too.
-    Note what §9's pinning does NOT cover: it is `Staff.spawn` that gets
+    Note what §8's pinning does NOT cover: it is `Staff.spawn` that gets
     re-executed, not `Agent.send` — the chief's conversation never records
     one. Pinning makes re-*hydrating a result ID* inert; it says nothing
     about re-*executing a recorded call*.
@@ -1280,12 +1295,18 @@ What is NOT built — threads to pull, each self-contained:
     revives, including a read built to be safe, and an aborting error does
     not roll it back. Three runtimes booted out of a call that returned
     nothing but a parse failure.
+    **It can present as cache staleness.** This was filed separately for a
+    while (item 8) as a module-call cache defect: identical-arg `status`/
+    `read` calls appeared to replay stale results despite `@cache(Never)`.
+    They were not stale — they were honest reads of runtimes this revival had
+    just re-minted from `Seed`. On a resumed session, a module read whose
+    answer looks frozen at the seed is this bug, not the cache.
     **Dismissal does not survive either**, and the reason generalizes. All
     three workers had been dismissed before the restart. The layers split:
     agent runtimes are core values that revive through `GetOrCreate` on chain
     load, while `dismiss` is module-held state (`modules/staff` moving a
     handle from `members` to `tombstones`, and stopping the runtime) — and in
-    that session the module was exactly what failed to parse (item 14). The
+    that session the module was exactly what failed to parse. The
     layer that knows about dismissal never replayed; the core runtimes booted
     anyway. Hence the general finding, which outlives this crash:
     **replaying a chain of imperative verbs is not atomic.** A failure
@@ -1298,7 +1319,7 @@ What is NOT built — threads to pull, each self-contained:
     marked watch-only, and focusing one gave `agent "skimmer" cannot be
     addressed from this trace`. That is `focusAgent`'s read-only branch,
     reached when `encodedIDForCallDigest` cannot rebuild a handle: addressing
-    is a projection of the trace (§9), the payloads were emitted in the
+    is a projection of the trace (§8), the payloads were emitted in the
     PREVIOUS session, and a restarted client's `dagui.DB` is fresh, so
     `ID.decode` reports `call digest not found`. §3.3 renounced
     `Query.agents` *because* telemetry is the directory, so there is no
@@ -1310,7 +1331,7 @@ What is NOT built — threads to pull, each self-contained:
     session-independent, keyed on the spawn-minted `InstanceID` that already
     rides the pinned chain, so a resumed session finds the live entry instead
     of minting one. It is the only option where resume means what a user
-    expects (the worker keeps running, and keeps its history), and §9 already
+    expects (the worker keeps running, and keeps its history), and §8 already
     made that identity unforgeable and collision-free. It needs an owner for
     the lifetime question §4 dodges: when does an agent outlive every session
     that can see it? Runners-up: make imperative verbs in a restored chain
@@ -1332,19 +1353,17 @@ What is NOT built — threads to pull, each self-contained:
     (item 1) makes it more visible, not less.
     **Not the fix: making `ctrl+s` reach the staff.** Considered live and
     rejected. Workers have their own workspaces by design — the premise
-    §9.1 rests on, and why taking their work is a deliberate `pull` — so a
+    §8.1 rests on, and why taking their work is a deliberate `pull` — so a
     save that exported N divergent trees over one checkout would be either
     last-writer-wins (item 1's save-identity problem, worse) or a silent
     discard of worker WIP; and a staff-wide reset has `dismiss`'s shape with
-    none of its bookkeeping. The real defect is narrower and lives in the
-    §9.1 asymmetry recorded under item 14.
-14. **Changeset replay loses tracked-ness** — the name is a misnomer, kept
-    only so the history below still reads. The defect is **a staged commit's
-    delta diffed against a stale sparse base**.
-    **ROOT-CAUSED AND FIXED. Read to the end of this paragraph block and
-    stop; everything from "The investigation as it ran" onward is that
-    investigation as it happened, kept for its dead ends and because its
-    eight sightings are the evidence the diagnosis had to fit.**
+    none of its bookkeeping. Nothing replaces it: a worker's overlay
+    outranking the checkout on its touched paths is ratified as correct
+    (§8.1), so what remains here is the revival defect itself.
+14. **A staged commit's delta is diffed against a stale sparse base** —
+    filed for six sessions as "changeset replay loses tracked-ness", a
+    misnomer that steered the search wrong for most of them. **ROOT-CAUSED
+    AND FIXED.**
     **The mechanism.** `stagedCommitChanges` (core/schema/workspace_commit.go)
     derived commit N's own changes by diffing its staged tree against commit
     N-1's staged tree: `before = commits[index-1].Committed.After`. Every
@@ -1357,95 +1376,80 @@ What is NOT built — threads to pull, each self-contained:
     absent from it altogether. The step then reports that path as a
     whole-file ADD at its full content. Two diff anchors, sized at different
     instants; the older one lies.
-    **The tell, and why it looked intermittent for eight sightings:** commit
-    index 0 anchors on its own `Committed.Before` — the current base, which
-    does contain the path — so **the first commit of a session is always
-    right**. Everything else follows: "began mid-session"; the same file
-    reported `A` and then correctly `M` minutes later (by then the path was
-    in the previous commit's tree); a session whose preceding commit was a
-    `pull`, which stages commits the same way. The rule is
+    **The tell.** Commit index 0 anchors on its own `Committed.Before` — the
+    current base, which does contain the path — so **the first commit of a
+    session is always right**, which is the whole reason it looked
+    intermittent for eight sightings. The rule is
     `edit X, commit, first-edit Y, commit` ⇒ Y reports `A +<whole file>`,
     while `edit X and Y, commit X, commit Y` ⇒ Y reports `M`. Deterministic,
     5 seconds to reproduce, no module, no worker, no restart, no checkout
     move.
-    **Why every earlier hypothesis missed it.** All six looked at the *edit*
-    path — `TouchedPaths`, `overlayEdit`, `overlayWorkspaceWithMutation`,
-    persistence — and the touched set is innocent at every one of those
-    sites (audited again, independently, and cleared). The defect is in the
-    *read* path, in a projection derived at render time that nothing
-    persisted and no test covered. And the confirmation experiment recorded
-    above stayed green for a reason that is now obvious and was invisible
-    then: `workspace_module_edit_test.go` stages exactly ONE commit
-    (`require.Len(..., 1)`), so it never reaches the `index > 0` branch. A
-    green run against the wrong branch is worth exactly nothing, which is the
-    transferable lesson.
-    **The fix**, two commits. First, anchor both sides of the diff on one
-    base: rebuild the previous staged state over THIS commit's base rather
-    than reusing its frozen tree. That is not an approximation but the
-    identity — `withCommit` seeds the cumulative record from exactly that
-    expression (`overlay.Before.withChanges(staged)` in
-    `workspaceOverlayChanges`), so the reconstruction is the same dagql
-    selection, and the diff is precisely the commit's own step. Second,
-    extract `stagedTreeOver` and call it from both sites, because nothing
-    linked the two copies of that expression and a later edit to either would
-    silently reintroduce the class. The fix is retroactive: the per-commit
-    delta is derived on read and never persisted, so stacks already staged in
-    a live session render correctly as soon as the engine has it.
-    Reviewed adversarially before landing. It does not depend on the sparse
-    base being monotonic (it applies the previous changeset rather than
-    assuming containment); `withChanges` onto a wider base is already the
-    load-bearing primitive on the main read path (`resolveHostOverlayRootfs`);
-    it is a semantic no-op for value/git/rootless workspaces, whose `Before`
-    is constant; it costs no extra host sync, since `withChanges` is lazy and
-    the base is already in the after-side's lineage; and the guard must stay
+    Worth stating because six hypotheses died on it: the defect is on the
+    READ path, in a projection derived at render time that nothing persisted
+    and no test covered. The touched set is innocent at every edit-path site
+    (`TouchedPaths`, `overlayEdit`, `overlayWorkspaceWithMutation`,
+    persistence), each independently audited and cleared.
+    **The fix**, in `stagedTreeOver` (core/schema/workspace_commit.go):
+    anchor both sides of the diff on one base, by rebuilding the previous
+    staged state over THIS commit's base rather than reusing its frozen tree.
+    That is the identity rather than an approximation — `withCommit` seeds the
+    cumulative record from exactly that expression
+    (`overlay.Before.withChanges(staged)` in `workspaceOverlayChanges`) — and
+    the helper is called from both sites, because nothing linked the two
+    copies of that expression and a later edit to either would silently
+    reintroduce the class. The fix is retroactive: the per-commit delta is
+    derived on read and never persisted, so stacks already staged in a live
+    session render correctly as soon as the engine has it. Reviewed
+    adversarially before landing, and the results are worth keeping: it does
+    not depend on the sparse base being monotonic (it applies the previous
+    changeset rather than assuming containment); it is a semantic no-op for
+    value/git/rootless workspaces, whose `Before` is constant; it costs no
+    extra host sync, since `withChanges` is lazy and the base is already in
+    the after-side's lineage; and the guard must stay
     `index > 0 && commits[index-1].Committed != nil`, which mirrors
     `StagedChanges()` and is what makes the reconstruction exact.
-    **Consequences, measured rather than assumed.** The content was always
-    innocent: the workspace holds the surgical edit, nothing is left pending,
-    and after `export` git itself records `M` for the edit and `D` for the
-    removal whose summary was *empty* — history was never corrupt, only its
-    projection. The harvest cost is a refusal, not a clobber: `pull` replays
-    the same recorded changeset as a patch, `git apply` refuses an add over a
-    file the receiver already has, and `withCommitsFrom` then rejects the
-    WHOLE batch — so the receiver takes nothing, not even the unrelated
-    commit that would have applied. That is sighting (ii) exactly, and the
-    reason it cost authorship every time.
-    **`pullConflicted` is broken for this shape too** — discovered by needing
-    it during this very investigation. It is documented as the recovery for a
-    CONTENT conflict, but git cannot leave conflict markers for an add over
-    an existing file; it refuses outright. So the escape hatch fails on the
-    one defect it existed to work around, and the only route left is
-    re-applying the work by hand. Worth fixing on its own terms (§9.1): a
-    refused add whose target exists should degrade to a 3-way merge against
-    the receiver's copy rather than an error.
+    **The cost it was doing, measured rather than assumed.** The content was
+    always innocent: the workspace holds the surgical edit, nothing is left
+    pending, and after `export` git itself records `M` — history was never
+    corrupt, only its projection. The harvest cost is a refusal, not a
+    clobber: `pull` replays the same recorded changeset as a patch,
+    `git apply` refuses an add over a file the receiver already has, and
+    `withCommitsFrom` then rejects the WHOLE batch — so the receiver takes
+    nothing, not even the unrelated commit that would have applied. That is
+    why it cost authorship every time.
+    **`pullConflicted` is broken for this shape too**, and that outlives the
+    fix. It is documented as the recovery for a CONTENT conflict, but git
+    cannot leave conflict markers for an add over an existing file; it
+    refuses outright. So the escape hatch fails on the one defect it existed
+    to work around. Worth fixing on its own terms (§8.1): a refused add whose
+    target exists should degrade to a 3-way merge against the receiver's copy
+    rather than an error.
     **Provenance.** The anchoring was introduced by `2e8c27fb8468`
     ("cli(agent): show staged commits in Changes", #13835), 25 days after
     `6376ba07d838` (#13600) made the diff base sparse — the sparse base is
     what turned a plausible-looking derivation into a wrong one. #13835 is
-    still open, so this never reached `main`. Its message states the design
-    outright ("each entry's own changes are derived at read time as the step
-    between consecutive staged trees — no new persisted state"), and a
-    sibling commit asserts the record is "stable across chained and
-    path-scoped commits", which is precisely the claim that fails. #13600's
-    review discussion is entirely about performance; nobody raised diff-anchor
-    correctness, and #13835 has no review comments at all.
+    still open, so this never reached `main`.
     **Regression coverage**, and one trap worth stating: the suite's Go entry
     point is `TestWorkspace`, so `-run WorkspaceSuite/...` matches NOTHING and
     reports a green "no tests to run". Use
-    `TestWorkspace/TestWorkspaceStagedCommitSequence`, which covers the five
+    `TestWorkspace/TestWorkspaceStagedCommitSequence*`, which covers the five
     failing sequences and a control (`...TrackedEdit`), the saved history read
     back with git (`...SavedHistoryIsIntact`), and the cross-workspace replay
     (`...Harvest`); plus unit-level pins of the anchor arithmetic in
     `core/changeset_test.go` and of the sparse include semantics in
-    `core/host_include_filter_test.go`.
-    **What this does NOT explain, and remains open.** Sighting (iii) — a
-    worker's workspace materializing a source file with git CONFLICT MARKERS
-    in it — and the fourth sighting's host-side corrupted
-    `modules/staff/main.dang` are NOT accounted for by this defect: the replay
-    was measured to refuse rather than merge, and `pullConflicted` cannot
-    produce markers for an add either. Those stay open, and with the
-    reporting defect gone they should be re-observed from scratch rather than
-    assumed to share a cause.
+    `core/host_include_filter_test.go`. The confirmation experiment that
+    cleared the leading suspect stayed green throughout because
+    `workspace_module_edit_test.go` stages exactly ONE commit
+    (`require.Len(..., 1)`) and so never reaches the `index > 0` branch —
+    the transferable lesson is recorded in §10.1.
+    **What this does NOT explain, and remains open.** A worker's workspace
+    materializing a source file with git CONFLICT MARKERS in it (observed in
+    `engine/telemetryattrs/attrs.go`, markers landing exactly where the
+    chief's edit had been inserted, failing the worker's build and aborting
+    `spawn`) is NOT accounted for by this defect: the replay was measured to
+    refuse rather than merge, and `pullConflicted` cannot produce markers for
+    an add either. With the reporting defect gone it should be re-observed
+    from scratch rather than assumed to share a cause.
     **Follow-ups this turned up, none blocking.** (a) The structural version
     of the fix: record the per-commit delta at staging time, where both
     operands are already in hand, instead of re-deriving it on read — that
@@ -1461,219 +1465,8 @@ What is NOT built — threads to pull, each self-contained:
     none occur in this checkout, all now pinned by tests. (e) Unproven
     suspect: `latest.Repo` is a full host read frozen at the first commit of a
     stack while the remainder applied on top is anchored live — same shape,
-    bounded by the read epoch, and it does not match any recorded sighting.
-    **The investigation as it ran, from here down.** Originally filed as
-    known, pre-existing and unexplained — started some time ago: the
-    workspace's changeset machinery
-    intermittently forgets that a path is already tracked and treats it as
-    new content, so a surgical edit to a long-tracked file is recorded as a
-    whole-file ADD. Symptoms seen in one session, in increasing order of
-    consequence. (i) Commit summaries lie: two edits of a few lines each to
-    `dagql/dagui/db.go` and `dagql/dagui/spans.go` were reported as
-    `A +1303 -0` / `A +1141 -0`, and a ~45-line edit to
-    `dagql/idtui/frontend_pretty.go` as `A +7121 -0`, while an earlier commit
-    in the same session correctly reported `M` for `core/agent.go` — so it is
-    intermittent, and it began mid-session. (ii) A worker's commit of a
-    tracked file becomes a whole-file add, which the chief's `pull` then
-    cannot apply: it lands as CONFLICT (§9.1's CONTENT reason) even though
-    the worker changed only a dozen lines, and the real diff has to be
-    re-applied by hand — authorship lost for no reason. (iii) Worst: a worker
-    bootstrapped from a replayed changeset can materialize a source file with
-    git CONFLICT MARKERS in it (observed in `engine/telemetryattrs/attrs.go`,
-    markers landing exactly where the chief's edit had been inserted), which
-    fails the worker's own build and aborts `spawn` before its task ever
-    runs. That failure is then CACHED — a retry returned a byte-identical
-    error with the same traceparent and input digests, i.e. it never
-    re-executed — so the only recovery was recomposing the agent against the
-    current workspace. Both (ii) and (iii) were observed right after the
-    checkout moved under a live session (a deploy), which is the obvious
-    suspect but is not confirmed as necessary. Practical workarounds until
-    root-caused: take a conflicting worker commit's substance as edits rather
-    than fighting `pull`, and recompose after a checkout move. Not
-    agent-specific — it is a workspace-layer defect — but recorded here
-    because the staff workflow (spawn, harvest, pull) is where it keeps
-    surfacing.
-    **A fourth sighting, with a mechanism candidate and a compounding
-    consequence.** After a restart, `modules/staff/main.dang` itself was
-    corrupted on the host checkout — parse failure at `175:1`, in the blank
-    line directly above where a worker's edit had been inserted, matching
-    (iii)'s observation that markers land exactly at the chief's insertion
-    point. The workspace copy was clean, so the divergence was host-side.
-    Candidate mechanism, and it fits every sighting: `ctrl+s` moves the
-    checkout, but nothing moves the WORKERS — their workspaces are values
-    snapshotted at spawn — so a worker re-materializing (here, re-animated by
-    item 13) replays a spawn-time changeset over content that has since
-    moved underneath it. Which points at a real asymmetry rather than
-    intermittency: **§9.1 already learned this lesson in one direction and
-    never applied it in the other.** Harvesting INTO the chief is patch-based
-    precisely so a commit still lands when the receiver has moved on —
-    "patch application is the merge; `withChanges` is only the write" — but a
-    worker's own workspace is still a whole-tree value re-materialized as an
-    overlay, which is the semantics §9.1 renounced. Fixing that asymmetry
-    would remove this class without `ctrl+s` needing to know the staff exists
-    (item 13). The compounding consequence is why it is worth prioritizing:
-    the corrupted file broke the module parse, and the broken parse is what
-    stranded item 13's dismisses, so a workspace-layer defect disabled the
-    cleanup path for an agent-layer one.
-    **A fifth sighting, on this document, with a new consequence: it
-    misleads.** A ~50-line prose edit to this file was recorded `A +1231 -0`,
-    while a ~160-line edit to the same file minutes later in the same session
-    recorded correctly as `M +160 -7` — the clearest demonstration yet that
-    the defect is intermittent within a single session. Two costs beyond the
-    lying summary. The whole-file add made a worker's doc commits unpullable:
-    `pullConflicted` cannot apply an add onto a file that already exists, so
-    two commits had to be replayed by hand and their author lost. And the
-    symptom was misdiagnosed — an agent inferred from the whole-file add that
-    the document was untracked, a chief believed it without checking, and the
-    false conclusion was written into §11.1 as guidance before the human
-    caught it. Worth stating for whoever root-causes this: the summary is not
-    just cosmetic, it is evidence that other agents will reason from.
-    **Not fixed. A sixth sighting, and the first mechanism that is more than a
-    guess.** A ~41-line prose edit to this document committed as `A +1514 -0`
-    — whole file — in a session whose immediately preceding commit was a
-    `pull` of a worker's commit. Minutes later a fresh edit to the same file
-    reported `M +2 -0`, so it remains intermittent and there is still no
-    deterministic repro.
-    What is new is that the verdict's provenance is now known, and it is not
-    git's. `ADDED` vs `MODIFIED` is decided in `buildDiffStats`
-    (core/changeset.go:629) from `computeChangesetPathsDelta(before, after)`,
-    and for a host-backed workspace the BEFORE tree is deliberately **sparse**:
-    `sparseHostBase` (core/schema/workspace.go:2677-2705) builds it as
-    `host.directory(path: ".", include: <TouchedPaths>)` — only the paths the
-    overlay has accumulated. So "loses tracked-ness" is a misnomer that has
-    been steering the search wrong: nothing consults git's index, and the file
-    is not mistaken for untracked. It is genuinely absent from the tree it is
-    diffed against, because its path was not in `TouchedPaths` when that base
-    was sized. **This is a path-accumulation bug, not a tracking bug** — which
-    explains why the symptom is a whole-file ADD rather than a wrong line
-    count, and why the summary is not merely cosmetic: a staged commit's own
-    changeset is computed against that same sparse base
-    (core/schema/workspace_commit.go:221-250), so `pull` really does receive
-    an add.
-    The specific suspect, unconfirmed: `overlayWorkspaceWithMutation`
-    (workspace.go:2511-2554) re-bases a new overlay on the PARENT overlay's
-    `Changes.Before` — sparse, for a host-backed parent — while passing `nil`
-    for `TouchedPaths`, on the stated assumption that it is only ever reached
-    for value/git/rootless workspaces. `overlayEdit` upholds that today by
-    branching on `ws.HostPath() == "" || !ws.ClientLocalBase()` (:2591). But a
-    workspace handed to a MODULE is exactly one that stops being client-local
-    while carrying a host-derived sparse overlay — which is every staff
-    worker, and which is the §9.1 asymmetry recorded above. That predicts
-    sightings (ii) and (iii) precisely: a worker editing a long-tracked file
-    records an ADD, and its commit is unpullable. It does not by itself
-    explain a chief-side sighting like this one, so either the guard has a
-    second hole or there are two causes.
-    Confirmation experiment [RUN — see below: it reported `MODIFIED`, and
-    refuted this suspect]: assert that a file absent from `TouchedPaths` but
-    present on the host reports `MODIFIED` after an edit, driven through a
-    module-held workspace. If it reports `ADDED`, this is the bug, and the fix
-    is to stop sizing a correctness-bearing diff base by an optimization's
-    path set.
-    **A seventh sighting, and the sharpest evidence yet, because it caught the
-    two anchors disagreeing at the same instant.** A worker committing a
-    146-line edit to an existing file reported, from `status` immediately
-    before committing, `M +146 -0` — and the commit itself then recorded
-    `A +1488`, the whole file. Same file, same worker, seconds apart. That
-    rules out any theory in which the workspace has simply "forgotten"
-    something globally, because the pending view had it right. The two reads
-    differ only in what they diff against: `Workspace.git.uncommitted` diffs
-    against the staged HEAD, while the staged commit's own changeset diffs
-    against the overlay's `Before` (core/schema/workspace_commit.go:221-250),
-    which is the sparse tree. So the divergence is precisely the anchor
-    difference the comment at :214-220 already describes, and the sparse
-    anchor is the one that lies.
-    It also lands on the predicted population: this was a WORKER, i.e. a
-    module-held workspace, editing a file the CHIEF had never touched — so the
-    path was absent from the chief's `TouchedPaths`, and therefore absent from
-    the sparse `Before` the worker's overlay inherited. That is exactly the
-    `overlayWorkspaceWithMutation` path above, and it upgrades that suspect
-    from "unconfirmed" to "consistent with every worker-side sighting and with
-    a directly observed anchor disagreement". Still not a controlled
-    experiment: what would close it is the confirmation test already described,
-    driven through a module-held workspace whose parent overlay's touched set
-    excludes the edited path.
-    **The confirmation experiment has now been RUN, and it REFUTES the
-    suspect.** `core/integration/workspace_module_edit_test.go`
-    (`WorkspaceSuite.TestWorkspaceModuleEditOfUntouchedTrackedFile`, fixture
-    `testdata/modules/go/workspace-editor`) drives a surgical edit to a
-    long-tracked, host-present file through a module-held workspace whose
-    parent overlay's touched set excludes that path, and reads THREE anchors:
-    the overlay `changes`, `git.uncommitted`, and the staged commit's own
-    changeset — the projection the seventh sighting reported as `A +1488`. All
-    three report `MODIFIED +1 -1`, in all three cases (client-side control;
-    module, pristine workspace; module, after an unrelated write). 9/9, green
-    across four runs; the test is unskipped, as a regression guard.
-    **The premise is false: a workspace handed to a module does NOT stop being
-    client-local.** Measured by temporarily instrumenting `overlayEdit` (added,
-    measured, reverted — `core/schema/workspace.go` is untouched):
-
-        edit 1: hostPath=/work clientLocalBase=true source=ClientLocal
-                parentTouched=[]            editTouched=[scratch.txt]  branch=sparse-host
-        edit 2: hostPath=/work clientLocalBase=true source=Overlay/ClientLocal
-                parentTouched=[scratch.txt] editTouched=[tracked.txt]  branch=sparse-host
-
-    `ClientLocalBase()` reads the source TYPE and `HostPath()` a recorded
-    field; both travel with the value across the module boundary, because the
-    module receives the workspace by ID and re-evaluates it in the owning
-    session, with `withWorkspaceClientContext` routing host reads back through
-    the owning client. So the guard at workspace.go:2591 holds,
-    `overlayWorkspaceWithMutation` is never reached, and `touchedAll` contains
-    the edited path before the base is sized. The sixth sighting's "a workspace
-    handed to a MODULE is exactly one that stops being client-local" is simply
-    not true, and the predictions drawn from it go with it.
-    **What survives, and it is most of the diagnosis.** The seventh sighting's
-    anchor disagreement is untouched: the sparse `Before` is still the anchor
-    that lies, `buildDiffStats` still decides ADDED vs MODIFIED against a base
-    sized by `TouchedPaths`, and this is still a path-accumulation bug rather
-    than a tracking one. What falls is only the explanation of HOW a workspace
-    reaches that state. The structural requirement can now be stated exactly:
-    the failure needs a MIXED state — a parent overlay carrying a host-derived
-    SPARSE `Changes.Before` together with an edit taking the FULL-ROOT branch.
-    Both-sparse accumulates touched paths correctly; both-full diffs against a
-    full tree. So the search narrows to whatever strips host-ness while KEEPING
-    a host-derived overlay. Nothing in-tree does that through the public API
-    (`SetSource` appears only in `overlayEdit`, `overlayWorkspaceWithMutation`
-    and the two synthetic constructors, which build fresh workspaces;
-    `SetHostPath` only in tests). The one candidate is
-    `decodePersistedWorkspaceSource`, where `NewWorkspaceSourceClientLocal("")`
-    keeps `ClientLocalBase()` true while `hostPath` is empty — precisely
-    full-root-branch-over-sparse-`Before`. That, plus the agent-snapshot route
-    (`workerWorkspace` = `harvestTarget(name).snapshot.sync.workspace`) and a
-    restart or checkout-move boundary, is where the next measurement belongs.
-    **What the experiment does NOT cover**, stated because a green run is weak
-    evidence against an intermittent defect. The module receives its workspace
-    by contextual auto-injection of an omitted `Workspace!` argument; a staff
-    worker receives a BOUND one (`WorkspaceFromContext`) through
-    `Agent.snapshot`. That route is untested, and it is the population every
-    real sighting came from — if anything rewrites the source there, the
-    trigger lives there and this test cannot see it. Also absent: any session
-    boundary (no restart, no `ctrl+s`, no checkout move between the writes),
-    which is exactly the condition sightings (ii) and (iii) were observed
-    under. And the host-backed workspace is a container git repo reached by
-    nested privileged exec rather than a laptop checkout, though the test
-    asserts `clientLocalBase=true` so it cannot silently degenerate into a
-    value-workspace test.
-    **An eighth sighting, minutes after the refutation above and on the same
-    document — which is what makes it useful.** Committing the very edit that
-    recorded the refutation, `status` reported `M +107 -5` and the commit that
-    immediately followed recorded `A +1976 -0`, the whole file. That is the
-    seventh sighting's anchor disagreement exactly, reproduced seconds apart —
-    but CHIEF-side this time: an ordinary client-local workspace, no module
-    holding it, no worker, no restart, no checkout move. Content was intact
-    (no conflict markers, the file reads correctly), so this is the reporting
-    failure alone.
-    It matters because of its timing. The module explanation had just been
-    measured away, so a chief-side occurrence cannot fall back on it, and
-    "either the guard has a second hole or there are two causes" is no longer
-    a hedge — the second cause is now the only one with evidence. Note also
-    what did NOT misreport: three other files first touched in that same
-    session (`dagql/dagui/conversation.go`, `dagql/dagui/db.go`,
-    `dagql/idtui/frontend_pretty.go`) committed correctly as `M` from the same
-    workspace minutes earlier. Same session, same client-local host workspace,
-    all first-touched that session, and one of them reports a whole-file add.
-    Whatever the discriminator is, it is not module-holding, not
-    tracked-ness, and not "the path was never touched before" — which
-    together retire most of what this item has assumed for six sightings.
+    bounded by the read epoch, and it does not match anything that was
+    actually observed.
 15. **`TestStaff/TestAskChiefAndCollect` is broken and SKIPPED**: it arrived
     broken from a session that stopped before resolving it, and it is still
     unknown whether the test or the code is wrong — hence skipped rather
@@ -1697,170 +1490,84 @@ What is NOT built — threads to pull, each self-contained:
     Worth pairing with item 10 (workers not knowing their own name), which
     also wants to interpolate into `workerPrompt` and would move the same
     seed boundary.
-16. **A staff-spawned worker can be unaddressable from the roster in the SAME
-    session** (§3.3, §9) — distinct from item 13, which needs a restart.
-    **RESOLVED — read "Mode A: RESOLVED" in §11.2 first; everything below is
-    the investigation that led there, kept for its dead ends.**
-    Observed live: a worker spawned through `modules/staff` rendered on the
-    roster carrying the read-only marker, and focusing it failed with
+16. **A staff-spawned worker could be unaddressable from the roster in the
+    SAME session** (§3.3, §8) — distinct from item 13, which needs a restart.
+    **RESOLVED.** The full account — root cause, fix, tests, and what is
+    still open behind it — is §10.2 "Mode A: RESOLVED", which supersedes this
+    entry; what follows is only enough to know whether §10.2 is the section
+    you want.
+    The symptom was a worker spawned minutes earlier in the same client
+    process, fully drivable through the chief's held handle (`sendTo`
+    delivered `STEERED`, `collect` and the harvest family worked), rendering
+    on the roster with the read-only marker and failing on focus with
+    `call digest … not found`. So the runtime was live and correct, and it
+    was *addressing* that failed — the one thing §8 claimed was verified end
+    to end rather than argued.
+    Root cause, in one sentence: a call payload only ever reached a client as
+    an attribute on the span emitted for that exact selection, and whole
+    classes of frame are never independently spanned — most sharply, loading
+    an ID never re-selects the calls behind it, so an ID entering a session
+    from OUTSIDE it contributes zero spans and every frame behind it is
+    permanently unresolvable to that client. Fixed by giving call payloads a
+    second channel, as OTel log records (§10.2).
+    Two hypotheses died here and should not be re-derived, both recorded in
+    §10.2: that a post-evaluation `Result.ID()` handle form sits in an
+    ID-literal argument (impossible by construction — `mustBeRecipe` panics
+    on one), and that `Query.host`'s single per-session emission goes missing
+    (measured: the client's DB held two spans carrying that digest).
+    NOT resolved with it: **Mode B**, where the chain rebuilds completely and
+    the rebuilt handle then addresses a different, inert entry — `state`
+    reads `IDLE` while `name` and `instanceID` read back correctly, because
+    they are literals in the recipe. That is the live thread, it is blocked
+    on a decision rather than a measurement, and it lives in §10.2.
 
-        agent "scout" cannot be addressed: failed to decode DAG: failed to
-        decode receiver Call: <×13> … failed to decode argument: failed to
-        decode argument value: failed to decode literal Call: failed to
-        decode receiver Call: call digest "xxh3:76d54f087f21f29e" not found
+### 10.1 Notes for live QA
 
-    No restart, no resume, no saved recipe: the agent was spawned minutes
-    earlier in the same client process, and stayed fully drivable through the
-    chief's held handle the whole time — `sendTo` delivered `STEERED` into its
-    open turn, `collect` and the whole harvest family worked. So this is not
-    item 13's revival: the runtime is live and correct, and it is *addressing*
-    that fails — the one thing §9 claimed was verified end to end rather than
-    argued.
-    **Established.** `focusAgent` rebuilds a handle via
-    `encodedIDForCallDigest` → `Span.CallID` → `extractIntoDAG`, and the walk
-    needs a call payload for every frame the chain references, including
-    frames buried inside ID-literal arguments. `extractIntoDAG` dropped
-    unresolvable frames *silently*, so the gap only surfaced later inside
-    `ID.decode` as `call digest %q not found` (dagql/call/id.go:767-770),
-    wrapped once per frame it unwound through — a wall of identical wrappers
-    naming a digest but never the frame that wanted it. The payload was never
-    ingested rather than evicted: `DB.CallPayloads` has no pruning path.
-    **Fixed, the diagnostic half only**: the walk now records the referring
-    frame and `Span.CallID` fails there instead of handing a truncated recipe
-    to decode, so the next occurrence names the frame and says whether it hung
-    off the receiver spine or an argument (`dagql/dagui/extract.go`,
-    `extract_test.go`). Reproducing against a build with that in is step one;
-    it should identify the frame outright. (Since extended, §11.2 measurement
-    1: the referring frame now carries its own digest and arguments, so it is
-    findable in the trace rather than merely named — the errors quoted below
-    are the older field-and-type-only shape.)
-    **Unproven, and the first thing to measure.** [SUPERSEDED — this whole
-    hypothesis was REFUTED BY CONSTRUCTION; see "Mode A: RESOLVED" in §11.2.
-    An ID literal in a recorded call is recipe-form or the engine panics
-    (`mustBeRecipe`). Kept only so the reasoning is not re-derived.] The error
-    bottoms out behind
-    an **argument**, not on the receiver spine. `modules/staff` passes
-    post-evaluation objects around (`source: Workspace!`, the bound
-    `[Agent!]`), and §4.1 and §9 both measured that a post-evaluation
-    `Result.ID()` is the HANDLE form — an engine-local shared-result reference
-    (`call.NewEngineResultID`, dagql/cache.go:2250) which is not a call recipe
-    and which no span ever publishes. If a handle-form ID can be embedded as
-    an argument in a recorded call, then no trace can ever resolve it, and
-    roster addressing is broken *by construction* for any composition that
-    routes an object through a module function — which is every staff worker,
-    making this the common case rather than an edge.
-    Runners-up, ruled out by reading and not by measurement: a frame whose
-    sole emission happened in a nested module session this client never
-    ingested; and `ShouldEmitTelemetry`'s per-session dedupe
-    (dagql/telemetry.go:48-64) losing that sole emission — it emits
-    unconditionally for `DoNotCache` calls, so it should always emit at least
-    once.
-    Why it matters past one keypress: §3.3 renounced `Query.agents` *because*
-    telemetry is the directory, so there is no fallback. An unaddressable
-    agent can be watched but never focused, prompted or stopped from the UI,
-    and the spawning chief's held handle is the only thing that can still
-    reach it — which means a worker whose chief is gone is unreachable, full
-    stop. If the handle-form reading is right, this also retires §9's
-    "verified end to end" as scoped to compositions that carry no
-    post-evaluation object argument, which the two roster tests happen to
-    satisfy and real staff sessions do not.
-    **Reproduced with the diagnostic in, and it named the frame — but not the
-    one predicted.** Live, same session, focusing a `modules/staff` worker
-    spawned minutes earlier:
+Hazards learned the expensive way, worth reading before driving a staff
+session by hand:
 
-        agent "scoper" cannot be addressed: cannot rebuild ID for "agent"
-        (Agent): call xxh3:b034a1d294a17bec, referenced as receiver of
-        "directory" (Directory) never reached this client
+- **On a RESUMED session, do not call a staff tool to "just check".** Item
+  13's revival triggers on receiver load, so any call on the bound `Staff`
+  object — including `status`, which is built never to create — re-animates
+  every worker baked into the restored recipe, and each resume adds another
+  round. Establish what you want to know before touching it. If a read's
+  answer looks frozen at the seed, that is this, not a stale cache.
+- **`staff.read` is the wrong tool for watching a working agent.** It omits
+  tool calls by design, so a worker in a long tool-call stretch shows almost
+  nothing, and SYSTEM-role padding used to consume the window (fixed).
+  `ReadLogs` on the worker's span is what actually shows progress.
+- **Pulling a fix to `modules/staff` does not fix the RUNNING session**: the
+  loaded module is the one from session start, so a harvested change to the
+  staff tools takes effect only after a reload. Expect to dogfood one version
+  behind.
+- **Harvest inside the session that spawned the worker** (item 12): a
+  tombstone re-selected later projects IDLE-from-absence with the seed as its
+  snapshot, so harvest silently reports "nothing new" rather than failing.
+- **A worker you spawned this session may focus onto a CORPSE** (§10.2 mode
+  B). The loud read-only marker (`·` after the name) is fixed as of the
+  call-payload channel, so an entry that renders normally can still address
+  nothing: `state` reads `IDLE` while the worker is really running or failed,
+  and `name` reads back correctly because it is a literal. The tell is a
+  state that disagrees with what `staff.status` says. Nothing is wrong with
+  the worker: steer and harvest it through the chief's tools as usual.
+- **On an engine built before item 14's fix, a worker's commit may be
+  unpullable.** Any commit after the first in a session records a
+  first-touched path as a whole-file ADD, and both `pull` and `pullConflicted`
+  then refuse it ("already exists in working directory"); replay the change by
+  hand and commit it yourself, at the cost of the worker's authorship. The
+  tell is that only the FIRST commit of the session reads correctly. Do NOT
+  infer from a whole-file add that the file is untracked — it never meant
+  that. That inference was made here, believed, written into this section as
+  fact before a human caught it, and cost the investigation several sessions
+  by pointing it at tracked-ness instead of at the diff anchor.
+- **A green test run against the wrong branch is worth exactly nothing.**
+  Item 14 survived a confirmation experiment for several sessions because the
+  fixture staged exactly one commit and so never reached the branch that was
+  broken — the run was green and told you nothing. Before believing a test
+  that clears a hypothesis, check that it executes the code path the
+  hypothesis is about; prefer one you have seen fail first.
 
-    The diagnostic half does its job: one named frame instead of ×13
-    `failed to decode receiver Call` wrappers. And it settles the question it
-    was built to settle — **the gap is on the receiver spine, not behind an
-    argument.** The two hops are distinguished by construction (`receiver of
-    …`, dagql/dagui/extract.go:80, versus `argument %q of …`, :84), so the
-    leading hypothesis above is ruled out for this occurrence: no handle-form
-    `Result.ID()` sits in an ID-literal argument here. It remains possible for
-    other compositions, but it should stop being the first thing to measure —
-    which also means roster addressing is NOT broken by construction for
-    object-routing compositions, the worst reading this item entertained.
-    What the evidence does say is narrower: some `directory` call returning
-    `Directory` has a receiver whose span never carried a payload. Which one
-    is not yet measured — the walk names the REFERRING frame by field and
-    type, while the missing receiver survives only as a digest, and
-    "`directory`" alone does not identify it. A candidate drawn from item 14's
-    investigation — `sparseHostBase` (core/schema/workspace.go:2696-2701)
-    selects `host` then `directory(path:, include:)` off the root, so
-    `Query.host` is the receiver of a `directory` call in every host-backed
-    workspace chain, and being argument-free it has ONE call digest and one
-    per-session emission (`ShouldEmitTelemetry`, core/telemetry.go:81) — was
-    **measured and REFUTED.** A probe against a from-source engine found the
-    client's DB holding TWO spans carrying that digest
-    (`xxh3:37b977856265b79a`), one `internal=true` from the engine's
-    `sparseHostBase` select and one `internal=false` from the client's own
-    chain. The argument-free-implies-one-digest reasoning is right; the
-    conclusion drawn from it was wrong, because the emission is not lost and
-    the dedupe did not starve the client even when the engine-internal read
-    went first. The golden-trace hint that suggested it (`Host.directory` rows
-    with no `Query.host` row) was UI visibility, not payload absence. Recorded
-    at length because it is a plausible-sounding dead end that costs a day:
-    do not re-derive it.
-    **A second, distinct failure mode found while refuting it, and this one
-    is measured.** `TestRosterAddressingHostWorkspace` — `TestRosterAddressing`
-    plus a host-backed workspace bound via `withWorkspace` — fails, but never
-    with a gap: the walk closes, every frame resolves, and the rebuilt handle
-    then reads `IDLE` where the live runtime is `FAILED`. That is
-    IDLE-from-absence: the chain rebuilt fine and addressed a DIFFERENT,
-    inert entry. `name` and `instanceID` still read back correctly, because
-    they come off the chain's own literals — so the handle looks healthy while
-    addressing a corpse, which is strictly worse than the loud gap error.
-    Mechanism: `AgentRuntimes` keys entries on the agent value's content
-    digest (core/agent.go:201-232), the telemetry-rebuilt ID is the RECIPE
-    form (§9), and re-executing a recipe containing `Query.currentWorkspace`
-    does not reproduce the same value — it is `NotReplayable` and carries
-    `PerCallInput`/`PerSessionInput` (core/schema/workspace.go:35-40), so each
-    re-address mints a fresh workspace, the agent's digest moves with it, and
-    the lookup misses. The contrast isolates it: the same test passes when the
-    workspace is `host.directory(…).asWorkspace()`, which is replayable and
-    digest-stable, and fails identically with a bare `currentWorkspace` with
-    NO overlay — **so the sparse overlay is not the trigger, `currentWorkspace`
-    is.**
-    This makes the registry's content-digest key the real defect for
-    addressing, and it generalizes past workspaces: any composition carrying a
-    non-replayable or per-session leaf is unaddressable-by-rebuild, silently.
-    §9 minted `InstanceID` precisely so instances could not collide, and it
-    already rides the pinned chain as a literal — so keying `AgentRuntimes` on
-    `InstanceID`, with the content digest demoted to a corroborating check,
-    would make rebuild-addressing survive any leaf. That trade needs an
-    owner's call, because the digest key is also what stops a forged
-    `agent(id:)` chain with a foreign seed from addressing somebody else's
-    runtime.
-    Both of these say the same thing about §9's "verified end to end": the two
-    roster tests pass because a bare `llm` seed carries no workspace at all,
-    not because the mechanism is sound for real compositions.
-
-    The original gap remains unexplained, and the shape to look for is still
-    this: span emission is per selected step in `AroundFunc`
-    (core/telemetry.go:31-105), which returns before recording a payload for
-    introspection frames, `isMeta` frames (`node`, `id`, `sync`, anything
-    returning `Error`) and anything under an inherited `IsSkipped` context. A
-    frame that only ever materializes inside a suppressed subtree publishes
-    nothing, while a later unsuppressed selection of its CHILD still publishes
-    — a hole one level up the receiver spine. Note the refuted probe narrows
-    where to look rather than reopening everything: whatever the missing frame
-    is, it is NOT reached through the plain client-side workspace chain, which
-    was measured to rebuild completely. The untested dimension the probe could
-    not cover is the one the live failure actually had — a chain built inside
-    a MODULE call, with a module-held `source: Workspace!` and host reads
-    routed through `withWorkspaceHostReadContext` for another client. That is
-    where the next measurement belongs:
-    `TestRosterAddressingFromModule` with a host-backed workspace threaded
-    through the module.
-    Cheap and worth doing first regardless: have the walk report the referring
-    call's own digest and arguments alongside the missing receiver's digest.
-    That turns "some `directory` call" into a frame findable in the trace, and
-    identifies the receiver by inspection instead of by hypothesis — which is
-    how this round was lost.
-
-### 11.2 Handoff: fixing roster switching
+### 10.2 Handoff: fixing roster switching
 
 **STATUS.** MODE A (the loud "never reached this client") is FIXED, tested and
 explained below — a recurrence is a bug report, not an expected condition.
@@ -1873,7 +1580,7 @@ IDLE handle, and that is Mode B, expected, not a regression of the fix.
 Written at the end of a session that investigated ONLY this, so the next one
 does not re-derive it. Everything below is about **switching between agents in
 the TUI failing** — item 16's territory. It is deliberately separate from item
-13 (revival on resume), item 14 (ADDED-vs-MODIFIED), and §4.1 (resume from
+13 (revival on resume), item 14 (the stale diff anchor), and §4.1 (resume from
 trace); those are real and pressing but are NOT this, and conflating them cost
 time here.
 
@@ -1902,7 +1609,7 @@ first thing to do with any new report, because they need opposite fixes:
 
 **Mode B: the mechanism, settled.** `AgentRuntimes` keys entries on the
 agent VALUE's content digest (`agentKey` → `ContentPreferredDigest`,
-core/agent.go:226-232). A telemetry-rebuilt ID is the RECIPE form (§9), so
+core/agent.go:226-232). A telemetry-rebuilt ID is the RECIPE form (§8), so
 using it RE-EXECUTES the chain — and `Query.currentWorkspace` is
 `NotReplayable` with `PerCallInput`/`PerSessionInput`
 (core/schema/workspace.go:35-40), i.e. deliberately mints a fresh value every
@@ -1921,7 +1628,7 @@ way.
 is "decide what authority to address an agent means", so it wants an owner.
 Today's whole-value digest doubles as proof of possession: you can only
 address a runtime by presenting the entire composition, which is §3.3's
-capability model and §9's "IDs are unforgeable". Options:
+capability model and §8's "IDs are unforgeable". Options:
 
 - **(a) Key on `InstanceID`.** Simplest, and it survives any leaf — the ID is
   minted at spawn, unique by construction, and already rides the pinned chain
@@ -1932,7 +1639,7 @@ capability model and §9's "IDs are unforgeable". Options:
   `someUnrelatedLLM.agent(id: "…", name: "…")` onto a live runtime with a
   foreign seed.
 - **(b) Key on `InstanceID`, put authority in another layer** — the spawning
-  session, or the ownership flag the CLI already carries (§11 slice 2).
+  session, or the ownership flag the CLI already carries (§10 slice 2).
 - **(c) Make the replay digest-stable instead**, by pinning the workspace into
   the chain rather than re-deriving it. Nobody has evaluated this. It is the
   only option that costs nothing security-wise, because the capability
@@ -1953,24 +1660,29 @@ inside the session. Unestablished.
 **Mode A: what is ruled out, so it is not re-derived.** The hypothesis that
 `Query.host`'s single per-session telemetry emission goes missing was
 MEASURED AND REFUTED — the client's DB held two spans carrying that digest,
-one internal from `sparseHostBase` and one from the client's own chain (see
-item 16). More usefully, the same probe established that the plain
-client-side workspace chain rebuilds COMPLETELY. So the gap is not in a
-client-issued composition, which is most of the search space gone.
+one internal from `sparseHostBase` and one from the client's own chain. It is
+a plausible-sounding dead end that costs a day, and the golden-trace hint that
+suggested it (`Host.directory` rows with no `Query.host` row) was UI
+visibility, not payload absence. More usefully, the same probe established
+that the plain client-side workspace chain rebuilds COMPLETELY. So the gap is
+not in a client-issued composition, which is most of the search space gone.
 
 **Mode A: RESOLVED.** Root cause, fix and remaining edge all measured in one
 session. Read this before touching anything telemetry-shaped.
 
-*The live repro that cracked it.* With the diagnostic above in a built CLI,
-focusing a `modules/staff` worker gave:
+*The live repro that cracked it.* The walk was first taught to name the
+referring frame rather than hand a truncated recipe to `ID.decode` — which
+turned a wall of identical `failed to decode receiver Call` wrappers into one
+named frame (`dagql/dagui/extract.go`, `extract_test.go`). With that in a
+built CLI, focusing a `modules/staff` worker gave:
 
     agent "scout" cannot be addressed: cannot rebuild ID for "agent" (Agent):
     call xxh3:47ab2dce6d1d5b1e never reached this client, referenced as
     argument "directory" of "withSkills" (LLM)
     xxh3:edf3a4032b78d5df(directory: xxh3:47ab2dce6d1d5b1e)
 
-Note this is an ARGUMENT gap, where the earlier occurrence recorded in item 16
-was on the receiver spine. Both shapes are the same defect; neither is special.
+Note this is an ARGUMENT gap, where the first occurrence of this failure was
+on the receiver spine. Both shapes are the same defect; neither is special.
 
 *The handle-form hypothesis is REFUTED BY CONSTRUCTION, not merely unproven.*
 Item 16 spent a long time on "maybe a post-evaluation `Result.ID()` handle
@@ -2012,8 +1724,9 @@ criterion, and it held.
 *Base64, not bytes, and why it looked tempting.* The log data model has a
 Bytes kind, but bytes do not survive the first hop: `telemetry.LogValueToPB`
 has no `KindBytes` case and silently encodes such a value as the string
-`"INVALID"` (measured). Upstream fix filed: dagger/otel-go#16. Until that
-lands and is bumped, base64 is not a preference, it is a requirement.
+`"INVALID"` (measured). The upstream fix, dagger/otel-go#16, has MERGED, but
+this repo still pins `v1.43.1-0.20260515012101-af7cd0684887`, so until that
+bump lands base64 remains a requirement rather than a preference.
 
 *Still open, deliberately.* (1) **Array members** — `TestArrayMemberSubSelection`
 (core/integration/callid_rebuild_test.go) is SKIPPED, and its comment carries
@@ -2033,10 +1746,9 @@ this REFUTES the "reproduce through a module call" measurement this section
 used to recommend: nested-session spans ARE forwarded, so a module-built
 chain was never the problem.
 
-**Lost work, RECREATED.** A probe test, `TestRosterAddressingHostWorkspace`,
-was written and measured but lost with its worker's workspace before it could
-be harvested. It is `TestRosterAddressing` plus a host-backed workspace bound
-via `spawnOpts.wsID`, with the session pointed at a temp-dir git repo via
+**The Mode B probe test.** `TestRosterAddressingHostWorkspace` is
+`TestRosterAddressing` plus a host-backed workspace bound via
+`spawnOpts.wsID`, with the session pointed at a temp-dir git repo via
 `dagger.WithWorkdir`, in three cases:
 
 | case | workspace | result |
@@ -2052,10 +1764,10 @@ state — Mode B. `withNewFile` is the workspace edit verb
 the engine-dev test container, which sets `_EXPERIMENTAL_DAGGER_RUNNER_HOST`
 rather than `DAGGER_SESSION_PORT`, so these tests really run there.
 
-It now lives in `core/integration/agent_runtime_test.go`, and a run against a
-from-source engine reproduced that table exactly, failure message included —
-so nothing about Mode B has moved. Two things about its shape, because they
-are the reason it can sit in a green tree:
+It lives in `core/integration/agent_runtime_test.go`, and a run against a
+from-source engine reproduced that table exactly, failure message included.
+Two things about its shape, because they are the reason it can sit in a green
+tree:
 
 - **The assertions are split at the seam, not skipped wholesale.** Everything
   through the rebuild and the literal-derived identity (`name`, `instanceID`)
@@ -2074,52 +1786,10 @@ are the reason it can sit in a green tree:
   passes would have to be un-adjusted by exactly the person least able to
   tell it apart from intent.
 
-**Two hazards for whoever picks this up.** Do not open the investigation by
-calling a `modules/staff` tool on a resumed session (§11.1, item 13) — it
-revives workers on receiver load, including reads. Item 14 used to be the
-second hazard — it misreported this section's own commits as whole-file adds
-and made a worker's commit unpullable — but it is fixed; a session running an
-engine built before that fix will still show it, and the tell is that only the
-FIRST commit of the session is reported correctly.
-
-### 11.1 Notes for live QA
-
-Hazards learned the expensive way, worth reading before driving a staff
-session by hand:
-
-- **On a RESUMED session, do not call a staff tool to "just check".** Item
-  13's revival triggers on receiver load, so any call on the bound `Staff`
-  object — including `status`, which is built never to create — re-animates
-  every worker baked into the restored recipe, and each resume adds another
-  round. Establish what you want to know before touching it.
-- **`staff.read` is the wrong tool for watching a working agent.** It omits
-  tool calls by design, so a worker in a long tool-call stretch shows almost
-  nothing, and SYSTEM-role padding used to consume the window (fixed).
-  `ReadLogs` on the worker's span is what actually shows progress.
-- **Pulling a fix to `modules/staff` does not fix the RUNNING session**: the
-  loaded module is the one from session start, so a harvested change to the
-  staff tools takes effect only after a reload. Expect to dogfood one version
-  behind.
-- **Harvest inside the session that spawned the worker** (item 12): a
-  tombstone re-selected later projects IDLE-from-absence with the seed as its
-  snapshot, so harvest silently reports "nothing new" rather than failing.
-- **A worker you spawned this session may focus onto a CORPSE** (§11.2 mode
-  B). The loud read-only marker (`·` after the name) is fixed as of the
-  call-payload channel, so an entry that renders normally can still address
-  nothing: `state` reads `IDLE` while the worker is really running or failed,
-  and `name` reads back correctly because it is a literal. The tell is a
-  state that disagrees with what `staff.status` says. Nothing is wrong with
-  the worker: steer and harvest it through the chief's tools as usual.
-- **A worker's commit may be unpullable, via item 14 — fixed, but know the
-  shape.** On an engine built before the fix, any commit after the first in a
-  session records a first-touched path as a whole-file ADD, and both `pull`
-  and `pullConflicted` then refuse it: an add cannot apply onto a file that
-  already exists ("already exists in working directory"). Replay the change by
-  hand and commit it yourself, at the cost of the worker's authorship — this
-  section's own harvest had to do exactly that. Do NOT infer from the
-  whole-file add that the file is untracked: it never meant that, and a
-  comparable edit minutes later in the same session records correctly as `M`.
-  That wrong inference was made here, believed, and written into this section
-  as fact before being caught — and it cost the investigation several sessions
-  by pointing it at tracked-ness instead of at the diff anchor.
+**One hazard for whoever picks this up.** Do not open the investigation by
+calling a `modules/staff` tool on a resumed session (§10.1, item 13) — it
+revives workers on receiver load, including reads. Item 14 used to be a second
+hazard, misreporting this section's own commits as whole-file adds and making
+a worker's commit unpullable; it is fixed, but an engine built before the fix
+still shows it (§10.1).
 
