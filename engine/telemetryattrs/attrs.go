@@ -75,6 +75,50 @@ const (
 	ProgressUnitAttr = "dagger.io/progress.unit"
 )
 
+// Call payloads over OTel logs (dagger.io/dag.call.payload.*).
+//
+// A client rebuilds a dagql call ID by walking the chain a call references
+// and looking up a payload for EVERY frame it reaches (dagui's
+// extractIntoDAG). The span channel can only ever carry the payload of a
+// call that got its own span, and several frames structurally never do:
+// introspection / isMeta / skipped selections, digests the per-session span
+// dedupe already spent, frames buried inside an ID-literal argument (which
+// LiteralID.pb flattens to a bare digest reference), and members of an array
+// result that are only ever sub-selected. Those frames are unreachable to a
+// client, forever, however long it watches.
+//
+// So payloads also ride LOG RECORDS, exactly like agent state above and for
+// the same structural reason: the log channel is the one stream that can
+// carry data no span exists to hold. The engine publishes the transitive
+// closure of a call's ID when it emits that call's span — every frame the
+// chain references, minus the ones already sent this session — so a chain is
+// rebuildable even if only ONE of its frames was ever spanned.
+//
+// This is purely ADDITIVE to dagger.io/dag.call on the span, which is
+// unchanged: an old client keeps working against a new engine, and a new
+// client against an old engine. Consumers fold a record carrying
+// DagCallPayloadAttr into their call-payload store and must not render it as
+// log text; it may arrive before OR after the span that references the
+// digest (separate pipelines, separate batching, no ordering guarantee).
+const (
+	// DagCallPayloadDigestAttr is the call digest the payload belongs to —
+	// the same key dagger.io/dag.digest carries on a span, and the map key a
+	// consumer files the payload under without having to decode it. (string)
+	DagCallPayloadDigestAttr = "dagger.io/dag.call.payload.digest"
+
+	// DagCallPayloadAttr is one protobuf-encoded callpbv1.Call (a single
+	// frame, not a DAG), base64-encoded — the identical encoding
+	// dagger.io/dag.call uses on spans, so both channels decode through
+	// Call.Decode.
+	//
+	// Base64 rather than the log data model's native Bytes value, which does
+	// NOT survive the trip: the engine persists each client's records via
+	// telemetry.LogValueToPB (engine/server/telemetry.go), whose switch has
+	// no log.KindBytes case and silently encodes such a value as the string
+	// "INVALID". (string)
+	DagCallPayloadAttr = "dagger.io/dag.call.payload"
+)
+
 // Agent directory (dagger.io/agent.*).
 //
 // Async agents (hack/designs/async-agents.md) are long-lived, addressable
