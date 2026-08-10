@@ -47,7 +47,7 @@ type Review {
     """
     paths: [String!]! = [],
   ): String! {
-    let stats = source.git.uncommitted.diffStats.{{kind, addedLines, removedLines, path}}
+    let stats = source.git.uncommitted.diffStats.{{kind, addedLines, removedLines, path, oldPath}}
     # Pending edits git cannot see at all — gitignored paths, paths inside a
     # nested repository, or a file edited back to its committed content. They
     # are written to the checkout on save, but there is nothing to commit.
@@ -56,7 +56,13 @@ type Review {
       stats
     } else {
       stats.filter { s =>
-        paths.any { p => Path(p).contains(Path(s.path)) }
+        # A rename is ONE stat, keyed on the NEW path with the old one
+        # alongside in oldPath (null for every other kind). `diff` keeps a
+        # section when EITHER name in its header is scoped, so match either
+        # name here too, or the two tools disagree about renames. An absent
+        # oldPath spells "" and would match the whole tree, so drop it.
+        let names = [s.path] + [s.oldPath ?? ""].filter { n => n != "" }
+        names.any { n => paths.any { p => Path(p).contains(Path(n)) } }
       }
     }
     let scopedUnmanaged = if (paths.isEmpty) {
