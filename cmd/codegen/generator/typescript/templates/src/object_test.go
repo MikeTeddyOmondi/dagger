@@ -83,6 +83,32 @@ func TestObjectFieldDeprecated(t *testing.T) {
 	require.Equal(t, want, b.String())
 }
 
+func TestNullableObjectField(t *testing.T) {
+	tmpl := templateHelper(t)
+	object := objectInit(t, `{
+      "kind": "OBJECT",
+      "name": "GitRepository",
+      "description": "",
+      "fields": [{
+        "args": [],
+        "description": "",
+        "isDeprecated": false,
+        "name": "latestVersion",
+        "type": {"kind": "OBJECT", "name": "GitRef"}
+      }],
+      "inputFields": null,
+      "interfaces": [],
+      "enumValues": null,
+      "possibleTypes": null
+    }`)
+
+	var b bytes.Buffer
+	require.NoError(t, tmpl.ExecuteTemplate(&b, "object", object))
+	require.Contains(t, b.String(), "latestVersion = async (): Promise<GitRef | null>")
+	require.Contains(t, b.String(), `.select("latestVersion").select("id")`)
+	require.Contains(t, b.String(), "if (response === null)")
+}
+
 func TestInterfaceMethodOptionalArgDeprecated(t *testing.T) {
 	tmpl := templateHelper(t)
 
