@@ -332,6 +332,10 @@ type Editor {
 
   """
   Rename or move a file or directory. Parent directories are created automatically.
+
+  Refuses rather than destroys: moving a path onto itself, into its own
+  subtree, or onto an existing destination is an error, as is moving a source
+  that does not exist.
   """
   mv(
     source: Workspace!,
@@ -347,22 +351,48 @@ type Editor {
     Force-move the file - only used to resolve merge conflicts
     """
     force: Boolean! = false,
-  ): Changeset {
-    let normalizedPath = normalize(oldPath)
-    let base = source
-      .directory(".", include: [normalizedPath])
-    let changes = if (base.exists(oldPath, expectedType: ExistsType.REGULAR_TYPE)) {
-      base
-        .withFile(newPath, source.file(oldPath))
-        .withoutFile(oldPath)
-        .changes(base)
-    } else if (base.exists(oldPath, expectedType: ExistsType.DIRECTORY_TYPE)) {
-      base
-        .withDirectory(newPath, source.directory(oldPath))
-        .withoutDirectory(oldPath)
-        .changes(base)
+  ): Changeset! {
+    # Path normalizes on construction, so the aliases that used to slip past an
+    # equality check on the raw strings ("x" vs "./x" vs "x/") collapse here.
+    let src = Path(normalize(oldPath))
+    let dst = Path(normalize(newPath))
+    let srcPath = src.string
+    let dstPath = dst.string
+
+    # Both writes below land before the matching removal, so a source that is
+    # also the destination would delete what was just written.
+    if (src == dst) {
+      raise `mv: source and destination are the same path (${srcPath})`
     }
-    changes
+    if (src.contains(dst)) {
+      raise `mv: cannot move ${srcPath} into its own subtree (${dstPath})`
+    }
+
+    # Diff against the whole tree rather than a base narrowed to the source.
+    # A narrowed base omits the source's siblings, so its parent directory
+    # looks emptied by the move, and applying that structural diff deletes
+    # every sibling the base left out.
+    let base = source.directory(".")
+
+    if (base.exists(srcPath, expectedType: ExistsType.REGULAR_TYPE)) {
+      if (base.exists(dstPath, expectedType: ExistsType.DIRECTORY_TYPE)) {
+        raise `mv: destination ${dstPath} is an existing directory; pass the full destination path`
+      }
+      base
+        .withFile(dstPath, base.file(srcPath))
+        .withoutFile(srcPath)
+        .changes(base)
+    } else if (base.exists(srcPath, expectedType: ExistsType.DIRECTORY_TYPE)) {
+      if (base.exists(dstPath)) {
+        raise `mv: destination ${dstPath} already exists`
+      }
+      base
+        .withDirectory(dstPath, base.directory(srcPath))
+        .withoutDirectory(srcPath)
+        .changes(base)
+    } else {
+      raise `mv: ${srcPath} does not exist`
+    }
   }
 
   """
