@@ -137,6 +137,9 @@ func (b *SchemaBuilder) Replacing(mods ...Mod) *SchemaBuilder {
 }
 
 func (b *SchemaBuilder) Lookup(name string) (Mod, bool) {
+	if b == nil {
+		return nil, false
+	}
 	for _, e := range b.entries {
 		if e.mod.Name() == name {
 			return e.mod, true
