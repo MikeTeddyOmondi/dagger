@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/opencontainers/go-digest"
 	"github.com/vektah/gqlparser/v2/ast"
 	"go.opentelemetry.io/otel/codes"
 
@@ -25,18 +24,29 @@ import (
 // value itself stays pure and content-addressed — seed conversation, minted
 // instance ID, display name — and starting it registers a runtime entry
 // (loop goroutine on a detached context, computed state) in the session's
-// AgentRuntimes table, keyed by the value's digest. All runtime state lives
-// in that table, never on the value.
+// AgentRuntimes table, keyed by the InstanceID. All runtime state lives in
+// that table, never on the value.
 type Agent struct {
 	// Seed is the conversation the agent's evaluation loop starts from,
 	// including its tools, workspace, and message history.
 	Seed dagql.ObjectResult[*LLM]
 
 	// InstanceID is the unique identity minted by the spawn that created
-	// this agent. It rides the pinned ID chain, so it participates in the
-	// value's content digest: every spawn yields a fresh runtime registry
-	// key, and a stopped instance's tombstone can never be collided with
-	// by a later spawn of the same composition.
+	// this agent, and the agent's runtime registry key: every spawn yields
+	// a fresh entry, and a stopped instance's tombstone can never be
+	// collided with by a later spawn of the same composition.
+	//
+	// Identity is the ID and nothing else — deliberately NOT the value's
+	// content digest, which would make addressing depend on the seed
+	// re-deriving byte-identically. It does not: a handle rebuilt from
+	// telemetry is the RECIPE form, so using it re-executes the chain, and
+	// a per-session or non-replayable leaf anywhere in the composition
+	// (Query.currentWorkspace being the one every real agent carries)
+	// mints a fresh value on every evaluation. Keyed on the digest, such a
+	// handle missed the registry and — since Get never creates and
+	// IDLE-with-seed-snapshot is the honest projection of a never-started
+	// agent — looked healthy while addressing nothing, then spawned a
+	// second loop from the seed on the first send.
 	InstanceID string
 
 	// Name is a display label — telemetry and error messages — with no
@@ -110,9 +120,9 @@ func (state AgentState) ToLiteral() call.Literal {
 // (hack/designs/async-agents.md §3.2), which under multiple senders is the
 // only non-racy way to pair a reply with a message.
 type AgentMessage struct {
-	// AgentKey is the registry key (the agent value's content digest) of
-	// the runtime entry holding the message record.
-	AgentKey digest.Digest
+	// AgentKey is the registry key (the agent's instance ID) of the runtime
+	// entry holding the message record.
+	AgentKey string
 	// AgentName is the agent's display name, carried for error messages.
 	AgentName string
 	// MessageID uniquely identifies the message record within the entry.
@@ -199,43 +209,56 @@ type agentMessageRecord struct {
 }
 
 // AgentRuntimes manages the lifecycle of agent runtime entries for a single
-// session: one entry per spawned agent instance, keyed by the agent value's
-// content digest — which contains the spawn-minted InstanceID, so keys never
-// collide across spawns. Entries persist as tombstones after their loop ends
-// (state and the last snapshot stay readable for the rest of the session,
-// like ExitedService); unlike Services — which free a running entry's key on
-// exit precisely because their keys are reusable composition digests — an
-// agent's key is born unique, so the tombstone can keep the keyed slot
-// harmlessly forever.
+// session: one entry per spawned agent instance, keyed by the spawn-minted
+// InstanceID, which is unique by construction so keys never collide across
+// spawns. Entries persist as tombstones after their loop ends (state and the
+// last snapshot stay readable for the rest of the session, like
+// ExitedService); unlike Services — which free a running entry's key on exit
+// precisely because their keys are reusable composition digests — an agent's
+// key is born unique, so the tombstone can keep the keyed slot harmlessly
+// forever.
 //
-// The registry itself is session-scoped — created alongside Services in the
-// session state (engine/server/session.go) — so keys are just the agent
-// value's digest, with no session component.
+// Keying on the ID rather than on the agent value's content digest is what
+// makes a handle rebuilt from telemetry address the LIVE runtime (design
+// §10.2 mode B): the ID is a literal on the pinned chain, so it survives
+// re-execution of a composition whose leaves do not. The capability model
+// (§3.3) is unaffected — the same trace that publishes the ID publishes the
+// call payloads a client rebuilds the whole composition from, so the digest
+// was never the stronger secret — and the ID itself is engine-minted
+// entropy, scoped to this session's registry.
+//
+// The registry is session-scoped — created alongside Services in the session
+// state (engine/server/session.go) — so keys carry no session component.
 type AgentRuntimes struct {
-	entries map[digest.Digest]*AgentRuntime
+	entries map[string]*AgentRuntime
 	mu      sync.Mutex
 }
 
 // NewAgentRuntimes returns a new, empty AgentRuntimes registry.
 func NewAgentRuntimes() *AgentRuntimes {
 	return &AgentRuntimes{
-		entries: map[digest.Digest]*AgentRuntime{},
+		entries: map[string]*AgentRuntime{},
 	}
 }
 
-func agentKey(ctx context.Context, agent dagql.ObjectResult[*Agent]) (digest.Digest, error) {
-	dig, err := agent.ContentPreferredDigest(ctx)
-	if err != nil {
-		return "", fmt.Errorf("agent digest: %w", err)
+// agentKey is the registry key of an agent value: its instance ID, minted by
+// the spawn that created it. An agent with no instance ID was never minted by
+// a spawn (LLM.agent(id: "") is the only way to build one), and has no
+// identity to address a runtime by, so it is rejected rather than sharing one
+// key with every other such value.
+func agentKey(agent dagql.ObjectResult[*Agent]) (string, error) {
+	self := agent.Self()
+	if self == nil || self.InstanceID == "" {
+		return "", fmt.Errorf("agent has no instance ID: only an agent minted by spawn can be addressed")
 	}
-	return dig, nil
+	return self.InstanceID, nil
 }
 
 // Get returns the runtime entry for the given agent value, if one exists.
 // It never creates an entry: a never-started agent has no runtime, and its
 // observable state (IDLE, snapshot == seed) is projected from that absence.
 func (ars *AgentRuntimes) Get(ctx context.Context, agent dagql.ObjectResult[*Agent]) (*AgentRuntime, bool, error) {
-	key, err := agentKey(ctx, agent)
+	key, err := agentKey(agent)
 	if err != nil {
 		return nil, false, err
 	}
@@ -247,8 +270,14 @@ func (ars *AgentRuntimes) Get(ctx context.Context, agent dagql.ObjectResult[*Age
 
 // GetOrCreate returns the runtime entry for the given agent value, creating
 // an inert one (loop not started, snapshot == seed) if none exists yet.
+//
+// The seed is read off the value only when the entry is CREATED. A later
+// handle for the same instance addresses the entry as it stands — its own
+// seed is not consulted, and cannot displace the conversation the loop has
+// been building. That is what makes a rebuilt handle safe to use: it names an
+// instance, it does not redefine one.
 func (ars *AgentRuntimes) GetOrCreate(ctx context.Context, agent dagql.ObjectResult[*Agent]) (*AgentRuntime, error) {
-	key, err := agentKey(ctx, agent)
+	key, err := agentKey(agent)
 	if err != nil {
 		return nil, err
 	}
@@ -390,14 +419,15 @@ func (ars *AgentRuntimes) KillAll(ctx context.Context, cause error) error {
 // reporting STOPPED/FAILED and Snapshot the last committed conversation for
 // the rest of the session, like ExitedService (core/services.go).
 type AgentRuntime struct {
-	key  digest.Digest
+	key  string
 	name string
 
 	// self is the agent handle the entry was created from: an honest dagql
 	// instance of the agent value. Immutable after creation (any handle
-	// with the same content digest denotes the same entry). The loop binds
-	// it into its context (AgentToContext) so tools dispatched by a step
-	// can reach the calling agent — the Agent! argument injection.
+	// carrying the same instance ID denotes the same entry, whatever its
+	// seed re-derived to). The loop binds it into its context
+	// (AgentToContext) so tools dispatched by a step can reach the calling
+	// agent — the Agent! argument injection.
 	self dagql.ObjectResult[*Agent]
 
 	mu sync.Mutex

@@ -1379,12 +1379,12 @@ func queryID(ctx context.Context, t *testctx.T, c *dagger.Client, query, path st
 
 // TestRosterAddressingHostWorkspace is TestRosterAddressing with a workspace
 // bound into the seed — the one thing every real composition has and the two
-// passing roster tests happen to lack. A bare llm() seed carries no workspace
-// at all, so those tests establish that the mechanism CAN work, not that it
-// works for the compositions users actually drive (design §11.2).
+// other roster tests happen to lack. A bare llm() seed carries no workspace at
+// all, so those tests establish that the mechanism CAN work, not that it works
+// for the compositions users actually drive (design §10.2).
 //
 // The three cases differ only in where the workspace comes from, and that
-// alone decides whether addressing survives:
+// alone used to decide whether addressing survived:
 //
 //   - host directory workspace — host.directory(…).asWorkspace(), a
 //     replayable, digest-stable leaf.
@@ -1392,26 +1392,25 @@ func queryID(ctx context.Context, t *testctx.T, c *dagger.Client, query, path st
 //     carries PerCallInput/PerSessionInput (core/schema/workspace.go:35-40),
 //     i.e. deliberately mints a fresh value on every evaluation.
 //   - session workspace overlay — the same, plus an edit, to separate the
-//     sparse-overlay machinery from currentWorkspace itself. It is not the
-//     overlay: this case fails exactly like the bare one.
+//     sparse-overlay machinery from currentWorkspace itself. It was never the
+//     overlay: this case failed exactly like the bare one.
 //
-// What breaks is not the walk. Every frame resolves, the ID rebuilds, and
+// What broke was never the walk. Every frame resolves, the ID rebuilds, and
 // the handle reads back its own name and instance ID — those are literals in
 // the recipe. But a telemetry-rebuilt ID is the RECIPE form (design §9), so
-// USING it re-executes the chain; a fresh currentWorkspace means a fresh
-// seed, a different agent value, and therefore a different key in
-// AgentRuntimes, which is keyed on the agent value's content digest
-// (core/agent.go:201-232). The lookup misses, and a miss is indistinguishable
-// from a never-started agent — Get never creates, and IDLE-with-seed-snapshot
-// is the honest projection of one. So the handle looks healthy and addresses
-// a corpse, which is strictly worse than failing loudly.
+// USING it re-executes the chain; a fresh currentWorkspace meant a fresh seed,
+// a different agent value, and — while AgentRuntimes keyed on the agent
+// value's content digest — a different registry key. The lookup missed, and a
+// miss is indistinguishable from a never-started agent, since Get never
+// creates and IDLE-with-seed-snapshot is the honest projection of one. So the
+// handle looked healthy and addressed a corpse, and the first send spawned a
+// second loop from the seed: the live agent kept running while a fresh,
+// history-less one received the user's message.
 //
-// The assertions are split at exactly that seam: everything up to and
-// including the literal-derived identity RUNS for all three cases (and is
-// real coverage — it is what would catch the loud, walk-side failure), and
-// only the runtime-identity assertions past it are skipped where the defect
-// bites. When the registry stops keying on the value digest, deleting the
-// skip is the whole change.
+// The registry now keys on the spawn-minted InstanceID (core/agent.go), a
+// literal on the pinned chain that survives re-execution whatever the leaves
+// do — so all three cases address the live runtime, and the assertions past
+// the rebuild are what pins that.
 func (AgentRuntimeSuite) TestRosterAddressingHostWorkspace(ctx context.Context, t *testctx.T) {
 	if _, nested := os.LookupEnv("DAGGER_SESSION_PORT"); nested {
 		t.Skip("needs its own CLI session to forward telemetry to the sink")
@@ -1423,9 +1422,6 @@ func (AgentRuntimeSuite) TestRosterAddressingHostWorkspace(ctx context.Context, 
 		// temp-dir workspace root, so relative host paths resolve to it.
 		query  string
 		idPath string
-		// broken, when set, is why the runtime-identity assertions are
-		// skipped for this case.
-		broken string
 	}{
 		{
 			name:   "host directory workspace",
@@ -1436,9 +1432,6 @@ func (AgentRuntimeSuite) TestRosterAddressingHostWorkspace(ctx context.Context, 
 			name:   "session workspace",
 			query:  `{ currentWorkspace { id } }`,
 			idPath: "currentWorkspace.id",
-			broken: "known-broken: re-executing a recipe containing currentWorkspace " +
-				"mints a fresh workspace, so the rebuilt handle's agent value digest " +
-				"misses AgentRuntimes and projects IDLE; see async-agents.md §11.2 mode B",
 		},
 		{
 			name: "session workspace overlay",
@@ -1446,8 +1439,6 @@ func (AgentRuntimeSuite) TestRosterAddressingHostWorkspace(ctx context.Context, 
 				withNewFile(path: "probe.txt", contents: "probe") { id }
 			} }`,
 			idPath: "currentWorkspace.withNewFile.id",
-			broken: "known-broken: same as the bare session workspace -- the overlay is " +
-				"not the trigger, currentWorkspace is; see async-agents.md §11.2 mode B",
 		},
 	} {
 		t.Run(tc.name, func(ctx context.Context, t *testctx.T) {
@@ -1486,20 +1477,20 @@ func (AgentRuntimeSuite) TestRosterAddressingHostWorkspace(ctx context.Context, 
 			require.Contains(t, rebuiltID.Display(),
 				fmt.Sprintf(`agent(id: %q, name: %q)`, node.ID, "rostered"))
 
-			// Read off the chain's own literals, so these hold even when the
-			// handle addresses nothing. They are asserted anyway, precisely
-			// so the failure below cannot be mistaken for a mangled chain.
+			// Read off the chain's own literals. They are asserted before
+			// the runtime reads so a failure below cannot be mistaken for a
+			// mangled chain.
 			require.Equal(t, "rostered",
 				rebuilt.mustRun(ctx, t, `name`).Get("name").String())
 			require.Equal(t, node.ID,
 				rebuilt.mustRun(ctx, t, `instanceID`).Get("instanceID").String())
 
-			if tc.broken != "" {
-				t.Skip(tc.broken)
-			}
-
 			// Everything past here comes from the runtime registry rather
-			// than the recipe, which is what addressing has to reach.
+			// than the recipe, which is what addressing has to reach. It is
+			// the half the value-digest key could not deliver for a
+			// currentWorkspace-seeded agent: the rebuilt handle re-executes
+			// the chain, so only an identity that rides it as a literal —
+			// the instance ID — still names the live entry.
 			require.Equal(t, "FAILED", rebuilt.state(ctx, t))
 			transcript, _ := rebuilt.snapshot(ctx, t)
 			require.Contains(t, transcript, marker)
