@@ -190,6 +190,8 @@ class NewCodegenVisitor extends CodeWriter
             $phpReturnType = $this->resolveReturnType($returnType, $field);
             if ($returnType->isNonNull()) {
                 $method->setReturnNullable(false);
+            } elseif ($returnType->isObject() || $returnType->isInterface()) {
+                $method->setReturnNullable(true);
             }
             $method->setReturnType($phpReturnType);
         }
@@ -210,6 +212,18 @@ class NewCodegenVisitor extends CodeWriter
                 [$field->name]
             );
             $method->addBody('return $this;');
+        } elseif (!$returnType->isNonNull() && ($returnType->isObject() || $returnType->isInterface())) {
+            $method->addBody('$objectQueryBuilder = new \Dagger\Client\QueryBuilder(?);', [$field->name]);
+            $this->generateMethodArgsBody($method, $sortedArgs, 'objectQueryBuilder');
+            $method->addBody('$objectQueryBuilder->selectField(?);', ['id']);
+            $method->addBody('$id = $this->queryLeaf($objectQueryBuilder, ?);', ['id']);
+            $method->addBody('if ($id === null) {');
+            $method->addBody('    return null;');
+            $method->addBody('}');
+            $returnClassName = $this->resolveReturnClassName($returnType, $field);
+            $method->addBody(
+                'return $this->client->loadObjectFromId(' . $returnClassName . '::class, new \Dagger\Id((string)$id));'
+            );
         } elseif ($this->isLeafReturn($returnType, $field)) {
             // Scalar/list/enum return: use queryLeaf
             $method->addBody('$leafQueryBuilder = new \Dagger\Client\QueryBuilder(?);', [$field->name]);
@@ -287,6 +301,8 @@ class NewCodegenVisitor extends CodeWriter
             $phpReturnType = $this->resolveReturnType($returnType, $field);
             if ($returnType->isNonNull()) {
                 $method->setReturnNullable(false);
+            } elseif ($returnType->isObject() || $returnType->isInterface()) {
+                $method->setReturnNullable(true);
             }
             $method->setReturnType($phpReturnType);
         }
