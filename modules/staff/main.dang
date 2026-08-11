@@ -77,10 +77,6 @@ type Staff {
     it finishes, so you can pull the result with its authorship.
     """
     task: String!,
-    """
-    Optional model override for the worker; defaults to the session's model.
-    """
-    model: String = null,
   ): Staff! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): composes, starts, and messages a real agent runtime —
     # side effects that must actually run, never replay from cache.
@@ -92,11 +88,7 @@ type Staff {
     # (and its system prompt) never reaches a worker (a no-op when the
     # module isn't installed there).
     let composed = source.agents(exclude: ["staff"])
-    let base = if (model != null) {
-      composed.compose(base: llm(model: model).withWorkspace(source))
-    } else {
-      composed.compose
-    }
+    let base = composed.compose
     let worker = base
       # The line home, minted via a real self-call; the boss handle itself
       # stays out of the tool schema.
