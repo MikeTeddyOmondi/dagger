@@ -219,6 +219,27 @@ defmodule Dagger.Codegen.ElixirGenerator.ObjectRenderer do
         end
         """
 
+      field.type.kind in ["OBJECT", "INTERFACE"] ->
+        output_type = Formatter.format_output_type(field.type)
+        type_name = field.type.name
+
+        """
+        case Client.execute(#{module_var}.client, query_builder) do
+          {:ok, nil} -> {:ok, nil}
+          {:ok, id} ->
+            {:ok,
+             %#{output_type}{
+               query_builder:
+                 QB.query()
+                 |> QB.select("node")
+                 |> QB.put_arg("id", id)
+                 |> QB.inline_fragment("#{type_name}"),
+               client: #{module_var}.client
+             }}
+          error -> error
+        end
+        """
+
       true ->
         output_type = Formatter.format_output_type(field.type)
 
@@ -430,7 +451,8 @@ defmodule Dagger.Codegen.ElixirGenerator.ObjectRenderer do
       for arg <- optional_args do
         ["|> QB.maybe_put_arg(", ?", arg.name, ?", ~c",", render_maybe_put_arg(arg), ")"]
       end,
-      if TypeRef.is_list_of?(field.type, "OBJECT") or
+      if field.type.kind in ["OBJECT", "INTERFACE"] or
+           TypeRef.is_list_of?(field.type, "OBJECT") or
            TypeRef.is_list_of?(field.type, "INTERFACE") do
         ["|> QB.select(\"id\")"]
       else
