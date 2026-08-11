@@ -113,6 +113,7 @@ func (funcs goTemplateFuncs) FuncMap() template.FuncMap {
 		// interface support
 		"IsInterfaceType":          funcs.isInterfaceType,
 		"IsInterfaceRef":           funcs.isInterfaceRef,
+		"IsNullableObject":         funcs.isNullableObject,
 		"IsListOfInterface":        funcs.isListOfInterface,
 		"InterfaceClientName":      funcs.interfaceClientName,
 		"InterfaceReturnType":      funcs.interfaceReturnType,
@@ -405,7 +406,7 @@ func (funcs goTemplateFuncs) fieldFunction(f introspection.Field, topLevel bool,
 
 	// Generate arguments
 	args := []string{}
-	if f.TypeRef.IsScalar() || f.TypeRef.IsList() {
+	if f.TypeRef.IsScalar() || f.TypeRef.IsList() || funcs.isNullableObject(f.TypeRef) {
 		args = append(args, "ctx context.Context")
 	}
 	for _, arg := range f.Args {
@@ -457,6 +458,12 @@ func (funcs goTemplateFuncs) fieldFunction(f introspection.Field, topLevel bool,
 		retType = fmt.Sprintf("(*%s, error)", retType)
 	case f.TypeRef.IsScalar() || f.TypeRef.IsList():
 		retType = fmt.Sprintf("(%s, error)", retType)
+	case funcs.isNullableObject(f.TypeRef):
+		if funcs.isInterfaceRef(f.TypeRef) {
+			retType = fmt.Sprintf("(%s, error)", retType)
+		} else {
+			retType = fmt.Sprintf("(*%s, error)", retType)
+		}
 	case funcs.isInterfaceRef(f.TypeRef):
 		retType, err = funcs.interfaceReturnType(funcs.InnerType(f.TypeRef).Name, scopes...)
 		if err != nil {
@@ -490,6 +497,10 @@ func (funcs goTemplateFuncs) isInterfaceRef(t *introspection.TypeRef) bool {
 		}
 	}
 	return false
+}
+
+func (funcs goTemplateFuncs) isNullableObject(t *introspection.TypeRef) bool {
+	return t != nil && t.IsOptional() && (t.IsObject() || funcs.isInterfaceRef(t))
 }
 
 // isListOfInterface returns true if the type ref is a list whose element is an interface.
@@ -581,7 +592,7 @@ func (funcs goTemplateFuncs) interfaceMethodSignature(f introspection.Field) (st
 	sig := formatName(f.Name)
 
 	args := []string{}
-	if f.TypeRef.IsScalar() || f.TypeRef.IsList() {
+	if f.TypeRef.IsScalar() || f.TypeRef.IsList() || funcs.isNullableObject(f.TypeRef) {
 		args = append(args, "ctx context.Context")
 	}
 	for _, arg := range f.Args {
@@ -622,6 +633,12 @@ func (funcs goTemplateFuncs) interfaceMethodSignature(f introspection.Field) (st
 		sig += fmt.Sprintf(" (%s, error)", retType)
 	case f.TypeRef.IsScalar() || f.TypeRef.IsList():
 		sig += fmt.Sprintf(" (%s, error)", retType)
+	case funcs.isNullableObject(f.TypeRef):
+		if funcs.isInterfaceRef(f.TypeRef) {
+			sig += fmt.Sprintf(" (%s, error)", retType)
+		} else {
+			sig += fmt.Sprintf(" (*%s, error)", retType)
+		}
 	case funcs.isInterfaceRef(f.TypeRef):
 		retType, err = funcs.interfaceReturnType(funcs.InnerType(f.TypeRef).Name)
 		if err != nil {
@@ -643,7 +660,7 @@ func (funcs goTemplateFuncs) interfaceClientMethod(ifaceName string, f introspec
 	sig := "func (r *" + clientName + ") " + formatName(f.Name)
 
 	args := []string{}
-	if f.TypeRef.IsScalar() || f.TypeRef.IsList() {
+	if f.TypeRef.IsScalar() || f.TypeRef.IsList() || funcs.isNullableObject(f.TypeRef) {
 		args = append(args, "ctx context.Context")
 	}
 	for _, arg := range f.Args {
@@ -684,6 +701,12 @@ func (funcs goTemplateFuncs) interfaceClientMethod(ifaceName string, f introspec
 		sig += fmt.Sprintf(" (%s, error)", retType)
 	case f.TypeRef.IsScalar() || f.TypeRef.IsList():
 		sig += fmt.Sprintf(" (%s, error)", retType)
+	case funcs.isNullableObject(f.TypeRef):
+		if funcs.isInterfaceRef(f.TypeRef) {
+			sig += fmt.Sprintf(" (%s, error)", retType)
+		} else {
+			sig += fmt.Sprintf(" (*%s, error)", retType)
+		}
 	case funcs.isInterfaceRef(f.TypeRef):
 		retType, err = funcs.interfaceReturnType(funcs.InnerType(f.TypeRef).Name)
 		if err != nil {
