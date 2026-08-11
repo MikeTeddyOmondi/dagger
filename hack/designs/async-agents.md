@@ -109,12 +109,13 @@ per call and pins it into the returned handle's chain via the pure
 identity family (§8). The value itself stays a pure, content-addressed dagql
 value (seed conversation, minted instance ID, display name), and starting it
 registers a runtime entry — mailbox, loop goroutine on a detached context,
-computed state — in a session-scoped runtime table keyed by the value's
-digest. Because the digest contains the minted ID, every spawn gets a fresh
-entry: two spawns of one composition are two agents, and a stopped
-instance's slot can never be resolved to by a later spawn. `start` is
-`DoNotCache` and idempotent; `send` to an unstarted agent starts it
-(signal-with-start).
+computed state — in a session-scoped runtime table **keyed by that minted
+instance ID**. Every spawn therefore gets a fresh entry: two spawns of one
+composition are two agents, and a stopped instance's slot can never be
+resolved to by a later spawn. The key is the ID and nothing else, which is
+what lets a handle rebuilt from telemetry address the live entry even though
+re-executing its chain re-derives the seed (§10.2). `start` is `DoNotCache`
+and idempotent; `send` to an unstarted agent starts it (signal-with-start).
 
 The loop itself is today's `Loop`, with one change: **at each step boundary it
 drains the mailbox**, recording every drained message as `withPrompt`
@@ -380,11 +381,10 @@ So: blocking calls are the *verb*; `WAITING_INPUT` is the *view*.
   `ExitedService` (services.go:180). One deliberate divergence: Services
   *free* a running entry's registry key on exit (`delete(ss.running, key)`,
   services.go:1116–1137; tombstones go to a capped side list) precisely
-  because their keys are reusable composition digests. An agent's key
-  contains its spawn-minted instance ID — born unique, never reusable — so
-  the tombstone keeps the keyed slot harmlessly forever, and terminal stop
-  is the honest semantics of an instance (nobody asks to restart a k8s
-  UID).
+  because their keys are reusable composition digests. An agent's key IS
+  its spawn-minted instance ID — born unique, never reusable — so the
+  tombstone keeps the keyed slot harmlessly forever, and terminal stop is
+  the honest semantics of an instance (nobody asks to restart a k8s UID).
 - **`FAILED`** holds the completed prefix in `snapshot`; `resume` re-enters
   the loop from it — supervision-lite.
 - **Instances, not dedupe**: `LLM` *values* dedupe — identical chains are
@@ -715,10 +715,11 @@ core/integration/agent_runtime_test.go), ratified here:
   through the pure `LLM.agent(id:, name:)` lookup — extending the
   message-identity pattern (previous bullet) one level up — and, being
   imperative, returns `ID!` with `@expectedType` like every other verb.
-  The registry is untouched: keys are still content digests, they just
-  never collide now, so send-to-STOPPED-errors, seal ordering,
-  signal-with-start, resume-retries-FAILED, message pinning, tombstone
-  readability (now per-instance), and no-namespace all hold verbatim.
+  The registry keys on that minted ID directly (originally on the agent
+  value's content digest, which contained it; see §10.2 for why the digest
+  had to go), so send-to-STOPPED-errors, seal ordering, signal-with-start,
+  resume-retries-FAILED, message pinning, tombstone readability (now
+  per-instance), and no-namespace all hold verbatim.
   Renounced with it: attach-by-rederivation — two evaluations of the same
   composition are two agents, and observing a running agent requires
   holding its ID (§3.3's addressing model, now strengthened: IDs are
@@ -985,13 +986,14 @@ Semantics ratified during implementation:
 What is BUILT (see also §8 for ratified semantics):
 
 - **Core runtime**: `core/agent.go` (Agent value with spawn-minted
-  `InstanceID`, `AgentRuntimes` session registry keyed by content digest —
-  collision-free by construction, loop with mailbox drained at step
-  boundaries, tombstones), `core/schema/agent.go` (fields: `name`, `state`,
-  `snapshot`, `start`, `send`, `message`, `waitFor`, `pause`, `resume`,
-  `interrupt`, `stop`; `AgentMessage.{delivery,await}`; `AgentState`,
-  `AgentMessageDelivery`). Registry wiring in `engine/server/session.go`
-  alongside `Services`.
+  `InstanceID`, `AgentRuntimes` session registry keyed by that ID —
+  collision-free by construction, and stable across the re-execution a
+  telemetry-rebuilt handle performs (§10.2) — loop with mailbox drained at
+  step boundaries, tombstones), `core/schema/agent.go` (fields: `name`,
+  `state`, `snapshot`, `start`, `send`, `message`, `waitFor`, `pause`,
+  `resume`, `interrupt`, `stop`; `AgentMessage.{delivery,await}`;
+  `AgentState`, `AgentMessageDelivery`). Registry wiring in
+  `engine/server/session.go` alongside `Services`.
 - **Spawned instance identity**: `LLM.spawn(name)` mints a unique instance
   per call and pins it through the pure `LLM.agent(id:, name:)` lookup
   (§8), in `core/schema/llm.go`; name is display-only. `asAgent` is gone.
@@ -1332,21 +1334,26 @@ rather than being renumbered away:
     Fix, recommended: **reattach by instance ID** — make registry lookup
     session-independent, keyed on the spawn-minted `InstanceID` that already
     rides the pinned chain, so a resumed session finds the live entry instead
-    of minting one. It is the only option where resume means what a user
-    expects (the worker keeps running, and keeps its history), and §8 already
-    made that identity unforgeable and collision-free. It needs an owner for
-    the lifetime question §4 dodges: when does an agent outlive every session
-    that can see it? Runners-up: make imperative verbs in a restored chain
-    resolve to their recorded result (smaller, stops the duplicate work, but
-    leaves the chief holding corpses); or refuse to serialize a chain
-    containing an imperative verb at all — the honest stopgap, turning silent
-    duplicate work into a loud save-time failure. None landed: this is a hole
-    in §4's cross-session identity story rather than a defect in `send`, and
-    every option changes engine-wide semantics. Note the receiver-load
-    finding raises the stakes on the runner-up: resolving imperative verbs to
-    their recorded results also fixes the "a read revived it" case, which
-    reattach-by-instance-ID alone does not, since a reattached entry still
-    has to exist somewhere to be found.
+    of minting one. **Half of this has landed**: the registry now keys on
+    `InstanceID` (§10.2, fixing a different defect), so what remains is
+    purely the session-independence — the table is still allocated per
+    session, so a resumed session misses whatever the key is and
+    `GetOrCreate` still mints from `Seed`. It is the only option where resume
+    means what a user expects (the worker keeps running, and keeps its
+    history), and §8 already made that identity unforgeable and
+    collision-free. It needs an owner for the lifetime question §4 dodges:
+    when does an agent outlive every session that can see it? Runners-up:
+    make imperative verbs in a restored chain resolve to their recorded
+    result (smaller, stops the duplicate work, but leaves the chief holding
+    corpses); or refuse to serialize a chain containing an imperative verb at
+    all — the honest stopgap, turning silent duplicate work into a loud
+    save-time failure. Neither landed: this is a hole in §4's cross-session
+    identity story rather than a defect in `send`, and every option changes
+    engine-wide semantics. Note the receiver-load finding raises the stakes
+    on the runner-up: resolving imperative verbs to their recorded results
+    also fixes the "a read revived it" case, which reattach-by-instance-ID
+    alone does not, since a reattached entry still has to exist somewhere to
+    be found.
     Adjacent to item 12's note that a tombstone re-selected in a NEW session
     projects IDLE-from-absence with the seed as its snapshot, but distinct
     and worse: there the re-selection is inert, here it has side effects. The
@@ -1517,11 +1524,17 @@ rather than being renumbered away:
     ID-literal argument (impossible by construction — `mustBeRecipe` panics
     on one), and that `Query.host`'s single per-session emission goes missing
     (measured: the client's DB held two spans carrying that digest).
-    NOT resolved with it: **Mode B**, where the chain rebuilds completely and
-    the rebuilt handle then addresses a different, inert entry — `state`
-    reads `IDLE` while `name` and `instanceID` read back correctly, because
-    they are literals in the recipe. That is the live thread, it is blocked
-    on a decision rather than a measurement, and it lives in §10.2.
+    RESOLVED WITH IT: **Mode B**, where the chain rebuilds completely and the
+    rebuilt handle then addresses a different, inert entry — `state` reads
+    `IDLE` while `name` and `instanceID` read back correctly, because they
+    are literals in the recipe. Fixed by keying the runtime registry on the
+    spawn-minted `InstanceID` rather than the agent value's content digest;
+    §10.2 carries the reasoning, including why the capability objection to
+    that key dissolved on inspection. The live report that forced it also
+    corrected the symptom's description: a missed lookup is not inert,
+    because `send` creates through `GetOrCreate` — so focusing a worker and
+    prompting it started a SECOND loop from the seed, which answered with no
+    history, while the original kept running.
 
 ### 10.1 Notes for live QA
 
@@ -1545,13 +1558,15 @@ session by hand:
 - **Harvest inside the session that spawned the worker** (item 12): a
   tombstone re-selected later projects IDLE-from-absence with the seed as its
   snapshot, so harvest silently reports "nothing new" rather than failing.
-- **A worker you spawned this session may focus onto a CORPSE** (§10.2 mode
-  B). The loud read-only marker (`·` after the name) is fixed as of the
-  call-payload channel, so an entry that renders normally can still address
-  nothing: `state` reads `IDLE` while the worker is really running or failed,
-  and `name` reads back correctly because it is a literal. The tell is a
-  state that disagrees with what `staff.status` says. Nothing is wrong with
-  the worker: steer and harvest it through the chief's tools as usual.
+- **A worker you focus from the roster addresses the live runtime** (§10.2).
+  Both failure modes are fixed: the loud one (a read-only `·` after the name,
+  "cannot be addressed") by the call-payload log channel, and the silent one
+  (an entry that renders normally but reads `IDLE` while the worker is really
+  running) by keying the registry on the instance ID. If you see either again
+  — especially a focused agent whose state disagrees with `staff.status`, or a
+  prompt that lands in a conversation with no history while the original loop
+  keeps going — that is a regression worth reporting, not the known condition
+  it used to be.
 - **On an engine built before item 14's fix, a worker's commit may be
   unpullable.** Any commit after the first in a session records a
   first-touched path as a whole-file ADD, and both `pull` and `pullConflicted`
@@ -1582,13 +1597,15 @@ session by hand:
 
 ### 10.2 Handoff: fixing roster switching
 
-**STATUS.** MODE A (the loud "never reached this client") is FIXED, tested and
-explained below — a recurrence is a bug report, not an expected condition.
-MODE B (the silent IDLE-from-absence) is untouched and is the only thing left
-here; it is blocked on an owner's decision between (a)/(b)/(c) below, not on
-another measurement. If you are picking this up to test a TUI fix: switching
-to a worker whose seed carries `currentWorkspace` will STILL land on an inert
-IDLE handle, and that is Mode B, expected, not a regression of the fix.
+**STATUS.** Both modes are FIXED. MODE A (the loud "never reached this
+client") was resolved by the call-payload log channel, explained below. MODE B
+(the silent IDLE-from-absence) was resolved by keying the runtime registry on
+the spawn-minted `InstanceID` instead of the agent value's content digest —
+option (a) below, taken after the security objection to it dissolved on
+inspection. A recurrence of either is a bug report, not an expected condition.
+Switching to a worker whose seed carries `currentWorkspace` now lands on the
+live runtime; `TestRosterAddressingHostWorkspace` covers all three workspace
+shapes with no skips.
 
 Written at the end of a session that investigated ONLY this, so the next one
 does not re-derive it. Everything below is about **switching between agents in
@@ -1616,59 +1633,113 @@ first thing to do with any new report, because they need opposite fixes:
   then addresses a different, inert entry: `state` reads `IDLE` while the live
   runtime is something else, and `name`/`instanceID` read back CORRECTLY
   because they are literals in the recipe and never touch the registry. A
-  handle that looks healthy and points at nothing. **Root-caused and
-  measured, NOT fixed** — it is the only one of the two still open, and what
-  it needs is a decision, not a measurement.
+  handle that looks healthy and points at nothing. **ROOT-CAUSED AND FIXED**
+  — see "Mode B: resolved" below.
 
-**Mode B: the mechanism, settled.** `AgentRuntimes` keys entries on the
+**Mode B: the mechanism, settled.** `AgentRuntimes` keyed entries on the
 agent VALUE's content digest (`agentKey` → `ContentPreferredDigest`,
-core/agent.go:226-232). A telemetry-rebuilt ID is the RECIPE form (§8), so
-using it RE-EXECUTES the chain — and `Query.currentWorkspace` is
-`NotReplayable` with `PerCallInput`/`PerSessionInput`
-(core/schema/workspace.go:35-40), i.e. deliberately mints a fresh value every
-evaluation. Fresh workspace → different Seed → different digest → different
-key → lookup miss. The miss is invisible because `Get` never creates and
-IDLE-with-seed-snapshot is the honest projection of a never-started agent, so
-absence and freshness are indistinguishable by construction. Measured
-contrast: the same test PASSES with `host.directory(…).asWorkspace()`, which
-is replayable and digest-stable, and FAILS with a bare `currentWorkspace`
-carrying NO overlay — so the sparse-overlay machinery is NOT involved,
-`currentWorkspace` alone is. This generalizes: ANY non-replayable or
-per-session leaf anywhere in a composition breaks rebuild-addressing the same
-way.
+core/agent.go). A telemetry-rebuilt ID is the RECIPE form (§8), so using it
+RE-EXECUTES the chain — and `Query.currentWorkspace` is `NotReplayable` with
+`PerCallInput`/`PerSessionInput` (core/schema/workspace.go:35-40), i.e.
+deliberately mints a fresh value every evaluation. Fresh workspace → different
+Seed → different digest → different key → lookup miss. The miss is invisible
+because `Get` never creates and IDLE-with-seed-snapshot is the honest
+projection of a never-started agent, so absence and freshness are
+indistinguishable by construction. Measured contrast: the same test PASSES
+with `host.directory(…).asWorkspace()`, which is replayable and digest-stable,
+and FAILS with a bare `currentWorkspace` carrying NO overlay — so the
+sparse-overlay machinery is NOT involved, `currentWorkspace` alone is. This
+generalizes: ANY non-replayable or per-session leaf anywhere in a composition
+broke rebuild-addressing the same way.
 
-**Mode B: the decision that blocks the fix.** It is not "pick a map key", it
-is "decide what authority to address an agent means", so it wants an owner.
-Today's whole-value digest doubles as proof of possession: you can only
-address a runtime by presenting the entire composition, which is §3.3's
-capability model and §8's "IDs are unforgeable". Options:
+**Mode B is not inert — it MANUFACTURES an agent.** The account above (and
+this section's original "addresses a corpse" framing) understated the damage,
+and a live report is what corrected it. Reads stop at the miss, but `send`
+does not: it goes through `GetOrCreate` (core/agent.go) and then
+signal-with-starts what it created. So focusing a worker and typing at it
+**booted a second loop from the seed**, which received the message with no
+history and answered accordingly, while the original loop kept stepping
+untouched. Both loops publish the same `dagger.io/agent.id` — it is a literal
+on the chain — so the roster showed ONE entry, and the whole thing read as a
+single agent behaving bizarrely rather than as two runtimes. Any future
+registry-miss bug should be assumed generative, not merely blind: on this path
+a miss is a constructor.
 
-- **(a) Key on `InstanceID`.** Simplest, and it survives any leaf — the ID is
-  minted at spawn, unique by construction, and already rides the pinned chain
-  as a literal (which is exactly why `instanceID` reads back correctly today).
-  Cost: `InstanceID` is PUBLISHED in telemetry as `dagger.io/agent.id`, so
-  addressing degrades from "hold the composition" to "know a published
-  string" — anyone who can read the trace could build
-  `someUnrelatedLLM.agent(id: "…", name: "…")` onto a live runtime with a
-  foreign seed.
-- **(b) Key on `InstanceID`, put authority in another layer** — the spawning
-  session, or the ownership flag the CLI already carries (§10 slice 2).
-- **(c) Make the replay digest-stable instead**, by pinning the workspace into
-  the chain rather than re-deriving it. Nobody has evaluated this. It is the
-  only option that costs nothing security-wise, because the capability
-  property survives intact; it conflicts with `currentWorkspace` being
-  deliberately live, and that conflict is what needs examining.
+**Mode B: resolved — the registry keys on `InstanceID`.** Option (a) below,
+and what settled it was noticing that its stated cost does not exist. The
+objection was that the whole-value digest doubles as proof of possession
+("you can only address a runtime by presenting the entire composition",
+§3.3's capability model), while `InstanceID` is PUBLISHED as
+`dagger.io/agent.id`. But the composition is published too, and by the same
+channel: §10.2's own Mode A fix emits the TRANSITIVE CLOSURE of every call's
+ID as log records precisely so that a client can rebuild the full recipe from
+the trace — that IS the roster feature. Both the digest and the ID come out of
+the trace, so keying on either draws the capability boundary in exactly the
+same place: *can you read this session's telemetry*. The digest was never the
+stronger secret; it was only the more fragile one. And the ID is engine-minted
+entropy (`identity.NewID()` in `LLM.spawn`), scoped to a session-local
+registry, so it is a serviceable capability token on its own terms.
+
+That also **dissolves the question this section said would decide between (a)
+and (c)** — whether a module can enumerate the parent session's agent IDs from
+the trace. It no longer decides anything: anything that can read the IDs can
+read the compositions, so (a) and the status quo have identical exposure. The
+question is worth answering for its own sake, but it does not block this.
+
+What the change is, concretely: `agentKey` returns `agent.Self().InstanceID`
+rather than `ContentPreferredDigest`, and `AgentRuntimes.entries` /
+`AgentRuntime.key` / `AgentMessage.AgentKey` are strings. Two consequences
+worth stating because they are now load-bearing:
+
+- **The seed is read only when the entry is CREATED.** A later handle for the
+  same instance addresses the entry as it stands; its own re-derived seed is
+  never consulted and cannot displace the conversation the loop has been
+  building. That is what makes a rebuilt handle safe to *use* rather than
+  merely safe to construct — it names an instance, it does not redefine one.
+- **An empty instance ID is rejected** rather than silently sharing one key.
+  `LLM.agent(id: "")` is the only way to build such a value, and under digest
+  keying it was harmless; under ID keying it would be a collision, so
+  `agentKey` errors.
+
+Measured fail-first, as §10.1 demands: with the digest key restored,
+`TestRosterAddressingHostWorkspace` fails `expected: "FAILED", actual: "IDLE"`
+on both `currentWorkspace` cases and passes the `host.directory` one —
+reproducing this section's table exactly. With the ID key, all three pass, and
+the failing run's trace shows why in one glance: each read off the rebuilt
+handle re-executes `LLM.withWorkspace(workspace: currentWorkspace)` afresh
+while `LLM.agent(id: "m39gowtw3zfw4e71g5ta490jp", …)` carries the identical ID
+literal every time.
+
+**Not fixed by this, deliberately.** Item 13 (a session restart re-animating
+workers) is a different defect and survives: the registry is still
+per-SESSION, so a resumed session's lookup misses whatever the key is, and
+`GetOrCreate` still mints from `Seed`. Item 13's recommended fix was
+"reattach by instance ID — make registry lookup session-independent, keyed on
+the spawn-minted `InstanceID`"; this lands the keying half only. The
+session-independence half is what opens §4's unanswered lifetime question
+(when does an agent outlive every session that can see it?), and it still
+needs an owner.
 
 **Do not "keep the digest as a corroborating check".** It was proposed and it
 does not work: the rebuilt recipe's digest legitimately differs, which is the
 entire defect, so any check strong enough to be security-relevant also
 rejects the legitimate rebuild it was added to enable.
 
-**The fact that decides between (a) and (c)**, and it is a much smaller job
-than either fix: can a module enumerate the PARENT session's agent IDs from
-the trace? If it cannot, (a)'s exposure is close to theoretical, since the
-registry and the telemetry are both session-scoped and an attacker is already
-inside the session. Unestablished.
+**The options as they stood**, kept because the reasoning is reusable:
+
+- **(a) Key on `InstanceID`** — TAKEN. Survives any leaf: the ID is minted at
+  spawn, unique by construction, and already rides the pinned chain as a
+  literal (which is exactly why `instanceID` read back correctly even while
+  broken). Its stated cost dissolved, per above.
+- **(b) Key on `InstanceID`, put authority in another layer** — the spawning
+  session, or the ownership flag the CLI already carries (§10 slice 2). Still
+  available if addressing ever needs to be narrower than "can read the trace";
+  (a) does not foreclose it.
+- **(c) Make the replay digest-stable instead**, by pinning the workspace into
+  the chain rather than re-deriving it. Not pursued: it conflicts with
+  `currentWorkspace` being deliberately live, and it fixes only the leaves
+  anyone thought to pin, where (a) is indifferent to what the composition
+  contains.
 
 **Mode A: what is ruled out, so it is not re-derived.** The hypothesis that
 `Query.host`'s single per-session telemetry emission goes missing was
@@ -1759,45 +1830,31 @@ this REFUTES the "reproduce through a module call" measurement this section
 used to recommend: nested-session spans ARE forwarded, so a module-built
 chain was never the problem.
 
-**The Mode B probe test.** `TestRosterAddressingHostWorkspace` is
+**The Mode B regression test.** `TestRosterAddressingHostWorkspace` is
 `TestRosterAddressing` plus a host-backed workspace bound via
 `spawnOpts.wsID`, with the session pointed at a temp-dir git repo via
 `dagger.WithWorkdir`, in three cases:
 
-| case | workspace | result |
-|---|---|---|
-| session workspace | `currentWorkspace` | FAIL |
-| session workspace overlay | `currentWorkspace.withNewFile(…)` | FAIL |
-| host directory workspace | `host.directory(workdir).asWorkspace()` | PASS |
-| baseline | none (`TestRosterAddressing`) | PASS |
+| case | workspace | before | after |
+|---|---|---|---|
+| session workspace | `currentWorkspace` | FAIL | pass |
+| session workspace overlay | `currentWorkspace.withNewFile(…)` | FAIL | pass |
+| host directory workspace | `host.directory(workdir).asWorkspace()` | pass | pass |
+| baseline | none (`TestRosterAddressing`) | pass | pass |
 
-The failure is `expected: "FAILED", actual: "IDLE"` on the rebuilt handle's
+The failure was `expected: "FAILED", actual: "IDLE"` on the rebuilt handle's
 state — Mode B. `withNewFile` is the workspace edit verb
 (core/schema/workspace.go:130). The nested-session skip does NOT trigger under
 the engine-dev test container, which sets `_EXPERIMENTAL_DAGGER_RUNNER_HOST`
 rather than `DAGGER_SESSION_PORT`, so these tests really run there.
 
-It lives in `core/integration/agent_runtime_test.go`, and a run against a
-from-source engine reproduced that table exactly, failure message included.
-Two things about its shape, because they are the reason it can sit in a green
-tree:
-
-- **The assertions are split at the seam, not skipped wholesale.** Everything
-  through the rebuild and the literal-derived identity (`name`, `instanceID`)
-  RUNS in all three cases — that half is genuine Mode A coverage, and it
-  passing is the measurement that says a workspace in the seed does not break
-  the walk. Only the runtime-identity assertions past it (`state`, the
-  transcript marker, the QUEUED send) are skipped for the two
-  `currentWorkspace` cases, with a `known-broken:` message naming this
-  section — the convention item 15 set. Note a mid-test `t.Skip` does not
-  hide earlier failures: the test still reports FAIL if anything before it
-  failed.
-- **To re-measure the defect, delete the skip.** The assertions it guards are
-  the CORRECT expectations, so when the registry stops keying on the value
-  digest the whole change here is removing three lines. Nothing in the test
-  asserts the broken behaviour, deliberately: an assertion adjusted until it
-  passes would have to be un-adjusted by exactly the person least able to
-  tell it apart from intent.
+It lives in `core/integration/agent_runtime_test.go`. The `known-broken:`
+skips it used to carry are gone, along with the `broken` table column — the
+assertions past the rebuild (`state`, the transcript marker, the QUEUED send)
+were written as the CORRECT expectations precisely so that fixing the registry
+would be a deletion, and it was. Everything before that seam — the rebuild
+itself and the literal-derived identity (`name`, `instanceID`) — remains Mode
+A coverage and always passed.
 
 **One hazard for whoever picks this up.** Do not open the investigation by
 calling a `modules/staff` tool on a resumed session (§10.1, item 13) — it
