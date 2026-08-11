@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import javax.lang.model.element.Modifier;
 
@@ -51,6 +52,9 @@ class InterfaceVisitor extends AbstractVisitor {
                 .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT);
 
         TypeName returnType = resolveReturnType(field);
+		if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
+		  returnType = ParameterizedTypeName.get(ClassName.get(Optional.class), returnType);
+		}
         methodBuilder.returns(returnType);
 
         // Add parameters for required args
@@ -128,6 +132,10 @@ class InterfaceVisitor extends AbstractVisitor {
             .addAnnotation(Override.class);
 
     TypeName returnType = resolveReturnType(field);
+	TypeName objectReturnType = returnType;
+	if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
+	  returnType = ParameterizedTypeName.get(ClassName.get(Optional.class), returnType);
+	}
     fieldMethodBuilder.returns(returnType);
 
     List<ParameterSpec> mandatoryParams =
@@ -192,8 +200,22 @@ class InterfaceVisitor extends AbstractVisitor {
           .addException(InterruptedException.class)
           .addException(ExecutionException.class)
           .addException(ClassName.get("io.dagger.client.exception", "DaggerQueryException"));
+    } else if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
+      String graphqlTypeName = field.getTypeRef().getTypeName();
+      String clientClassName = field.getTypeRef().isInterface()
+          ? graphqlTypeName + "Client" : objectReturnType.toString();
+      fieldMethodBuilder.addStatement(
+          "QueryBuilder objectQueryBuilder = nextQueryBuilder.executeNullableObjectQuery($S)",
+          graphqlTypeName);
+      fieldMethodBuilder.addStatement(
+          "return Optional.ofNullable(objectQueryBuilder).map(qb -> new $L(qb))",
+          ClassName.bestGuess(clientClassName));
+      fieldMethodBuilder
+          .addException(InterruptedException.class)
+          .addException(ExecutionException.class)
+          .addException(ClassName.get("io.dagger.client.exception", "DaggerQueryException"));
     } else if (field.getTypeRef().isObjectOrInterface()) {
-      TypeName objectType = resolveReturnType(field);
+      TypeName objectType = objectReturnType;
       // For interface return types, instantiate the client class
       if (field.getTypeRef().isInterface()) {
         fieldMethodBuilder.addStatement(
@@ -240,7 +262,7 @@ class InterfaceVisitor extends AbstractVisitor {
     if (Helpers.isIdToConvert(field)) {
       return true;
     }
-    if (field.getTypeRef().isObjectOrInterface()) {
+    if (field.getTypeRef().isObjectOrInterface() && !field.getTypeRef().isOptional()) {
       return false;
     }
     return true; // scalar fields need exceptions
