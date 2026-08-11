@@ -271,7 +271,12 @@ public class CodeRenderer : ICodeRenderer
             return true;
         }
 
-        return field.Type.IsLeaf() || field.Type.IsList();
+        return field.Type.IsLeaf() || field.Type.IsList() || IsNullableObject(field.Type);
+    }
+
+    private static bool IsNullableObject(TypeRef type)
+    {
+        return type.Kind != "NON_NULL" && type.IsObjectOrInterface();
     }
 
     /// <summary>
@@ -451,6 +456,11 @@ public class CodeRenderer : ICodeRenderer
             return $"async Task<{type.GetTypeName()}>";
         }
 
+        if (IsNullableObject(type))
+        {
+            return $"async Task<{type.GetTypeName()}?>";
+        }
+
         return type.GetTypeName();
     }
 
@@ -496,6 +506,16 @@ public class CodeRenderer : ICodeRenderer
         {
             var typeName = type.GetType_().OfType!.GetTypeName();
             return $"await QueryExecutor.ExecuteListAsync<{typeName}>(GraphQLClient, queryBuilder, cancellationToken)";
+        }
+
+        if (IsNullableObject(type))
+        {
+            var typeName = type.GetType_().Name;
+            var formattedName = Formatter.FormatType(typeName);
+            var clientClassName = InterfaceTypeNames.Contains(typeName)
+                ? $"{formattedName}Client"
+                : formattedName;
+            return $"await QueryExecutor.ExecuteNullableObjectAsync(GraphQLClient, queryBuilder, id => new {clientClassName}(Object.NodeQueryBuilder(id.Value, \"{typeName}\"), GraphQLClient), cancellationToken)";
         }
 
         // For interface return types, use the client class

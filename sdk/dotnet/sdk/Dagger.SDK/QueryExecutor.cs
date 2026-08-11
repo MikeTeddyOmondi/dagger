@@ -48,6 +48,36 @@ public static class QueryExecutor
             .ToArray();
     }
 
+    /// <summary>
+    /// Execute a nullable object selection and load the returned object by ID.
+    /// </summary>
+    public static async Task<T?> ExecuteNullableObjectAsync<T>(
+        GraphQLClient client,
+        QueryBuilder queryBuilder,
+        Func<Id, T> objectFactory,
+        CancellationToken cancellationToken = default
+    ) where T : class
+    {
+        var idQueryBuilder = queryBuilder.Select("id");
+        var jsonElement = await RequestAsync(client, idQueryBuilder, cancellationToken);
+
+        foreach (var field in idQueryBuilder.Path)
+        {
+            if (jsonElement.ValueKind == JsonValueKind.Null)
+            {
+                return null;
+            }
+            jsonElement = jsonElement.GetProperty(field.Name);
+        }
+
+        if (jsonElement.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+
+        return objectFactory(jsonElement.Deserialize<Id>()!);
+    }
+
     private static async Task<JsonElement> RequestAsync(
         GraphQLClient client,
         QueryBuilder queryBuilder,
