@@ -27,6 +27,17 @@ Workflow:
   engine; then re-run your repro with `dagger`.
 - `engineTest(pkg, run)` runs engine tests with their own ephemeral engine (no
   `start` needed), e.g. pkg "./core/integration" with run "TestSuite/TestSub".
+- `dumpId(file, ...)` builds and runs the repo's own `cmd/dump-id` against a
+  file in your workspace — no engine session needed. `file` is a
+  workspace-relative path to a base64 call ID or a saved-session JSON file
+  (the `llm_id` field is extracted for you), so a `~/.config/dagger` save
+  copied into the tree can be inspected directly. Modes mirror the command's
+  flags: `stats` (per-field counts, chain depth, expansion/re-execution
+  counts — the mode for "why did this recipe run that call N times?"), `tree`,
+  `json`, `find` (regexp over Type.field names), `diff` (structural diff
+  against a second recipe file), plus `lit`/`spine`/`depth` for verbosity and
+  `limit` to cap the returned lines. The binary is rebuilt from your current
+  tree, so edits to cmd/dump-id take effect immediately.
 - Engine logs: ListServices shows the engine service's span ids;
   ReadLogs(span, grep, limit) reads them — the equivalent of
   `docker logs dagger-engine.dev | grep`.

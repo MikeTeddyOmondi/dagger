@@ -22,6 +22,9 @@
 #     defined in cmd/engine/debug.go).
 #   - `engineTest`: run engine tests via the engine-dev toolchain (spins its
 #     own ephemeral engine; independent of `start`).
+#   - `dumpId`: build and run the repo's own `cmd/dump-id` against a file in
+#     the workspace — recipe forensics on a saved session's `llm_id`, with no
+#     engine needed.
 #
 # Engine log access deliberately has no tool here: the engine service's spans
 # are discoverable via ListServices, and ReadLogs(span: ..., grep: ...) reads
@@ -284,6 +287,88 @@ type EngineLab {
     engineDev(ws: source).test(pkg: pkg, run: run, testVerbose: testVerbose)
   }
 
+  """
+  Compile and run `./cmd/dump-id` from the workspace source: decode a dagql
+  call ID (a "recipe") and report on it.
+
+  `file` is a workspace-relative path to a file holding a base64 call ID, or a
+  saved-session JSON file — the `llm_id` field is extracted automatically, so
+  a session save file can be passed straight in. Modes match the command's own
+  flags; with none, the human-readable idtui dump is printed.
+
+  The binary is compiled from the CURRENT workspace on every call, so edits to
+  cmd/dump-id take effect immediately. No engine session is needed.
+  """
+  dumpId(
+    source: Workspace!,
+    """
+    Workspace-relative path to the input: a file containing a base64 call ID,
+    or a saved-session JSON file, e.g. "testdata/after.json".
+    """
+    file: String!,
+    """
+    Emit per-field counts, chain depth and expansion (re-execution) counts —
+    the mode for "how many times does this recipe run that call?".
+    """
+    stats: Boolean! = false,
+    """
+    Emit the receiver spine, with ID-valued arguments expanded inline.
+    """
+    tree: Boolean! = false,
+    """
+    Emit the decoded callpbv1.DAG as structured JSON (lossless, and large).
+    """
+    json: Boolean! = false,
+    """
+    Emit every call whose Type.field name matches this regexp, e.g. "spawn".
+    """
+    find: String! = "",
+    """
+    Structurally diff the input recipe against the recipe in this file (also
+    workspace-relative, also session-JSON-aware).
+    """
+    diff: String! = "",
+    """
+    Truncate literal values to this many characters (0 = no truncation).
+    """
+    lit: Int! = 72,
+    """
+    Show at most this many trailing receiver selectors in a path (0 = all).
+    """
+    spine: Int! = 12,
+    """
+    In `tree`, only recurse this many levels into ID arguments (0 = unlimited).
+    """
+    depth: Int! = 0,
+    """
+    Keep at most this many lines of output (0 = unlimited).
+    """
+    limit: Int! = 300,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    let args: [String!]! = []
+    if (stats) { args += ["-stats"] }
+    if (tree) { args += ["-tree"] }
+    if (json) { args += ["-json"] }
+    if (find != "") { args += ["-find", find] }
+    if (diff != "") { args += ["-diff", diff] }
+    args += [
+      "-lit", toString(lit),
+      "-spine", toString(spine),
+      "-depth", toString(depth),
+      file,
+    ]
+
+    let out = goEnv(source)
+      # The build is deliberately NOT nonce-busted: it is a pure function of
+      # the mounted source, so an unchanged tree replays from the exec cache
+      # and only the run below actually re-executes.
+      .withExec(["go", "build", "-o", "/usr/local/bin/dump-id", "./cmd/dump-id"])
+      .withEnvVariable("ENGINE_LAB_NONCE", Random.string)
+      .withExec(["dump-id"] + args)
+      .stdout
+    clip(out, limit)
+  }
+
   # A self-call (`engineLab`) yields the module's own type as it lives in the
   # runtime schema — a Dagger.EngineLab, which carries a GraphQL id and
   # implements Node. Declaring the return as Dagger.EngineLab! (rather than
@@ -321,5 +406,39 @@ type EngineLab {
 
   let debugURL(path: String!): String! {
     "http://dagger-engine:" + toString(debugPort) + path
+  }
+
+  # A Go toolchain with the caller's CURRENT workspace mounted at /src, for
+  # building the repo's own commands (cmd/dump-id today).
+  #
+  # engine-dev's goContainer is the same base the repo's golang toolchain uses
+  # (dagger.toml: `base = "engine-dev:go-container"`), so the Go version always
+  # matches go.mod without this module pinning one of its own. The module and
+  # build caches are cache volumes, so only the first build pays for them.
+  let goEnv(source: Workspace!): Container! {
+    engineDev(ws: source)
+      .goContainer
+      .withEnvVariable("GOMODCACHE", "/go/pkg/mod")
+      .withMountedCache("/go/pkg/mod", cacheVolume("engine-lab-gomodcache"))
+      .withEnvVariable("GOCACHE", "/go/build-cache")
+      .withMountedCache("/go/build-cache", cacheVolume("engine-lab-gobuildcache"))
+      .withMountedDirectory(defaultWorkdir, source.directory("/"))
+      .withWorkdir(defaultWorkdir)
+  }
+
+  # Head-truncate a report to keep tool results context-friendly. Head, not
+  # tail: dump-id's modes lead with what a caller came for (the stats totals,
+  # the tree's root spine, the first matches), unlike the exec output the rest
+  # of this module returns, where the error is at the end.
+  let clip(s: String!, lines: Int!): String! {
+    let all = s.split("\n")
+    if (lines <= 0 or all.length <= lines) {
+      s
+    } else {
+      let dropped = toString(all.length - lines)
+      all.takeFirst(lines).join("\n")
+        + "\n… (" + dropped + " more lines truncated; raise `limit`, or narrow"
+        + " the report with `find`/`spine`/`depth`) …"
+    }
   }
 }
