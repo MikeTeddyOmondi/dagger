@@ -1562,6 +1562,17 @@ session by hand:
   that. That inference was made here, believed, written into this section as
   fact before a human caught it, and cost the investigation several sessions
   by pointing it at tracked-ness instead of at the diff anchor.
+- **Do not brief workers as read-only.** Observed live: a chief told its staff
+  the workspace was read-only, so the workers spent their turns investigating
+  and writing prose patches the chief then had to apply by hand — the exact
+  cost the per-worker `Workspace` exists to avoid. Isolation (§8.1) is what
+  makes editing SAFE, not a reason to avoid it: a worker's copy is read-write,
+  nothing it does escapes until a `pull`/`pullPending`, and a commit is the
+  handoff that keeps its authorship. Both prompts now say so outright
+  (`chiefPrompt`: never tell a worker to avoid editing; `workerPrompt`: the
+  workspace is yours, commit what you finish), and `spawn`'s own doc string
+  says it too, since that is what the chief reads at call time. When briefing
+  a worker by hand, hand it the change, not a research assignment.
 - **A green test run against the wrong branch is worth exactly nothing.**
   Item 14 survived a confirmation experiment for several sessions because the
   fixture staged exactly one commit and so never reached the branch that was

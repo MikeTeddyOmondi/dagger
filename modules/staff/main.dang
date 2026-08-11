@@ -50,13 +50,18 @@ type Staff {
   }
 
   """
-  Hire a worker: spawn a named agent bound to your workspace and start it on
-  a task, in the background.
+  Hire a worker: spawn a named agent with its OWN read-write copy of your
+  workspace and start it on a task, in the background.
 
   Returns immediately — the worker runs its opening turn asynchronously.
   Check on it with status/read, steer it with sendTo/ask, harvest it with
   collect, let it go with dismiss. The worker has your same workspace tools,
   none of your staff tools, and one extra: askChief, its line back to you.
+
+  Its copy is a sandbox: whatever it edits, breaks or commits stays there
+  until you harvest it, and reaches neither you nor any other worker. So
+  hand it the change itself, not read-only investigation it has to write
+  back to you in prose.
   """
   spawn(
     chief: Agent!,
@@ -67,7 +72,9 @@ type Staff {
     name: String!,
     """
     The worker's opening task. Make it self-contained: the worker starts
-    with none of your conversation context.
+    with none of your conversation context. Ask for the work itself — it can
+    edit, run checks and commit in its own copy — and tell it to commit what
+    it finishes, so you can pull the result with its authorship.
     """
     task: String!,
     """
@@ -888,8 +895,9 @@ type Staff {
     run in the background: spawn returns immediately, and the worker chews
     on its task while you keep working.
 
-    - `spawn` hires a named worker bound to your workspace and starts it on
-      a task. Names are unique; every other tool addresses workers by name.
+    - `spawn` hires a named worker with its own read-write copy of your
+      workspace and starts it on a task. Names are unique; every other tool
+      addresses workers by name.
     - `sendTo` steers a worker without blocking (returning the delivery
       evidence); `ask` sends and WAITS for the reply of the turn that
       consumes the message.
@@ -900,8 +908,17 @@ type Staff {
       paused); a later sendTo/ask resumes it. `dismiss` stops and removes a
       worker for good.
 
-    Workers edit and commit in their OWN copy of the workspace. Nothing they
-    do reaches yours until you harvest it:
+    A worker's copy is a SANDBOX, not a read-only view: it can edit, create,
+    delete, run checks and commit exactly as freely as you can, and none of
+    it reaches your workspace or any other worker's until you harvest it.
+    Delegate the work itself, not a report about it. Never tell a worker to
+    avoid editing, to treat the workspace as read-only, or to hand you a
+    patch in prose — that throws away the isolation that makes workers worth
+    hiring, and leaves you to redo the change by hand. Tell each worker to
+    COMMIT what it finishes: a commit is the clean handoff, and uncommitted
+    work is only the fallback.
+
+    Harvesting is how their work reaches you:
 
     - `logOf` lists a worker's staged commits, each annotated with what
       `pull` would do with it; `diffOf` shows one commit's patch, or the
@@ -948,6 +965,23 @@ type Staff {
     task autonomously to completion with the available tools. The chief
     reads results from your conversation and collects your final reply, so
     end each task with a concise, self-contained report.
+
+    THE WORKSPACE IS YOURS. It is a private read-write copy — not the
+    chief's, not shared with any other worker. Edit, create, delete, run
+    checks and commit as freely as the task needs: nothing you do disturbs
+    anyone else's workspace, and no change of yours reaches the chief until
+    it deliberately harvests one. So do the work rather than describing it.
+    Never treat the workspace as read-only, never ask permission to make an
+    edit the task already implies, and never stop at proposing a patch you
+    could have applied. Experiments are cheap here: try the change, run the
+    checks, keep what works.
+
+    COMMIT WHAT YOU FINISH, in focused commits with clear messages — that is
+    the clean handoff, and the chief takes those commits with your
+    authorship intact. Genuinely unfinished work can stay uncommitted (the
+    chief can still rescue it), but do not leave finished work sitting as
+    pending edits. Say in your final report what you changed and which
+    commits carry it.
 
     You have one line home: `askChief` sends the chief a question and BLOCKS
     until the chief's turn that absorbs it ends, returning that turn's
