@@ -155,7 +155,7 @@ cache_volume = Object(
         (NonNull(Scalar("FileID")), "FileID"),
         (Scalar("FileID"), "FileID | None"),
         (NonNull(cache_volume), "CacheVolume"),
-        (cache_volume, "CacheVolume"),
+        (cache_volume, "CacheVolume | None"),
         (List(NonNull(cache_volume)), "list[CacheVolume]"),
         (List(cache_volume), "list[CacheVolume | None]"),
     ],
@@ -283,6 +283,22 @@ def test_core_sync(ctx: Context):
 
     assert str(handler.func_body()).endswith(
         'return await self._ctx.execute_sync(self, "sync", _args)'
+    )
+
+
+def test_nullable_object_field():
+    git_ref = Object("GitRef", {"id": Field(NonNull(GraphQLID))})
+    repository = Object("GitRepository", {})
+    handler = _ObjectField(
+        Context(),
+        "latestVersion",
+        Field(git_ref),
+        repository,
+    )
+
+    assert handler.func_signature() == "async def latest_version(self) -> GitRef | None:"
+    assert str(handler.func_body()).endswith(
+        "return await _ctx.execute_object(GitRef)"
     )
 
 

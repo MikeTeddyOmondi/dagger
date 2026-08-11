@@ -514,11 +514,21 @@ def format_output_type(
     legacy_ids: bool = False,
 ) -> str:
     """May be used as the output type of an object field."""
-    # When returning objects we're in query building mode, so don't return
-    # None even if the field's return is optional.
-    if not is_output_leaf_type(t) and not is_required_type(t):
+    # Lists of objects already execute eagerly and keep their established
+    # return shape. A directly nullable object must expose None because its
+    # accessor now executes to determine whether the object exists.
+    if (
+        not isinstance(t, (GraphQLObjectType, GraphQLInterfaceType))
+        and not is_output_leaf_type(t)
+        and not is_required_type(t)
+    ):
         t = GraphQLNonNull(t)
-    return format_input_type(t, False, expected_type, legacy_ids)
+    return format_input_type(
+        cast(GraphQLInputType, t),
+        False,
+        expected_type,
+        legacy_ids,
+    )
 
 
 def output_type_description(t: GraphQLOutputType) -> str:
@@ -690,7 +700,12 @@ class _ObjectField:
 
         self.is_leaf = is_output_leaf_type(field.type)
         self.is_list = is_list_of_objects_type(field.type)
-        self.is_exec = self.is_leaf or self.is_list
+        self.is_nullable_object = (
+            not self.is_leaf
+            and not self.is_list
+            and not is_required_type(field.type)
+        )
+        self.is_exec = self.is_leaf or self.is_list or self.is_nullable_object
         self.is_void = self.is_leaf and self.named_type.name == "Void"
 
         # Read @expectedType directive from the field's AST node.
@@ -804,6 +819,9 @@ class _ObjectField:
             # Use the concrete client class for interface types
             t = self._iface_client_name(self.type)
             yield f"return {t}(_ctx)"
+        elif self.is_nullable_object:
+            t = self._iface_client_name(self.named_type.name)
+            yield f"return await _ctx.execute_object({t})"
         elif self.is_list:
             n = self.named_type.name
             t = self._iface_client_name(n)
