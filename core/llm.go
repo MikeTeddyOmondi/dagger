@@ -903,7 +903,7 @@ func (r *LLMRouter) Route(model, provider string) (*LLMEndpoint, error) {
 
 func (r *LLMRouter) LoadConfig(ctx context.Context, getenv func(context.Context, string) (string, error)) (suppliedLocal bool, _ error) {
 	if getenv == nil {
-		getenv = func(_ context.Context, key string) (string, error) { //nolint:unparam
+		getenv = func(_ context.Context, key string) (string, error) {
 			return os.Getenv(key), nil
 		}
 	}
