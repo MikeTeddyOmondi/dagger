@@ -1,7 +1,10 @@
 # LLM subscription OAuth: token lifecycle cleanup
 
-Status: audit complete, one prototype commit staged, four steps of work
-remaining. This document is the handoff — it is meant to be read cold.
+Status: **implemented**. All four steps below have landed; what remains is the
+end-to-end confirmation noted at the bottom (a real session outliving its
+access token) and a `-race` run in an environment with a C compiler. The audit
+and the reasoning are kept as-is, because they are why the code looks the way
+it does.
 
 ## The symptom
 
@@ -167,146 +170,92 @@ items marked (T) were additionally reproduced by a test.
   `authConfig.TokenSource(...)` per call, so there is no in-process dedupe
   either.
 
-## Already staged (3 commits)
+## What landed
 
-These are on top of the base checkout and are what you are inheriting.
-
-1. `core/llm: prototype per-request credential source` — adds
-   `core/llm_credential.go` (`CredentialSource`, `cachedCredential` with TTL
-   + single-flight + stale-on-error fallback, `credentialTransport`,
-   `applyBearer`/`applyCodexBearer`), wires `LLMEndpoint.AuthTokenSource`,
-   `LLMRouter.reload{Anthropic,Codex}AuthToken` via a `reloader(getenv, key)`
-   closure, pins that closure to the loading client in `LoadClientConfig`,
-   and inserts the transport in `otelHTTPClient`. Plus
-   `core/llm_credential_test.go`. **Marked in its message as a spike, not
-   merge-ready** — step 2 below de-prototypes it.
-2. `core/llm: drop now-unused unparam directive` — lint fallout.
-3. `core/llm: test endpoint memoization pins the token` — adds
-   `core/llm_auth_test.go`: a real `Endpoint()` resolution against a mocked
-   secret schema (`PerCallInput` + `DoNotCache`, matching
-   `core/schema/secret.go`) with a rotatable env, showing the memo survives
-   a refresh and rides `Clone` into prompts, responses and parallel forks;
-   the `step()`-shaped counterpart where resolving on a clone leaves the
-   receiver free to re-derive; and httptest-backed checks that both SDK
-   clients keep sending the token they were built with, with an
-   expired-token 401 classified non-retryable by both.
-
-`go build ./core/... ./engine/... ./internal/cmd/...` and `go test ./core/`
-are green on this base.
+The three commits this document was handed with (a `core/llm_credential.go`
+spike, its lint fallout, and `core/llm_auth_test.go` demonstrating the pin)
+are still in the history; the work below builds on them.
 
 > Note: a fourth worker produced ~15 client-side tests (including two
 > real-subprocess cross-process ones) that asserted the intended behavior and
 > therefore failed against today's code. Its sandbox snapshot became
 > unreplayable (overlay mount options too long) and the tests were lost.
-> They need rewriting — but written *alongside* the fixes they should pass,
-> which is better anyway. The defect inventory above records exactly what
-> they covered.
+> They were rewritten alongside the fixes they should pass, which is better
+> anyway. The defect inventory above records exactly what they covered.
 
-## Remaining work
+### Step 1 — cross-process refresh race (client) — DONE
 
-### Step 1 — cross-process refresh race (client, independent)
+`withConfigLock` (`llmconfig/config.go`) now runs load→refresh→persist as one
+critical section, **re-reading the config after taking the flock** so a process
+that lost the race adopts the winner's rotated token instead of spending a dead
+one. `oauthRefreshMu` stays as the in-process dedupe. The rest of the
+permanent-logout class went with it, each as its own commit: the refresh token
+is kept when the response omits it; providers that already succeeded are
+persisted even when a later one fails (`errors.Join`); `Save` mkdirs
+`filepath.Dir(ConfigFile)`; every OAuth request is bound to a `context.Context`
+with a 10s timeout, plumbed from the env-refresher hook; `envProvider` logs and
+records a span event instead of swallowing the error; `Enabled` is honored; and
+an explicitly-exported token is never clobbered (we track what we exported).
 
-Do the whole load→refresh→persist inside the flock, and **re-read after
-acquiring it** so a process that lost the race picks up the winner's fresh
-token instead of spending a dead one. `UpdateFile` already has the right
-shape; `RefreshOAuthProviderIfNeeded` and `RefreshOAuthTokensIfNeeded` should
-route through it. Keep `oauthRefreshMu` as the in-process fast path.
+### Step 2 — de-prototype the credential source (engine) — DONE
 
-Fold in the rest of the permanent-logout class while you are in these
-functions, each as its own commit:
+The TTL closure became a `CredentialSource` value with an `Invalidate` entry
+point, resolution yields a `Credential{Token, ExpiresAt}`, and `loadLLMRouter`
+re-bases resolvers onto a `SessionScopedContext` with a per-resolution timeout —
+so a detached agent loop no longer depends on the context of whichever request
+first routed the endpoint. The `bindClient` pinning is intact. An auth 401 is
+now recoverable exactly once: `sendQueryWithRetry` reads `ep.Client` *inside*
+the backoff closure, invalidates the cached credential, and retries; a genuinely
+revoked login fails fast with a message pointing at `dagger llm setup`. The
+`Clone()`/`Endpoint()` race is fixed (and `WithModel`/`WithReasoningEffort` no
+longer lock a mutex that protects nothing). The router is still **not** reloaded
+per request.
 
-- keep `RefreshToken` when the response omits it;
-- persist providers that already succeeded even if a later one fails;
-- `Save` mkdirs `filepath.Dir(ConfigFile)`;
-- bound both refresh paths with a `context.Context` and a timeout, and plumb
-  the `ctx` the env-refresher hook already receives;
-- surface refresh failures — at minimum an `slog.Warn` on the on-demand path,
-  ideally as a span event so it reaches `dagger trace`;
-- honor `Enabled`, and stop clobbering an explicitly-exported token.
+### Step 3 — expiry alongside the token — DONE
 
-### Step 2 — de-prototype the per-request credential source (engine)
+`token_expires_at` (unix ms, true expiry, no margin) is persisted; the margin is
+applied at check time; legacy `token_expiry` is read *and still written*, since
+an older CLI sharing the file reads only that field and would otherwise loop
+refreshing. Unknown expiry means unknown, not expired. The client exports
+`ANTHROPIC_AUTH_TOKEN_EXPIRES_AT` / `OPENAI_CODEX_AUTH_TOKEN_EXPIRES_AT` in RFC
+3339 UTC from both the startup export and the hook — which answers to either of
+a provider's variables and always updates both, because the engine resolves the
+token first and the expiry second within one resolution. The engine derives the
+expiry variable by `_EXPIRES_AT` suffix, treats absent/empty/unparseable as
+unknown (never as expired), and caches to
+`min(expiresAt − 1m, now + 5m)`, falling back to the 30s TTL when unknown.
+A 30s per-provider refresh floor keeps a token whose whole lifetime is shorter
+than the margin from refreshing on every resolution.
 
-Take the staged spike to merge quality:
+### Step 4 — proactive refresh — DONE
 
-- **Session-scoped resolution context.** The spike's reloader re-`Select`s
-  on the `dagql.Server` using `req.Context()`. Capture a
-  `query.Server.SessionScopedContext(ctx)` in `loadLLMRouter` instead (the
-  same idiom `setupLocalTunnel` uses for the local-LLM tunnel) and use it as
-  the base for credential resolution, with a bounded timeout. A detached
-  agent loop must not depend on the ctx of whichever request first routed
-  the endpoint.
-- **401 recovery.** On an expired-credential 401: invalidate the cached
-  credential and retry once. Note `sendQueryWithRetry` currently hoists
-  `client := ep.Client` outside the backoff closure — that must move inside,
-  or the retry is pointless.
-- Rewrite the commit message (it currently says "prototype only").
-- Fix the `Clone()`/`Endpoint()` data race while you are here.
+A background goroutine started from `rootCmd.PersistentPreRunE` (stopped via
+`cobra.OnFinalize`) refreshes each enabled OAuth provider ~5 minutes before
+expiry and updates both exported variables. It re-reads the persisted expiry
+every cycle (so a config another process rewrote is respected, and a long idle
+period resumes correctly), polls every 10 minutes when the expiry is unknown,
+floors the delay at 30s, and starts no goroutine at all unless a subscription
+provider is configured and enabled. The push design was **not** built, per the
+decision recorded above. The on-demand hook remains the fallback.
 
-**Hard constraint: do not "fix" this by reloading the whole router per
-request.** `LoadConfig` resolves ~21 variables, each costing 2 `GetSecret`
-RPCs plus an argon2 hash, and `loadLLMRouter` loads twice when the main and
-parent clients differ — ~80 round-trips. The endpoint memo is load-bearing
-for latency; it just must not be memoizing *credentials*.
-
-### Step 3 — carry expiry alongside the token
-
-So the engine's cache can expire precisely instead of guessing with a 30s TTL.
-
-**Config change.** Add `token_expires_at` (unix ms, the *true* expiry, no
-margin baked in). Apply the safety margin at *check* time, not write time.
-Migration: when `token_expires_at` is 0 and the legacy `token_expiry` is
-non-zero, treat the true expiry as `token_expiry + margin` (undoing the
-baked-in margin). Write only the new field going forward; keep reading the
-old one. This also kills the `expires_in`-absent refresh storm, since a
-missing `expires_in` should mean "unknown expiry", not "expired".
-
-**Env contract** (both halves must agree):
-
-- Client exports `ANTHROPIC_AUTH_TOKEN_EXPIRES_AT` and
-  `OPENAI_CODEX_AUTH_TOKEN_EXPIRES_AT`, RFC 3339 UTC, the true access-token
-  expiry. Absent/empty means unknown.
-- Engine's `CredentialSource` resolves the token var **first**, then the
-  expiry var, in one call — the refresher hook fires on the token var and
-  updates both, so ordering matters.
-- Cache validity horizon = `min(expiresAt − margin, now + maxTTL)`; unknown
-  expiry falls back to the existing 30s TTL.
-
-### Step 4 — proactive refresh (this is "Option 2")
-
-**Design decision, made deliberately — read this before implementing.**
-
-The original sketch for Option 2 was a *push* channel: the CLI refreshes on a
-timer and pushes the new token into the live session, e.g. by rebinding a
-`setSecret` handle (which is already a mutable, session-resident, name-keyed
-credential slot — `SetSecretHandle` is `HMAC(scope, name)`, content
-independent, and `BindSessionResource` overwrites).
-
-**Do not build that.** Once step 3 lands, pull + exact-expiry caching gets
-the same properties for far less surface:
-
-- the engine caches the credential until its real expiry, so it re-pulls
-  roughly once per token lifetime rather than per request;
-- a client-side timer that refreshes *before* expiry means that pull returns
-  an already-fresh token instead of triggering an inline refresh on the
-  critical path;
-- every agent sharing an endpoint shares the cache, and independent endpoints
-  each pull at most once per lifetime;
-- nested clients, CI and plain API keys keep working with **zero** new API
-  surface.
-
-Push's only real win is eliminating a ~1-per-hour RPC, and it costs a new
-session-mutable credential slot plus care about which module scope owns the
-name. Not worth it. Revisit only if profiling says otherwise.
-
-So step 4 is: **a background goroutine in the CLI that refreshes each OAuth
-provider ~5 minutes before expiry** and updates the process env, alongside
-`applyLLMConfigEnv`. It must survive idle periods in `dagger shell`/`agent`,
-tear down cleanly, and no-op when no OAuth provider is configured. Keep the
-on-demand hook as the fallback — it is what covers a laptop resuming from
-sleep with a long-dead timer.
 
 ## Options considered and rejected
 
+- **Push the refreshed token into the live session** (the original sketch for
+  "Option 2"): the CLI refreshes on a timer and rebinds a `setSecret` handle,
+  which is already a mutable, session-resident, name-keyed credential slot
+  (`SetSecretHandle` is `HMAC(scope, name)`, content independent, and
+  `BindSessionResource` overwrites). Rejected in favour of pull + exact-expiry
+  caching (steps 3 and 4), which gets the same properties for far less
+  surface: the engine caches the credential until its real expiry, so it
+  re-pulls roughly once per token lifetime rather than per request; a
+  client-side timer that refreshes *before* expiry means that pull returns an
+  already-fresh token instead of triggering an inline refresh on the critical
+  path; every agent sharing an endpoint shares the cache; and nested clients,
+  CI and plain API keys keep working with **zero** new API surface. Push's only
+  real win is eliminating a ~1-per-hour RPC, and it costs a new session-mutable
+  credential slot plus care about which module scope owns the name. Revisit
+  only if profiling says otherwise.
 - **Proxy all LLM traffic through the client** (so the engine never sees the
   token). Mechanically feasible reusing the local-LLM tunnel's
   `SocketKindHostIP` + `sshforward` machinery, but that tunnel is a *raw TCP
@@ -333,26 +282,32 @@ sleep with a long-dead timer.
   (`routeReplayModel`) has no credential and must stay that way.
 - `loadLLMRouter` seeds from the main client first so a nested `dagger agent`
   never holds credentials — the reloader must resolve against **the same**
-  client that supplied the value. The staged spike does this via `bindClient`
-  in `LoadClientConfig`; do not regress it.
+  client that supplied the value, via `bindClient` in `LoadClientConfig`; do
+  not regress it.
 - Bearer tokens must not reach telemetry. `llmOTelTransport` logs bodies, not
   headers — keep it that way.
 
 ## Verification
 
 ```
-go build ./core/... ./engine/... ./internal/cmd/...
-go test ./core/ -run 'TestLLM|TestAnthropic|TestCodex|TestCredential' -count=1
-go test ./internal/cmd/dagger/llmconfig/ ./internal/cmd/dagger/ -count=1
+go build ./...
+go test ./core/ -count=1
+go test ./internal/cmd/dagger/llmconfig/ ./engine/client/secretprovider/ -count=1
+go test ./internal/cmd/dagger/ -count=1
 ```
 
-`-race` could not be run in the audit sandbox (`CGO_ENABLED=0`, no C
-compiler). Run it if your environment allows — specifically against the
-`Clone()`/`Endpoint()` race noted above. The `os.Setenv` concern turned out
-*not* to be a data race (`os.Setenv`/`LookupEnv` are serialized by
-`syscall.envLock`); it is a lost-update/TOCTOU between the hook's `Setenv`
-and `applyLLMConfigEnv`'s `LookupEnv`-then-`Setenv`.
+All green as of the implementation. (`TestDaggerCMD/TestShellAutocomplete` in
+`./internal/cmd/dagger/` fails in a sandbox without an engine driver — that is
+environmental and unrelated.)
 
-End-to-end, the thing to actually confirm: a session that outlives its access
-token keeps working, and a token refreshed by one agent is observed by all
-the others.
+`-race` could not be run in either sandbox (`CGO_ENABLED=0`, no C compiler).
+Run it where possible — specifically against the `Clone()`/`Endpoint()` race,
+which now has a dedicated concurrency test. The `os.Setenv` concern turned out
+*not* to be a data race (`os.Setenv`/`LookupEnv` are serialized by
+`syscall.envLock`); it was a lost-update/TOCTOU between the hook's `Setenv`
+and `applyLLMConfigEnv`'s `LookupEnv`-then-`Setenv`, which the export-tracking
+in step 1 closes.
+
+End-to-end, the thing still to actually confirm against a live subscription: a
+session that outlives its access token keeps working, and a token refreshed by
+one agent is observed by all the others.
