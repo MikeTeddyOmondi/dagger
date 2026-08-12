@@ -131,7 +131,11 @@ func RefreshOpenAIOAuthToken(provider *Provider) (*Provider, error) {
 
 	updated := *provider
 	updated.AuthToken = tokenResp.AccessToken
-	updated.RefreshToken = tokenResp.RefreshToken
+	// Keep the stored refresh token when the response omits it: RFC 6749 §5.1
+	// makes the field optional, and erasing it locks the user out for good.
+	if tokenResp.RefreshToken != "" {
+		updated.RefreshToken = tokenResp.RefreshToken
+	}
 	updated.TokenExpiry = expiryMs
 	return &updated, nil
 }

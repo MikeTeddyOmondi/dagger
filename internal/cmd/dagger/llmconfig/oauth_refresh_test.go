@@ -153,6 +153,47 @@ func expiredOAuthProvider(refreshToken string) Provider {
 	}
 }
 
+// TestRefreshKeepsRefreshTokenWhenOmitted covers the RFC 6749 §5.1 case: the
+// refresh response may omit refresh_token when the endpoint doesn't rotate.
+// Copying the empty field over the stored one erases the only credential that
+// can mint access tokens, so the next refresh reports "no refresh token
+// available" and the user is logged out for good.
+func TestRefreshKeepsRefreshTokenWhenOmitted(t *testing.T) {
+	// Both flows have their own response handling, and both got this wrong.
+	for _, provider := range []string{"anthropic", "openai-codex"} {
+		t.Run(provider, func(t *testing.T) {
+			srv := newFakeOAuthServer(t, "rt-keep")
+			srv.omitRefreshToken = true
+			srv.install(t)
+
+			useTempConfig(t, &Config{
+				LLM: LLMConfig{
+					DefaultProvider: provider,
+					Providers: map[string]Provider{
+						provider: expiredOAuthProvider("rt-keep"),
+					},
+				},
+			})
+
+			token, err := RefreshOAuthProviderIfNeeded(provider)
+			if err != nil {
+				t.Fatalf("RefreshOAuthProviderIfNeeded() failed: %v", err)
+			}
+			if token != "access-1" {
+				t.Errorf("returned token = %q, want %q", token, "access-1")
+			}
+
+			loaded, err := Load()
+			if err != nil {
+				t.Fatalf("Load() failed: %v", err)
+			}
+			if got := loaded.LLM.Providers[provider].RefreshToken; got != "rt-keep" {
+				t.Errorf("persisted RefreshToken = %q, want the stored %q kept", got, "rt-keep")
+			}
+		})
+	}
+}
+
 // Environment used to drive the re-executed test binary in
 // TestRefreshOAuthProviderCrossProcess.
 const (

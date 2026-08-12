@@ -153,7 +153,13 @@ func RefreshOAuthToken(provider *Provider) (*Provider, error) {
 
 	updated := *provider
 	updated.AuthToken = tokenResp.AccessToken
-	updated.RefreshToken = tokenResp.RefreshToken
+	// RFC 6749 §5.1 makes refresh_token optional in a refresh response;
+	// endpoints that don't rotate simply omit it. Overwriting unconditionally
+	// would erase the only credential that can mint new access tokens, leaving
+	// "no refresh token available" forever.
+	if tokenResp.RefreshToken != "" {
+		updated.RefreshToken = tokenResp.RefreshToken
+	}
 	updated.TokenExpiry = expiryMs
 
 	// Refresh subscription type (best-effort)
