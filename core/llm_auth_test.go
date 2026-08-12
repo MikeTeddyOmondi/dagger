@@ -228,8 +228,8 @@ func TestLLMEndpointResolvesCredentialPerRequest(t *testing.T) {
 
 // TestLLMEndpointHonorsReportedExpiry runs the *_EXPIRES_AT contract
 // end-to-end: the client exports the token's true expiry beside it, and the
-// engine caches the credential until one margin before that instant — not
-// until the blind 30s TTL, which is all it can do when the expiry is unknown.
+// engine holds the credential until one margin before that instant — far past
+// the blind 30s TTL, which is all it can do when the expiry is unknown.
 func TestLLMEndpointHonorsReportedExpiry(t *testing.T) {
 	ctx, env := newLLMEndpointTestCtx(t)
 	query, err := CurrentQuery(ctx)
@@ -244,9 +244,12 @@ func TestLLMEndpointHonorsReportedExpiry(t *testing.T) {
 	})
 	env.set("env://ANTHROPIC_BASE_URL", ts.URL)
 
+	// The login has three minutes left on it: short of credentialMaxTTL, so
+	// the reported expiry is what governs the horizon here.
 	clk := newTestClock()
+	const lifetime = 3 * time.Minute
 	env.set("env://ANTHROPIC_AUTH_TOKEN_EXPIRES_AT",
-		clk.Now().Add(10*time.Minute).Format(time.RFC3339))
+		clk.Now().Add(lifetime).Format(time.RFC3339))
 
 	llm, err := query.NewLLM(ctx, "claude-sonnet-4-5", "")
 	require.NoError(t, err)
@@ -260,13 +263,13 @@ func TestLLMEndpointHonorsReportedExpiry(t *testing.T) {
 	}
 	send()
 
-	// A rotation the client hasn't announced is invisible until the horizon,
-	// which is capped at credentialMaxTTL even though the token has ten
-	// minutes left.
+	// A rotation nobody announced stays invisible until the cached credential
+	// reaches its horizon, which is a whole margin before the expiry and many
+	// TTLs after the resolution.
 	env.set("env://ANTHROPIC_AUTH_TOKEN", "token-v2")
-	clk.Advance(credentialRefreshTTL + time.Second)
+	clk.Advance(lifetime - credentialExpiryMargin - time.Second)
 	send()
-	clk.Advance(credentialMaxTTL)
+	clk.Advance(2 * time.Second)
 	send()
 
 	mu.Lock()
