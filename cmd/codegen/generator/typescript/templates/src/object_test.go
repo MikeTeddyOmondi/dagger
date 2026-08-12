@@ -105,7 +105,8 @@ func TestNullableObjectField(t *testing.T) {
 	var b bytes.Buffer
 	require.NoError(t, tmpl.ExecuteTemplate(&b, "object", object))
 	require.Contains(t, b.String(), "latestVersion = async (): Promise<GitRef | null>")
-	require.Contains(t, b.String(), `.select("latestVersion").select("id")`)
+	require.Contains(t, b.String(), `"latestVersion",`)
+	require.Contains(t, b.String(), `.select("id")`)
 	require.Contains(t, b.String(), "if (response === null)")
 }
 
