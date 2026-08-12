@@ -197,6 +197,166 @@ func TestOAuthExpiryEnvExported(t *testing.T) {
 	}
 }
 
+// TestNextOAuthRefreshDelay covers the re-arming rule: the delay is derived
+// from the *currently persisted* expiry every cycle, so a token another dagger
+// process refreshed is respected, an unknown expiry falls back to a periodic
+// check instead of hot-looping, and an overdue token can't spin the loop.
+func TestNextOAuthRefreshDelay(t *testing.T) {
+	tempDir := t.TempDir()
+	origConfigRoot := llmconfig.ConfigRoot
+	origConfigFile := llmconfig.ConfigFile
+	t.Cleanup(func() {
+		llmconfig.ConfigRoot = origConfigRoot
+		llmconfig.ConfigFile = origConfigFile
+	})
+	llmconfig.ConfigRoot = filepath.Join(tempDir, "dagger")
+	llmconfig.ConfigFile = filepath.Join(llmconfig.ConfigRoot, llmconfig.ConfigFileName)
+
+	save := func(p llmconfig.Provider) {
+		t.Helper()
+		cfg := &llmconfig.Config{
+			LLM: llmconfig.LLMConfig{
+				DefaultProvider: "anthropic",
+				Providers:       map[string]llmconfig.Provider{"anthropic": p},
+			},
+		}
+		if err := cfg.Save(); err != nil {
+			t.Fatalf("Save() failed: %v", err)
+		}
+	}
+	oauth := func(expiresAt int64) llmconfig.Provider {
+		return llmconfig.Provider{
+			AuthType:       "oauth",
+			AuthToken:      "config-token",
+			RefreshToken:   "rt-0",
+			TokenExpiresAt: expiresAt,
+			Enabled:        true,
+		}
+	}
+
+	providers := []string{"anthropic"}
+
+	save(oauth(time.Now().Add(time.Hour).UnixMilli()))
+	got := nextOAuthRefreshDelay(providers)
+	if want := time.Hour - oauthRefreshLead; got > want || got < want-time.Minute {
+		t.Errorf("delay for a token expiring in an hour = %v, want about %v", got, want)
+	}
+
+	// A refresh elsewhere pushed the expiry out; the next cycle must see it.
+	save(oauth(time.Now().Add(3 * time.Hour).UnixMilli()))
+	if got := nextOAuthRefreshDelay(providers); got < 2*time.Hour {
+		t.Errorf("delay after the config was rewritten = %v, want it re-armed from the new expiry", got)
+	}
+
+	save(oauth(0))
+	if got := nextOAuthRefreshDelay(providers); got != oauthRefreshUnknownInterval {
+		t.Errorf("delay for an unknown expiry = %v, want the periodic %v", got, oauthRefreshUnknownInterval)
+	}
+
+	save(oauth(time.Now().Add(-time.Hour).UnixMilli()))
+	if got := nextOAuthRefreshDelay(providers); got != oauthRefreshMinDelay {
+		t.Errorf("delay for an overdue token = %v, want the floor %v", got, oauthRefreshMinDelay)
+	}
+
+	disabled := oauth(time.Now().Add(time.Hour).UnixMilli())
+	disabled.Enabled = false
+	save(disabled)
+	if got := nextOAuthRefreshDelay(providers); got != oauthRefreshUnknownInterval {
+		t.Errorf("delay once every provider is disabled = %v, want the periodic %v", got, oauthRefreshUnknownInterval)
+	}
+	if names := enabledOAuthProviders(); len(names) != 0 {
+		t.Errorf("enabledOAuthProviders() = %v, want none once the provider is disabled", names)
+	}
+}
+
+// TestStartOAuthTokenRefresher exercises the background refresher end to end:
+// it starts only when a subscription provider is configured, keeps the
+// exported variables in step with the persisted config across cycles (which is
+// what makes an idle `dagger shell` survive a token rotation), and stops when
+// its context is cancelled.
+func TestStartOAuthTokenRefresher(t *testing.T) {
+	tempDir := t.TempDir()
+	origConfigRoot := llmconfig.ConfigRoot
+	origConfigFile := llmconfig.ConfigFile
+	t.Cleanup(func() {
+		llmconfig.ConfigRoot = origConfigRoot
+		llmconfig.ConfigFile = origConfigFile
+	})
+	llmconfig.ConfigRoot = filepath.Join(tempDir, "dagger")
+	llmconfig.ConfigFile = filepath.Join(llmconfig.ConfigRoot, llmconfig.ConfigFileName)
+
+	for _, key := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN_EXPIRES_AT"} {
+		if val, ok := os.LookupEnv(key); ok {
+			t.Cleanup(func() { os.Setenv(key, val) })
+			os.Unsetenv(key)
+		} else {
+			t.Cleanup(func() { os.Unsetenv(key) })
+		}
+	}
+
+	// No config at all: nothing to keep fresh, so nothing starts.
+	stop := startOAuthTokenRefresher(t.Context())
+	stop()
+
+	save := func(token string) {
+		t.Helper()
+		cfg := &llmconfig.Config{
+			LLM: llmconfig.LLMConfig{
+				DefaultProvider: "anthropic",
+				Providers: map[string]llmconfig.Provider{
+					"anthropic": {
+						AuthType:     "oauth",
+						AuthToken:    token,
+						RefreshToken: "rt-0",
+						// Unknown expiry: the loop polls on its fallback
+						// interval and never needs the token endpoint.
+						Enabled: true,
+					},
+				},
+			},
+		}
+		if err := cfg.Save(); err != nil {
+			t.Fatalf("Save() failed: %v", err)
+		}
+	}
+
+	origInterval, origMin := oauthRefreshUnknownInterval, oauthRefreshMinDelay
+	t.Cleanup(func() {
+		oauthRefreshUnknownInterval, oauthRefreshMinDelay = origInterval, origMin
+	})
+	oauthRefreshUnknownInterval = 5 * time.Millisecond
+	oauthRefreshMinDelay = time.Millisecond
+
+	save("first-token")
+	stop = startOAuthTokenRefresher(t.Context())
+	t.Cleanup(stop)
+
+	waitForEnv := func(key, want string) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if os.Getenv(key) == want {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("%s = %q, want %q", key, os.Getenv(key), want)
+	}
+	waitForEnv("ANTHROPIC_AUTH_TOKEN", "first-token")
+
+	// Another dagger process rotates the token; the refresher picks it up on
+	// its next cycle without being told.
+	save("second-token")
+	waitForEnv("ANTHROPIC_AUTH_TOKEN", "second-token")
+
+	stop()
+	save("third-token")
+	time.Sleep(50 * time.Millisecond)
+	if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != "second-token" {
+		t.Errorf("ANTHROPIC_AUTH_TOKEN = %q after stop, want the refresher to have stopped at %q", got, "second-token")
+	}
+}
+
 // TestApplyLLMConfigEnvOpenAISlot verifies that when both openai and
 // openrouter are enabled, the shared OPENAI_* variables are owned by exactly
 // one provider, chosen deterministically rather than by map iteration order.
