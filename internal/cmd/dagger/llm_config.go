@@ -103,8 +103,8 @@ func init() {
 // env:// against the client.
 //
 // OAuth subscription tokens are refreshed first (client-side, and only when
-// expired). Anthropic (Claude Code) OAuth is wired end-to-end; Codex is not
-// yet, so its token is not exported.
+// expired). Both Anthropic (Claude Code) and OpenAI Codex (ChatGPT) OAuth are
+// wired end-to-end, so both tokens are exported.
 func applyLLMConfigEnv() {
 	// Refresh any expired OAuth tokens before exporting them. A failure here is
 	// non-fatal (we fall back to whatever token is persisted), but warn so an
