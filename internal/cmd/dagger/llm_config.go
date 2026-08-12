@@ -56,36 +56,64 @@ var (
 
 // exportLLMEnv sets key to val unless the variable already holds a value we
 // did not put there. Values we do export are remembered, so a later refresh
-// can replace its own. An empty val drops a variable we exported earlier —
-// leaving a stale expiry next to a freshly refreshed token would have the
-// engine cache the new credential against the old deadline.
+// can replace its own. An empty val exports nothing: callers pass whatever the
+// config holds, and a provider that leaves a field unset must not undo a value
+// exported for it earlier in the same pass (the default model, say).
 func exportLLMEnv(key, val string) {
+	if val == "" {
+		return
+	}
 	llmEnvMu.Lock()
 	defer llmEnvMu.Unlock()
-	cur, set := os.LookupEnv(key)
-	if set {
+	if cur, set := os.LookupEnv(key); set {
 		if exported, ours := llmEnvExports[key]; !ours || exported != cur {
 			return
 		}
-	}
-	if val == "" {
-		if set {
-			os.Unsetenv(key)
-			delete(llmEnvExports, key)
-		}
-		return
 	}
 	os.Setenv(key, val)
 	llmEnvExports[key] = val
 }
 
-// exportOAuthEnv refreshes provider's token if it is due and exports both of
-// its variables. Both, always: the engine resolves the token and the expiry as
-// two lookups of one credential, and updating only the one that was asked for
-// would pair a fresh token with a stale deadline.
-func exportOAuthEnv(ctx context.Context, provider string) error {
+// clearLLMEnv drops a variable we exported earlier, leaving one the user
+// exported explicitly alone.
+func clearLLMEnv(key string) {
+	llmEnvMu.Lock()
+	defer llmEnvMu.Unlock()
+	cur, set := os.LookupEnv(key)
+	if !set {
+		return
+	}
+	if exported, ours := llmEnvExports[key]; !ours || exported != cur {
+		return
+	}
+	os.Unsetenv(key)
+	delete(llmEnvExports, key)
+}
+
+// exportOAuthCredential exports a provider's bearer token together with the
+// expiry that belongs to it. Together, always: the engine resolves the token
+// and the expiry as two lookups of one credential, so leaving a stale expiry
+// next to a fresh token would have it cache the new credential against the old
+// deadline. An expiry we no longer know is cleared rather than left behind.
+func exportOAuthCredential(provider string, p *llmconfig.Provider) {
 	vars, ok := oauthEnvVars[provider]
 	if !ok {
+		return
+	}
+	// Never overwrite credentials the user exported explicitly, even when the
+	// refresh was a no-op and these are just the stored values.
+	exportLLMEnv(vars.token, p.AuthToken)
+	if expiresAt := p.TokenExpiresAtRFC3339(); expiresAt != "" {
+		exportLLMEnv(vars.expiresAt, expiresAt)
+	} else {
+		clearLLMEnv(vars.expiresAt)
+	}
+}
+
+// exportOAuthEnv refreshes provider's token if it is due and exports the
+// result.
+func exportOAuthEnv(ctx context.Context, provider string) error {
+	if _, ok := oauthEnvVars[provider]; !ok {
 		return nil
 	}
 	p, err := llmconfig.RefreshOAuthProviderIfNeeded(ctx, provider)
@@ -95,10 +123,7 @@ func exportOAuthEnv(ctx context.Context, provider string) error {
 	if p == nil {
 		return nil
 	}
-	// Never overwrite credentials the user exported explicitly, even when the
-	// refresh was a no-op and these are just the stored values.
-	exportLLMEnv(vars.token, p.AuthToken)
-	exportLLMEnv(vars.expiresAt, p.TokenExpiresAtRFC3339())
+	exportOAuthCredential(provider, p)
 	return nil
 }
 
@@ -312,10 +337,7 @@ func applyLLMConfigEnv() {
 			// engine can cache the credential exactly that long. Anthropic
 			// (Claude Code) and OpenAI Codex (ChatGPT subscription) are wired
 			// through the engine.
-			if vars, ok := oauthEnvVars[name]; ok {
-				exportLLMEnv(vars.token, p.AuthToken)
-				exportLLMEnv(vars.expiresAt, p.TokenExpiresAtRFC3339())
-			}
+			exportOAuthCredential(name, &p)
 			switch name {
 			case "anthropic":
 				exportLLMEnv("ANTHROPIC_REASONING_EFFORT", p.ReasoningEffort)

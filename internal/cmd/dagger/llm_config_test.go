@@ -357,6 +357,51 @@ func TestStartOAuthTokenRefresher(t *testing.T) {
 	}
 }
 
+// TestApplyLLMConfigEnvKeepsDefaultModel guards the interaction between the
+// default-model export and the provider loop: the provider's own model field
+// is usually empty, and exporting "nothing" for it must not undo the default
+// model exported moments earlier.
+func TestApplyLLMConfigEnvKeepsDefaultModel(t *testing.T) {
+	tempDir := t.TempDir()
+	origConfigRoot := llmconfig.ConfigRoot
+	origConfigFile := llmconfig.ConfigFile
+	t.Cleanup(func() {
+		llmconfig.ConfigRoot = origConfigRoot
+		llmconfig.ConfigFile = origConfigFile
+	})
+	llmconfig.ConfigRoot = filepath.Join(tempDir, "dagger")
+	llmconfig.ConfigFile = filepath.Join(llmconfig.ConfigRoot, llmconfig.ConfigFileName)
+
+	for _, key := range []string{"ANTHROPIC_MODEL", "ANTHROPIC_API_KEY"} {
+		if val, ok := os.LookupEnv(key); ok {
+			t.Cleanup(func() { os.Setenv(key, val) })
+			os.Unsetenv(key)
+		} else {
+			t.Cleanup(func() { os.Unsetenv(key) })
+		}
+	}
+
+	cfg := &llmconfig.Config{
+		LLM: llmconfig.LLMConfig{
+			DefaultProvider: "anthropic",
+			DefaultModel:    "claude-sonnet-4.5",
+			Providers: map[string]llmconfig.Provider{
+				// No Model of its own, which is the common case.
+				"anthropic": {APIKey: "sk-ant", Enabled: true},
+			},
+		},
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() failed: %v", err)
+	}
+
+	applyLLMConfigEnv()
+
+	if got := os.Getenv("ANTHROPIC_MODEL"); got != "claude-sonnet-4.5" {
+		t.Errorf("ANTHROPIC_MODEL = %q, want the configured default %q", got, "claude-sonnet-4.5")
+	}
+}
+
 // TestApplyLLMConfigEnvOpenAISlot verifies that when both openai and
 // openrouter are enabled, the shared OPENAI_* variables are owned by exactly
 // one provider, chosen deterministically rather than by map iteration order.
