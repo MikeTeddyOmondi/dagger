@@ -330,6 +330,172 @@ func TestRefreshHonorsContext(t *testing.T) {
 	}
 }
 
+// TestTokenExpiryMigration covers reading configs written before
+// token_expires_at existed: they carry token_expiry, which had the safety
+// margin subtracted at write time, so the true expiry is that value plus the
+// margin.
+func TestTokenExpiryMigration(t *testing.T) {
+	legacy := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+	for _, tc := range []struct {
+		name     string
+		provider Provider
+		want     time.Time
+	}{
+		{
+			name:     "legacy field only",
+			provider: Provider{TokenExpiry: legacy.UnixMilli()},
+			want:     legacy.Add(tokenExpiryMargin),
+		},
+		{
+			name: "new field wins",
+			provider: Provider{
+				TokenExpiry:    legacy.UnixMilli(),
+				TokenExpiresAt: legacy.Add(time.Hour).UnixMilli(),
+			},
+			want: legacy.Add(time.Hour),
+		},
+		{
+			name:     "neither is unknown",
+			provider: Provider{},
+			want:     time.Time{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.provider.TokenExpiresAtTime(); !got.Equal(tc.want) {
+				t.Errorf("TokenExpiresAtTime() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsTokenExpired(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name     string
+		provider Provider
+		want     bool
+	}{
+		{
+			name:     "unknown expiry is not expired",
+			provider: Provider{},
+			// Otherwise every secret resolution refreshes, rotating the
+			// single-use refresh token each time.
+			want: false,
+		},
+		{
+			name:     "well before expiry",
+			provider: Provider{TokenExpiresAt: now.Add(time.Hour).UnixMilli()},
+			want:     false,
+		},
+		{
+			name:     "inside the safety margin",
+			provider: Provider{TokenExpiresAt: now.Add(time.Minute).UnixMilli()},
+			want:     true,
+		},
+		{
+			name:     "past",
+			provider: Provider{TokenExpiresAt: now.Add(-time.Minute).UnixMilli()},
+			want:     true,
+		},
+		{
+			name:     "legacy expiry in the past",
+			provider: Provider{TokenExpiry: now.Add(-time.Hour).UnixMilli()},
+			want:     true,
+		},
+		{
+			name: "legacy expiry still ahead of the margin",
+			// The legacy value already had the margin subtracted, so this is a
+			// true expiry an hour and five minutes out.
+			provider: Provider{TokenExpiry: now.Add(time.Hour).UnixMilli()},
+			want:     false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsTokenExpired(&tc.provider); got != tc.want {
+				t.Errorf("IsTokenExpired() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRefreshWithoutExpiresIn covers a token endpoint that omits expires_in.
+// Baking the safety margin into the persisted value turned that into "expired
+// 5 minutes ago", so every secret resolution refreshed — and each refresh
+// rotated the single-use refresh token.
+func TestRefreshWithoutExpiresIn(t *testing.T) {
+	srv := newFakeOAuthServer(t, "rt-0")
+	srv.expiresIn = -1 // omit the field entirely
+	srv.install(t)
+
+	useTempConfig(t, &Config{
+		LLM: LLMConfig{
+			DefaultProvider: "anthropic",
+			Providers: map[string]Provider{
+				"anthropic": expiredOAuthProvider("rt-0"),
+			},
+		},
+	})
+
+	// A single credential resolution already costs two hook invocations.
+	for i := range 4 {
+		token, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic")
+		if err != nil {
+			t.Fatalf("RefreshOAuthProviderIfNeeded() call %d failed: %v", i, err)
+		}
+		if token != "access-1" {
+			t.Fatalf("call %d returned token %q, want %q", i, token, "access-1")
+		}
+	}
+
+	if grants, _ := srv.state(); grants != 1 {
+		t.Errorf("token endpoint granted %d refreshes, want exactly 1", grants)
+	}
+
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	provider := loaded.LLM.Providers["anthropic"]
+	if provider.TokenExpiresAt != 0 || provider.TokenExpiry != 0 {
+		t.Errorf("persisted expiry = (%d, %d), want both zero for an unknown expiry",
+			provider.TokenExpiresAt, provider.TokenExpiry)
+	}
+	if IsTokenExpired(&provider) {
+		t.Error("provider with an unknown expiry reads as expired")
+	}
+}
+
+// TestRefreshWithShortExpiresIn checks that a lifetime shorter than the safety
+// margin still persists a real, future expiry rather than a value that is
+// already in the past.
+func TestRefreshWithShortExpiresIn(t *testing.T) {
+	srv := newFakeOAuthServer(t, "rt-0")
+	srv.expiresIn = 60
+	srv.install(t)
+
+	useTempConfig(t, &Config{
+		LLM: LLMConfig{
+			DefaultProvider: "anthropic",
+			Providers: map[string]Provider{
+				"anthropic": expiredOAuthProvider("rt-0"),
+			},
+		},
+	})
+
+	if _, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic"); err != nil {
+		t.Fatalf("RefreshOAuthProviderIfNeeded() failed: %v", err)
+	}
+
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	provider := loaded.LLM.Providers["anthropic"]
+	if provider.TokenExpiresAt <= time.Now().UnixMilli() {
+		t.Errorf("persisted TokenExpiresAt %d is not in the future", provider.TokenExpiresAt)
+	}
+}
+
 // Environment used to drive the re-executed test binary in
 // TestRefreshOAuthProviderCrossProcess.
 const (

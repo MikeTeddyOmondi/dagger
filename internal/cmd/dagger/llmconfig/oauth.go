@@ -128,16 +128,13 @@ func ExchangeOAuthCode(ctx context.Context, authCode, verifier string) (*Provide
 		return nil, err
 	}
 
-	// Subtract 5 minutes from expiry for safety margin
-	expiryMs := time.Now().UnixMilli() + int64(tokenResp.ExpiresIn)*1000 - 5*60*1000
-
 	provider := &Provider{
 		AuthType:     "oauth",
 		AuthToken:    tokenResp.AccessToken,
 		RefreshToken: tokenResp.RefreshToken,
-		TokenExpiry:  expiryMs,
 		Enabled:      true,
 	}
+	provider.setTokenExpiry(tokenResp.ExpiresIn)
 
 	// Fetch subscription type from profile (best-effort)
 	if subType, err := FetchSubscriptionType(ctx, tokenResp.AccessToken); err == nil {
@@ -167,8 +164,6 @@ func RefreshOAuthToken(ctx context.Context, provider *Provider) (*Provider, erro
 		return nil, err
 	}
 
-	expiryMs := time.Now().UnixMilli() + int64(tokenResp.ExpiresIn)*1000 - 5*60*1000
-
 	updated := *provider
 	updated.AuthToken = tokenResp.AccessToken
 	// RFC 6749 §5.1 makes refresh_token optional in a refresh response;
@@ -178,7 +173,7 @@ func RefreshOAuthToken(ctx context.Context, provider *Provider) (*Provider, erro
 	if tokenResp.RefreshToken != "" {
 		updated.RefreshToken = tokenResp.RefreshToken
 	}
-	updated.TokenExpiry = expiryMs
+	updated.setTokenExpiry(tokenResp.ExpiresIn)
 
 	// Refresh subscription type (best-effort)
 	if subType, err := FetchSubscriptionType(ctx, tokenResp.AccessToken); err == nil {
@@ -188,12 +183,67 @@ func RefreshOAuthToken(ctx context.Context, provider *Provider) (*Provider, erro
 	return &updated, nil
 }
 
-// IsTokenExpired checks if the OAuth token has expired.
-func IsTokenExpired(provider *Provider) bool {
-	if provider.TokenExpiry == 0 {
-		return true
+// tokenExpiryMargin is how long before an access token's true expiry it is
+// treated as expired, so a request made now can't outlive it in flight.
+//
+// It is applied when the expiry is *checked*, never baked into what is
+// persisted: a stored "now + expires_in - margin" reads as already expired
+// whenever expires_in is absent or short, and since the on-demand refresher
+// runs on every secret resolution (twice, in fact — the plaintext is resolved
+// once more to derive the cache-key handle), that means a refresh storm
+// rotating the single-use refresh token over and over.
+const tokenExpiryMargin = 5 * time.Minute
+
+// TokenExpiresAtTime returns the true access-token expiry, or the zero time
+// when it is unknown. Configs written before token_expires_at existed carry
+// only token_expiry, which had the margin subtracted at write time — add it
+// back to recover the real instant.
+func (p *Provider) TokenExpiresAtTime() time.Time {
+	switch {
+	case p.TokenExpiresAt != 0:
+		return time.UnixMilli(p.TokenExpiresAt)
+	case p.TokenExpiry != 0:
+		return time.UnixMilli(p.TokenExpiry).Add(tokenExpiryMargin)
+	default:
+		return time.Time{}
 	}
-	return time.Now().UnixMilli() >= provider.TokenExpiry
+}
+
+// TokenExpiresAtRFC3339 formats the true access-token expiry as RFC 3339 in
+// UTC — the wire format of the *_AUTH_TOKEN_EXPIRES_AT variables the engine
+// reads alongside the token — or "" when the expiry is unknown.
+func (p *Provider) TokenExpiresAtRFC3339() string {
+	expiresAt := p.TokenExpiresAtTime()
+	if expiresAt.IsZero() {
+		return ""
+	}
+	return expiresAt.UTC().Format(time.RFC3339)
+}
+
+// setTokenExpiry records the true expiry derived from a token response's
+// expires_in (seconds). A missing or non-positive expires_in means "unknown",
+// not "expired".
+func (p *Provider) setTokenExpiry(expiresIn int) {
+	if expiresIn <= 0 {
+		p.TokenExpiresAt = 0
+		p.TokenExpiry = 0
+		return
+	}
+	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
+	p.TokenExpiresAt = expiresAt.UnixMilli()
+	p.TokenExpiry = expiresAt.Add(-tokenExpiryMargin).UnixMilli()
+}
+
+// IsTokenExpired reports whether the OAuth access token has expired, or is
+// close enough to expiring to be worth replacing now. An unknown expiry is not
+// expired: the refresher runs on every secret resolution, so guessing here
+// would rotate the refresh token continuously.
+func IsTokenExpired(provider *Provider) bool {
+	expiresAt := provider.TokenExpiresAtTime()
+	if expiresAt.IsZero() {
+		return false
+	}
+	return !time.Now().Before(expiresAt.Add(-tokenExpiryMargin))
 }
 
 // FetchSubscriptionType queries the Anthropic OAuth profile endpoint to

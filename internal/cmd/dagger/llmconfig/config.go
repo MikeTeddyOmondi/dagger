@@ -58,10 +58,20 @@ type Provider struct {
 	Enabled          bool   `toml:"enabled"`
 
 	// OAuth fields for Claude Code subscription auth
-	AuthType         string `toml:"auth_type,omitempty"`         // "oauth" for Claude Code OAuth
-	AuthToken        string `toml:"auth_token,omitempty"`        // OAuth access token
-	RefreshToken     string `toml:"refresh_token,omitempty"`     // OAuth refresh token
-	TokenExpiry      int64  `toml:"token_expiry,omitempty"`      // Unix timestamp (ms) when access token expires
+	AuthType     string `toml:"auth_type,omitempty"`     // "oauth" for Claude Code OAuth
+	AuthToken    string `toml:"auth_token,omitempty"`    // OAuth access token
+	RefreshToken string `toml:"refresh_token,omitempty"` // OAuth refresh token
+	// TokenExpiresAt is when the access token truly expires, in unix
+	// milliseconds, with no safety margin baked in. The margin is applied when
+	// the value is checked (IsTokenExpired), so an absent or short expires_in
+	// can't persist an already-expired value.
+	TokenExpiresAt int64 `toml:"token_expires_at,omitempty"`
+	// TokenExpiry is the legacy expiry: the same instant with the safety margin
+	// already subtracted. Still written so that an older CLI sharing this config
+	// file keeps working — it reads only this field and treats 0 as expired,
+	// which would put it in a refresh loop rotating the token out from under
+	// this one. TokenExpiresAt wins when both are present.
+	TokenExpiry      int64  `toml:"token_expiry,omitempty"`
 	SubscriptionType string `toml:"subscription_type,omitempty"` // "pro", "max", "team", "enterprise"
 
 	// ReasoningEffort is the reasoning level for the provider's model, taken

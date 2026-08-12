@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 )
 
 const (
@@ -75,15 +74,14 @@ func ExchangeOpenAIOAuthCode(ctx context.Context, code, verifier string) (*Provi
 		return nil, err
 	}
 
-	expiryMs := time.Now().UnixMilli() + int64(tokenResp.ExpiresIn)*1000 - 5*60*1000
-
-	return &Provider{
+	provider := &Provider{
 		AuthType:     "oauth",
 		AuthToken:    tokenResp.AccessToken,
 		RefreshToken: tokenResp.RefreshToken,
-		TokenExpiry:  expiryMs,
 		Enabled:      true,
-	}, nil
+	}
+	provider.setTokenExpiry(tokenResp.ExpiresIn)
+	return provider, nil
 }
 
 // RefreshOpenAIOAuthToken refreshes an expired OpenAI OAuth token.
@@ -103,8 +101,6 @@ func RefreshOpenAIOAuthToken(ctx context.Context, provider *Provider) (*Provider
 		return nil, err
 	}
 
-	expiryMs := time.Now().UnixMilli() + int64(tokenResp.ExpiresIn)*1000 - 5*60*1000
-
 	updated := *provider
 	updated.AuthToken = tokenResp.AccessToken
 	// Keep the stored refresh token when the response omits it: RFC 6749 §5.1
@@ -112,6 +108,6 @@ func RefreshOpenAIOAuthToken(ctx context.Context, provider *Provider) (*Provider
 	if tokenResp.RefreshToken != "" {
 		updated.RefreshToken = tokenResp.RefreshToken
 	}
-	updated.TokenExpiry = expiryMs
+	updated.setTokenExpiry(tokenResp.ExpiresIn)
 	return &updated, nil
 }
