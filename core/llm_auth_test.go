@@ -281,6 +281,74 @@ func TestLLMEndpointHonorsReportedExpiry(t *testing.T) {
 	assert.Positive(t, reads, "the expiry must be read alongside the token")
 }
 
+// TestLLMAuthFailureRetriesOnceWithFreshToken covers 401 recovery: the token
+// died mid-conversation, the client already has its replacement, and the turn
+// should survive. Exactly one retry — a login that is genuinely revoked must
+// fail fast with something the user can act on, not spin the backoff for two
+// minutes and then report "401 authentication_error".
+func TestLLMAuthFailureRetriesOnceWithFreshToken(t *testing.T) {
+	ctx, env := newLLMEndpointTestCtx(t)
+	query, err := CurrentQuery(ctx)
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	var seen []string
+	ts := anthropic401Server(t, func(auth string) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, auth)
+		// The CLI refreshed in the background; the engine is still holding
+		// the token it cached before that happened.
+		env.set("env://ANTHROPIC_AUTH_TOKEN", "token-v2")
+	})
+	env.set("env://ANTHROPIC_BASE_URL", ts.URL)
+
+	llm, err := query.NewLLM(ctx, "claude-sonnet-4-5", "")
+	require.NoError(t, err)
+
+	_, err = llm.sendQueryWithRetry(ctx, llmTestHistory(), nil, "", 0)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "dagger llm setup",
+		"an expired subscription login must say what to do about it")
+	assert.ErrorContains(t, err, string(Anthropic))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"Bearer token-v1", "Bearer token-v2"}, seen,
+		"the retry must carry the re-resolved token, and there must be only one")
+}
+
+// TestLLMAuthFailureWithoutSourceIsPermanent: with no credential source there
+// is nothing to re-resolve, so a 401 fails immediately — an API-key setup and
+// CI behave exactly as before.
+func TestLLMAuthFailureWithoutSourceIsPermanent(t *testing.T) {
+	var mu sync.Mutex
+	var requests int
+	ts := anthropic401Server(t, func(string) {
+		mu.Lock()
+		defer mu.Unlock()
+		requests++
+	})
+
+	endpoint := &LLMEndpoint{
+		Model:    "claude-sonnet-4-5",
+		BaseURL:  ts.URL,
+		Provider: Anthropic,
+		Key:      "sk-plain",
+	}
+	endpoint.Client = newAnthropicClient(endpoint)
+
+	llm := &LLM{endpoint: endpoint, endpointMtx: &sync.Mutex{}, mcp: newMCP()}
+	_, err := llm.sendQueryWithRetry(t.Context(), llmTestHistory(), nil, "", 0)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "dagger llm setup",
+		"an API key is the user's own env var; don't send them to the OAuth flow")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, requests)
+}
+
 // TestAnthropicClientWithoutSourceKeepsBakedToken is the invariant behind the
 // whole design: an SDK client captures its credential at construction, so an
 // endpoint without a source sends the token it was routed with forever, no
@@ -305,6 +373,9 @@ func TestAnthropicClientWithoutSourceKeepsBakedToken(t *testing.T) {
 
 	_, err := client.SendQuery(t.Context(), llmTestHistory(), nil, &LLMCallOpts{})
 	require.Error(t, err)
+	assert.True(t, isAuthFailure(err), "a 401 must be recognizable as such: %v", err)
+	assert.False(t, client.IsRetryable(err),
+		"resending is only worth it once the credential has been re-resolved")
 
 	endpoint.AuthToken = "token-v2"
 	_, err = client.SendQuery(t.Context(), llmTestHistory(), nil, &LLMCallOpts{})
@@ -360,6 +431,8 @@ func TestCodexClientRotatesAccountIDWithToken(t *testing.T) {
 
 	_, err := client.SendQuery(t.Context(), llmTestHistory(), nil, &LLMCallOpts{})
 	require.Error(t, err)
+	assert.True(t, isAuthFailure(err),
+		"the Codex error wrapper must keep the status classifiable: %v", err)
 
 	current.Store(&tokenV2)
 	clk.Advance(credentialRefreshTTL + time.Second)

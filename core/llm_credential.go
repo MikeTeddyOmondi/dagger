@@ -2,11 +2,15 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/openai/openai-go"
 )
 
 // Per-request credential resolution for LLM providers.
@@ -314,3 +318,44 @@ func (endpoint *LLMEndpoint) credentialApplier() applyCredential {
 	}
 	return applyBearer
 }
+
+// isAuthFailure reports whether err is the provider rejecting our credential
+// (HTTP 401) rather than any other failure. Both SDKs surface the status on a
+// typed API error, and the Codex client preserves it through its own error
+// wrapper (see codexAPIError).
+func isAuthFailure(err error) bool {
+	var anthropicErr *anthropic.Error
+	if errors.As(err, &anthropicErr) {
+		return anthropicErr.StatusCode == http.StatusUnauthorized
+	}
+	var openaiErr *openai.Error
+	if errors.As(err, &openaiErr) {
+		return openaiErr.StatusCode == http.StatusUnauthorized
+	}
+	return false
+}
+
+// credentialError turns a provider's rejection of our credential into
+// something the user can act on. Only a subscription login gets rewritten: a
+// rejected API key is a variable the user exported themselves and the
+// provider's own message names it well enough, whereas an OAuth login lives in
+// the CLI's config and is refreshed behind the session, so "401
+// authentication_error" tells its owner nothing about what to do next.
+func (endpoint *LLMEndpoint) credentialError(err error) error {
+	if !endpoint.IsOAuth {
+		return err
+	}
+	return &expiredLoginError{provider: endpoint.Provider, err: err}
+}
+
+type expiredLoginError struct {
+	provider LLMProvider
+	err      error
+}
+
+func (e *expiredLoginError) Error() string {
+	return fmt.Sprintf("%s rejected the subscription login: it has expired or been revoked — "+
+		"re-run `dagger llm setup` to log in again (%v)", e.provider, e.err)
+}
+
+func (e *expiredLoginError) Unwrap() error { return e.err }

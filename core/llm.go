@@ -1925,10 +1925,14 @@ func (llm *LLM) sendQueryWithRetry(ctx context.Context, messages []*LLMMessage, 
 	if err != nil {
 		return nil, err
 	}
-	client := ep.Client
 
 	var res *LLMResponse
+	var authRetried bool
 	err = backoff.Retry(func() error {
+		// Read the client inside the retry: recovering from a rejected
+		// credential is only worth anything if the next attempt picks up what
+		// the recovery changed.
+		client := ep.Client
 		var sendErr error
 		// The provider streams this turn's content into its own per-block display
 		// spans (thinking, response, tool calls); it sets the call digest on them
@@ -1943,6 +1947,20 @@ func (llm *LLM) sendQueryWithRetry(ctx context.Context, messages []*LLMMessage, 
 			if errors.As(sendErr, &finished) {
 				// Don't retry if the model finished explicitly, treat as permanent.
 				return backoff.Permanent(sendErr)
+			}
+			if isAuthFailure(sendErr) {
+				// A credential that rotated out from under a long conversation
+				// is worth exactly one retry: drop the cached one so the next
+				// attempt resolves a fresh token from the client. Exactly one,
+				// because a login that is really revoked would otherwise spin
+				// the backoff for its full MaxElapsedTime before telling the
+				// user the one thing they can act on.
+				if authRetried || ep.AuthTokenSource == nil {
+					return backoff.Permanent(ep.credentialError(sendErr))
+				}
+				authRetried = true
+				ep.AuthTokenSource.Invalidate()
+				return sendErr
 			}
 			if !client.IsRetryable(sendErr) {
 				// Maybe an invalid request - give up.

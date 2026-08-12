@@ -61,6 +61,10 @@ var anthropicRetryable = []string{
 	"Internal server error",
 }
 
+// IsRetryable reports whether a failed turn is worth resending. A rejected
+// credential is deliberately absent from the list: it is only retryable once
+// the credential has been re-resolved, so that case is handled centrally (see
+// sendQueryWithRetry).
 func (c *AnthropicClient) IsRetryable(err error) bool {
 	msg := err.Error()
 	for _, retryable := range anthropicRetryable {
