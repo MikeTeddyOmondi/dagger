@@ -1,6 +1,7 @@
 package llmconfig
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -119,6 +120,14 @@ func (c *Config) Save() error {
 	}
 	defer lock.Unlock()
 
+	return c.write()
+}
+
+// write merges the [llm] section into the config document on disk and rewrites
+// it atomically. The caller must already hold the cross-process lock: flock is
+// per open file description, so re-taking it here would deadlock a caller that
+// holds it (withConfigLock).
+func (c *Config) write() error {
 	// Initialize providers map if nil
 	if c.LLM.Providers == nil {
 		c.LLM.Providers = make(map[string]Provider)
@@ -153,6 +162,46 @@ func (c *Config) Save() error {
 	}
 
 	return nil
+}
+
+// withConfigLock runs fn against the config as it exists on disk *right now* —
+// re-read after the cross-process lock is taken — and persists the result
+// before releasing the lock, so load→modify→persist is a single critical
+// section.
+//
+// Re-reading is the point. OAuth refresh tokens are single-use and rotating:
+// a process that loaded the config before another process refreshed would
+// otherwise spend a dead refresh token (invalid_grant, i.e. a permanent
+// logout) and then write its stale snapshot back over the winner's rotated
+// token. fn reports whether it changed anything; nothing is written when it
+// did not.
+func withConfigLock(fn func(cfg *Config) (changed bool, err error)) error {
+	if err := os.MkdirAll(filepath.Dir(ConfigFile), 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	lock := flock.New(ConfigFile + ".lock")
+	if err := lock.Lock(); err != nil {
+		return fmt.Errorf("failed to acquire lock: %w", err)
+	}
+	defer lock.Unlock()
+
+	cfg, err := Load()
+	if err != nil {
+		return err
+	}
+	if cfg == nil {
+		cfg = &Config{LLM: LLMConfig{Providers: make(map[string]Provider)}}
+	}
+
+	changed, fnErr := fn(cfg)
+	if !changed {
+		return fnErr
+	}
+	if err := cfg.write(); err != nil {
+		return errors.Join(fnErr, err)
+	}
+	return fnErr
 }
 
 // UpdateFile applies fn to the current config file contents under the
@@ -318,31 +367,26 @@ func RefreshOAuthTokensIfNeeded() error {
 	oauthRefreshMu.Lock()
 	defer oauthRefreshMu.Unlock()
 
-	cfg, err := Load()
-	if err != nil || cfg == nil {
-		// a missing or unreadable config is non-fatal here
+	// Nothing to refresh, and no reason to create the config directory (or its
+	// lock file) for a user who has no config at all.
+	if !ConfigExists() {
 		return nil
 	}
 
-	var changed bool
-	for name, provider := range cfg.LLM.Providers {
-		refreshed, didChange, err := refreshProviderToken(name, provider)
-		if err != nil {
-			return err
+	return withConfigLock(func(cfg *Config) (bool, error) {
+		var changed bool
+		for name, provider := range cfg.LLM.Providers {
+			refreshed, didChange, err := refreshProviderToken(name, provider)
+			if err != nil {
+				return false, err
+			}
+			if didChange {
+				cfg.LLM.Providers[name] = refreshed
+				changed = true
+			}
 		}
-		if didChange {
-			cfg.LLM.Providers[name] = refreshed
-			changed = true
-		}
-	}
-
-	if changed {
-		if err := cfg.Save(); err != nil {
-			return fmt.Errorf("failed to save refreshed tokens: %w", err)
-		}
-	}
-
-	return nil
+		return changed, nil
+	})
 }
 
 // RefreshOAuthProviderIfNeeded refreshes a single OAuth provider by name if its
@@ -354,23 +398,28 @@ func RefreshOAuthProviderIfNeeded(name string) (string, error) {
 	oauthRefreshMu.Lock()
 	defer oauthRefreshMu.Unlock()
 
-	cfg, err := Load()
-	if err != nil || cfg == nil {
-		return "", err
-	}
-	provider, ok := cfg.LLM.Providers[name]
-	if !ok || !provider.IsOAuth() {
+	if !ConfigExists() {
 		return "", nil
 	}
-	refreshed, changed, err := refreshProviderToken(name, provider)
+
+	var token string
+	err := withConfigLock(func(cfg *Config) (bool, error) {
+		provider, ok := cfg.LLM.Providers[name]
+		if !ok || !provider.IsOAuth() {
+			return false, nil
+		}
+		refreshed, changed, err := refreshProviderToken(name, provider)
+		if err != nil {
+			return false, err
+		}
+		token = refreshed.AuthToken
+		if changed {
+			cfg.LLM.Providers[name] = refreshed
+		}
+		return changed, nil
+	})
 	if err != nil {
 		return "", err
 	}
-	if changed {
-		cfg.LLM.Providers[name] = refreshed
-		if err := cfg.Save(); err != nil {
-			return "", fmt.Errorf("failed to save refreshed tokens: %w", err)
-		}
-	}
-	return refreshed.AuthToken, nil
+	return token, nil
 }
