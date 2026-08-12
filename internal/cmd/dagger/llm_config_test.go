@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/dagger/dagger/engine/client/secretprovider"
 	"github.com/dagger/dagger/internal/cmd/dagger/llmconfig"
 )
 
@@ -51,6 +53,66 @@ func TestRemoveKeyClearsDefaultModel(t *testing.T) {
 	}
 	if loaded.LLM.DefaultModel != "" {
 		t.Errorf("DefaultModel = %q, want empty after removing the default provider", loaded.LLM.DefaultModel)
+	}
+}
+
+// TestExplicitAuthTokenNotClobbered verifies that a user-exported
+// ANTHROPIC_AUTH_TOKEN survives both the startup export and the on-demand
+// refresher hook. applyLLMConfigEnv already deferred to explicit env vars, but
+// the hook then overwrote the variable with the config's token on every secret
+// resolution — even when nothing was refreshed.
+func TestExplicitAuthTokenNotClobbered(t *testing.T) {
+	tempDir := t.TempDir()
+	origConfigRoot := llmconfig.ConfigRoot
+	origConfigFile := llmconfig.ConfigFile
+	t.Cleanup(func() {
+		llmconfig.ConfigRoot = origConfigRoot
+		llmconfig.ConfigFile = origConfigFile
+	})
+	llmconfig.ConfigRoot = filepath.Join(tempDir, "dagger")
+	llmconfig.ConfigFile = filepath.Join(llmconfig.ConfigRoot, llmconfig.ConfigFileName)
+
+	cfg := &llmconfig.Config{
+		LLM: llmconfig.LLMConfig{
+			DefaultProvider: "anthropic",
+			Providers: map[string]llmconfig.Provider{
+				"anthropic": {
+					AuthType:  "oauth",
+					AuthToken: "config-token",
+					// Far enough out that nothing tries to refresh it.
+					TokenExpiry:  time.Now().Add(time.Hour).UnixMilli(),
+					RefreshToken: "rt-0",
+					Enabled:      true,
+				},
+			},
+		},
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() failed: %v", err)
+	}
+
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "user-token")
+
+	applyLLMConfigEnv()
+	if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != "user-token" {
+		t.Fatalf("after applyLLMConfigEnv, ANTHROPIC_AUTH_TOKEN = %q, want the explicit %q", got, "user-token")
+	}
+
+	// Resolve the secret the way the engine does, which runs the refresher
+	// hook registered in this package's init.
+	resolver, name, err := secretprovider.ResolverForID("env://ANTHROPIC_AUTH_TOKEN")
+	if err != nil {
+		t.Fatalf("ResolverForID() failed: %v", err)
+	}
+	val, err := resolver(t.Context(), name)
+	if err != nil {
+		t.Fatalf("resolving env://ANTHROPIC_AUTH_TOKEN failed: %v", err)
+	}
+	if string(val) != "user-token" {
+		t.Errorf("resolved token = %q, want the explicit %q", val, "user-token")
+	}
+	if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != "user-token" {
+		t.Errorf("refresher hook overwrote ANTHROPIC_AUTH_TOKEN with %q", got)
 	}
 }
 

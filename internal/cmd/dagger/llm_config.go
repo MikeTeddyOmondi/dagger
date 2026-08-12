@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 
@@ -25,6 +26,34 @@ import (
 var oauthEnvProviders = map[string]string{
 	"ANTHROPIC_AUTH_TOKEN":    "anthropic",
 	"OPENAI_CODEX_AUTH_TOKEN": "openai-codex",
+}
+
+// llmEnvExports records the values applyLLMConfigEnv and the OAuth refresher
+// hook exported, keyed by variable name, so a refresh can update its own
+// variables without clobbering one the user exported explicitly. An explicit
+// `export ANTHROPIC_AUTH_TOKEN=...` wins for the whole session, not just at
+// startup.
+var (
+	llmEnvMu      sync.Mutex
+	llmEnvExports = map[string]string{}
+)
+
+// exportLLMEnv sets key to val unless the variable already holds a value we
+// did not put there. Values we do export are remembered, so a later refresh
+// can replace its own.
+func exportLLMEnv(key, val string) {
+	if val == "" {
+		return
+	}
+	llmEnvMu.Lock()
+	defer llmEnvMu.Unlock()
+	if cur, set := os.LookupEnv(key); set {
+		if exported, ours := llmEnvExports[key]; !ours || exported != cur {
+			return
+		}
+	}
+	os.Setenv(key, val)
+	llmEnvExports[key] = val
 }
 
 func init() {
@@ -60,9 +89,9 @@ func init() {
 		if err != nil {
 			return err
 		}
-		if token != "" {
-			os.Setenv(name, token)
-		}
+		// Never overwrite a token the user exported explicitly, even when the
+		// refresh was a no-op and this is just the stored value.
+		exportLLMEnv(name, token)
 		return nil
 	})
 }
@@ -88,15 +117,6 @@ func applyLLMConfigEnv() {
 	if err != nil || cfg == nil {
 		return
 	}
-	setIfEmpty := func(key, val string) {
-		if val == "" {
-			return
-		}
-		if _, ok := os.LookupEnv(key); ok {
-			return
-		}
-		os.Setenv(key, val)
-	}
 	// Honor the configured default model (`dagger llm set-default`), which lives
 	// in cfg.LLM.DefaultModel/DefaultProvider rather than any provider's own
 	// p.Model. The engine's router picks a model from the per-provider *_MODEL
@@ -104,19 +124,19 @@ func applyLLMConfigEnv() {
 	// default is written to config but never reaches the engine, which then
 	// falls back to its hardcoded default. Done before the provider loop so it
 	// wins over a stale per-provider model; explicit env vars still win via
-	// setIfEmpty.
+	// exportLLMEnv.
 	if cfg.LLM.DefaultModel != "" {
 		switch cfg.LLM.DefaultProvider {
 		case "anthropic":
-			setIfEmpty("ANTHROPIC_MODEL", cfg.LLM.DefaultModel)
+			exportLLMEnv("ANTHROPIC_MODEL", cfg.LLM.DefaultModel)
 		case "openai", "openrouter":
-			setIfEmpty("OPENAI_MODEL", cfg.LLM.DefaultModel)
+			exportLLMEnv("OPENAI_MODEL", cfg.LLM.DefaultModel)
 		case "openai-codex":
-			setIfEmpty("OPENAI_CODEX_MODEL", cfg.LLM.DefaultModel)
+			exportLLMEnv("OPENAI_CODEX_MODEL", cfg.LLM.DefaultModel)
 		case "google", "gemini":
-			setIfEmpty("GEMINI_MODEL", cfg.LLM.DefaultModel)
+			exportLLMEnv("GEMINI_MODEL", cfg.LLM.DefaultModel)
 		case "local":
-			setIfEmpty("LOCAL_MODEL", cfg.LLM.DefaultModel)
+			exportLLMEnv("LOCAL_MODEL", cfg.LLM.DefaultModel)
 		}
 	}
 	// The openai and openrouter providers share the OPENAI_* variables. Pick a
@@ -141,53 +161,53 @@ func applyLLMConfigEnv() {
 			// Codex (ChatGPT subscription) are wired through the engine.
 			switch name {
 			case "anthropic":
-				setIfEmpty("ANTHROPIC_AUTH_TOKEN", p.AuthToken)
-				setIfEmpty("ANTHROPIC_REASONING_EFFORT", p.ReasoningEffort)
+				exportLLMEnv("ANTHROPIC_AUTH_TOKEN", p.AuthToken)
+				exportLLMEnv("ANTHROPIC_REASONING_EFFORT", p.ReasoningEffort)
 			case "openai-codex":
-				setIfEmpty("OPENAI_CODEX_AUTH_TOKEN", p.AuthToken)
-				setIfEmpty("OPENAI_CODEX_MODEL", p.Model)
-				setIfEmpty("OPENAI_CODEX_REASONING_EFFORT", p.ReasoningEffort)
+				exportLLMEnv("OPENAI_CODEX_AUTH_TOKEN", p.AuthToken)
+				exportLLMEnv("OPENAI_CODEX_MODEL", p.Model)
+				exportLLMEnv("OPENAI_CODEX_REASONING_EFFORT", p.ReasoningEffort)
 			}
 			continue
 		}
 		switch name {
 		case "anthropic":
-			setIfEmpty("ANTHROPIC_API_KEY", p.APIKey)
-			setIfEmpty("ANTHROPIC_BASE_URL", p.BaseURL)
-			setIfEmpty("ANTHROPIC_MODEL", p.Model)
-			setIfEmpty("ANTHROPIC_REASONING_EFFORT", p.ReasoningEffort)
+			exportLLMEnv("ANTHROPIC_API_KEY", p.APIKey)
+			exportLLMEnv("ANTHROPIC_BASE_URL", p.BaseURL)
+			exportLLMEnv("ANTHROPIC_MODEL", p.Model)
+			exportLLMEnv("ANTHROPIC_REASONING_EFFORT", p.ReasoningEffort)
 		case "openai":
 			if name != openAISlotOwner {
 				continue
 			}
-			setIfEmpty("OPENAI_API_KEY", p.APIKey)
-			setIfEmpty("OPENAI_BASE_URL", p.BaseURL)
-			setIfEmpty("OPENAI_MODEL", p.Model)
+			exportLLMEnv("OPENAI_API_KEY", p.APIKey)
+			exportLLMEnv("OPENAI_BASE_URL", p.BaseURL)
+			exportLLMEnv("OPENAI_MODEL", p.Model)
 		case "google", "gemini":
-			setIfEmpty("GEMINI_API_KEY", p.APIKey)
-			setIfEmpty("GEMINI_BASE_URL", p.BaseURL)
-			setIfEmpty("GEMINI_MODEL", p.Model)
-			setIfEmpty("GEMINI_REASONING_EFFORT", p.ReasoningEffort)
+			exportLLMEnv("GEMINI_API_KEY", p.APIKey)
+			exportLLMEnv("GEMINI_BASE_URL", p.BaseURL)
+			exportLLMEnv("GEMINI_MODEL", p.Model)
+			exportLLMEnv("GEMINI_REASONING_EFFORT", p.ReasoningEffort)
 		case "openrouter":
 			// OpenRouter is OpenAI-compatible; route it through the OpenAI vars.
 			if name != openAISlotOwner {
 				continue
 			}
-			setIfEmpty("OPENAI_API_KEY", p.APIKey)
-			setIfEmpty("OPENAI_MODEL", p.Model)
+			exportLLMEnv("OPENAI_API_KEY", p.APIKey)
+			exportLLMEnv("OPENAI_MODEL", p.Model)
 			base := p.BaseURL
 			if base == "" {
 				base = "https://openrouter.ai/api/v1"
 			}
-			setIfEmpty("OPENAI_BASE_URL", base)
+			exportLLMEnv("OPENAI_BASE_URL", base)
 		case "local":
 			// A self-hosted, OpenAI- or Anthropic-compatible endpoint. The engine
 			// tunnels to it through this client, so it need only be reachable from
 			// here (e.g. Ollama on localhost).
-			setIfEmpty("LOCAL_BASE_URL", p.BaseURL)
-			setIfEmpty("LOCAL_MODEL", p.Model)
-			setIfEmpty("LOCAL_API_COMPAT", p.APICompat)
-			setIfEmpty("LOCAL_API_KEY", p.APIKey)
+			exportLLMEnv("LOCAL_BASE_URL", p.BaseURL)
+			exportLLMEnv("LOCAL_MODEL", p.Model)
+			exportLLMEnv("LOCAL_API_COMPAT", p.APICompat)
+			exportLLMEnv("LOCAL_API_KEY", p.APIKey)
 		}
 	}
 }
