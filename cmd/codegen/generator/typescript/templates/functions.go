@@ -174,11 +174,20 @@ func (funcs typescriptTemplateFuncs) FuncMap() template.FuncMap {
 // legacy mode.
 const legacyTypeScriptSDKCompatCutoverVersion = "v0.21.0-0"
 
+const nullableObjectSDKCutoverVersion = "v1.0.0-beta.10"
+
 func (funcs typescriptTemplateFuncs) legacyTypeScriptSDKCompat() bool {
 	if funcs.schemaVersion == "" || !semver.IsValid(funcs.schemaVersion) {
 		return false
 	}
 	return semver.Compare(funcs.schemaVersion, legacyTypeScriptSDKCompatCutoverVersion) < 0
+}
+
+func (funcs typescriptTemplateFuncs) supportsNullableObjects() bool {
+	if funcs.schemaVersion == "" || !semver.IsValid(funcs.schemaVersion) {
+		return true
+	}
+	return semver.Compare(funcs.schemaVersion, nullableObjectSDKCutoverVersion) >= 0
 }
 
 // isInterface checks if the type is a GraphQL interface.
@@ -341,7 +350,7 @@ func (funcs typescriptTemplateFuncs) solve(field introspection.Field) bool {
 }
 
 func (funcs typescriptTemplateFuncs) isNullableObject(ref *introspection.TypeRef) bool {
-	return ref != nil && ref.IsOptional() && (ref.IsObject() || ref.IsInterface())
+	return funcs.supportsNullableObjects() && ref != nil && ref.IsOptional() && (ref.IsObject() || ref.IsInterface())
 }
 
 // subtract subtract integer a with integer b.
