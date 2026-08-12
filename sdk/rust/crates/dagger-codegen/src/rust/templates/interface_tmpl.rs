@@ -100,7 +100,7 @@ fn render_trait_method(
     // Build argument list (required args only for trait signatures)
     let args = render_trait_method_args(funcs, field);
 
-    if type_ref.is_object() && type_ref.is_optional() {
+    if funcs.supports_nullable_objects() && type_ref.is_object() && type_ref.is_optional() {
         Some(quote! {
             $(field.description.pipe(|d| format_struct_comment(d)))
             fn $fn_name(&self$(if let Some(a) = &args => , $a)) -> impl core::future::Future<Output = Result<Option<$output_type>, $dagger_error>> + Send;
@@ -197,7 +197,7 @@ fn render_trait_impl_method(
 
     let (arg_sig, _arg_pass) = render_trait_impl_arg_parts(funcs, field);
 
-    if type_ref.is_object() && type_ref.is_optional() {
+    if funcs.supports_nullable_objects() && type_ref.is_object() && type_ref.is_optional() {
         let graphql_name = type_ref.get_non_null().name.clone().unwrap_or_default();
         Some(quote! {
             fn $fn_name(&self$(if let Some(a) = &arg_sig => , $a)) -> impl core::future::Future<Output = Result<Option<$(&output_type)>, $dagger_error>> + Send {

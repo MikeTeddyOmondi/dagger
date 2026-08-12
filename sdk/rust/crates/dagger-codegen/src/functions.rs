@@ -29,13 +29,19 @@ pub type DynFormatTypeFuncs = Arc<dyn FormatTypeFuncs + Send + Sync>;
 
 pub struct CommonFunctions {
     format_type_funcs: DynFormatTypeFuncs,
+    supports_nullable_objects: bool,
 }
 
 impl CommonFunctions {
-    pub fn new(funcs: DynFormatTypeFuncs) -> Self {
+    pub fn new(funcs: DynFormatTypeFuncs, schema_version: Option<&str>) -> Self {
         Self {
             format_type_funcs: funcs,
+            supports_nullable_objects: supports_nullable_objects(schema_version),
         }
+    }
+
+    pub fn supports_nullable_objects(&self) -> bool {
+        self.supports_nullable_objects
     }
 
     pub fn format_input_type(&self, t: &TypeRef) -> String {
@@ -158,6 +164,38 @@ impl CommonFunctions {
 
         representation
     }
+}
+
+fn supports_nullable_objects(schema_version: Option<&str>) -> bool {
+    let Some(version) = schema_version.filter(|version| !version.is_empty()) else {
+        return true;
+    };
+    let version = version.trim_start_matches('v');
+    let Some((core, prerelease)) = version.split_once('-') else {
+        return version
+            .split('.')
+            .take(3)
+            .map(|part| part.parse::<u64>())
+            .collect::<Result<Vec<_>, _>>()
+            .map(|core| core.as_slice() >= &[1, 0, 0])
+            .unwrap_or(true);
+    };
+    let Ok(core) = core
+        .split('.')
+        .take(3)
+        .map(|part| part.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return true;
+    };
+    if core.as_slice() != [1, 0, 0] {
+        return core.as_slice() > &[1, 0, 0];
+    }
+    prerelease
+        .strip_prefix("beta.")
+        .and_then(|number| number.parse::<u64>().ok())
+        .map(|number| number >= 10)
+        .unwrap_or(prerelease > "beta")
 }
 
 fn get_type(type_ref: &TypeRef) -> Option<TypeRef> {
