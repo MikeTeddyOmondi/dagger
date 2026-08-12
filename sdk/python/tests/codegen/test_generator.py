@@ -296,10 +296,24 @@ def test_nullable_object_field():
         repository,
     )
 
-    assert handler.func_signature() == "async def latest_version(self) -> GitRef | None:"
-    assert str(handler.func_body()).endswith(
-        "return await _ctx.execute_object(GitRef)"
+    assert handler.func_signature() == (
+        "async def latest_version(self) -> GitRef | None:"
     )
+    assert str(handler.func_body()).endswith("return await _ctx.execute_object(GitRef)")
+
+
+def test_nullable_object_field_older_engine():
+    git_ref = Object("GitRef", {"id": Field(NonNull(GraphQLID))})
+    repository = Object("GitRepository", {})
+    handler = _ObjectField(
+        Context(schema_version="v1.0.0-beta.9"),
+        "latestVersion",
+        Field(git_ref),
+        repository,
+    )
+
+    assert handler.func_signature() == "def latest_version(self) -> GitRef:"
+    assert str(handler.func_body()).endswith("return GitRef(_ctx)")
 
 
 def test_generate_modern_id_surface():
