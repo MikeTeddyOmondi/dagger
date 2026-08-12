@@ -141,7 +141,7 @@ type LLMEndpoint struct {
 	// goes stale in any long-running conversation. AuthToken is kept as the
 	// value observed when the endpoint was routed (used for the SDK's own
 	// construction-time setup and as the fallback when no source is set).
-	AuthTokenSource CredentialSource
+	AuthTokenSource *CredentialSource
 
 	// ReasoningEffort is the reasoning level (e.g. "low"/"medium"/"high",
 	// sourced from catwalk's per-model levels) for providers that support
@@ -625,18 +625,8 @@ type LLMRouter struct {
 	// a snapshot: the client's secret provider re-reads (and, for the CLI,
 	// refreshes) the token on every resolution, so asking again at request
 	// time yields the current one. Nil when no token was configured.
-	reloadAnthropicAuthToken CredentialSource
-	reloadCodexAuthToken     CredentialSource
-}
-
-// reloader returns a CredentialSource that re-runs getenv for key. The
-// returned closure carries no client identity of its own — LoadClientConfig
-// binds getenv to the client whose configuration is being read, so a reload
-// resolves against the same client that supplied the value.
-func reloader(getenv func(context.Context, string) (string, error), key string) CredentialSource {
-	return func(ctx context.Context) (string, error) {
-		return getenv(ctx, key)
-	}
+	reloadAnthropicAuthToken credentialResolver
+	reloadCodexAuthToken     credentialResolver
 }
 
 func (r *LLMRouter) isAnthropicModel(model string) bool {
@@ -693,7 +683,7 @@ func (r *LLMRouter) routeAnthropicModel() *LLMEndpoint {
 		Provider:        Anthropic,
 		AuthToken:       r.AnthropicAuthToken,
 		IsOAuth:         r.AnthropicIsOAuth,
-		AuthTokenSource: cachedCredential(credentialRefreshTTL, r.reloadAnthropicAuthToken),
+		AuthTokenSource: newCredentialSource(r.reloadAnthropicAuthToken),
 		ReasoningEffort: r.AnthropicReasoningEffort,
 	}
 	endpoint.Client = newAnthropicClient(endpoint)
@@ -719,7 +709,7 @@ func (r *LLMRouter) routeCodexModel() *LLMEndpoint {
 		Provider:        OpenAICodex,
 		AuthToken:       r.OpenAICodexAuthToken,
 		IsOAuth:         true,
-		AuthTokenSource: cachedCredential(credentialRefreshTTL, r.reloadCodexAuthToken),
+		AuthTokenSource: newCredentialSource(r.reloadCodexAuthToken),
 		ReasoningEffort: r.OpenAICodexReasoningEffort,
 	}
 	endpoint.Client = newOpenAICodexClient(endpoint)
@@ -947,7 +937,7 @@ func (r *LLMRouter) LoadConfig(ctx context.Context, getenv func(context.Context,
 		}
 		if v != "" {
 			r.AnthropicAuthToken = v
-			r.reloadAnthropicAuthToken = reloader(getenv, "ANTHROPIC_AUTH_TOKEN")
+			r.reloadAnthropicAuthToken = credentialReloader(getenv, "ANTHROPIC_AUTH_TOKEN")
 			anthropicTokenSet = true
 		}
 		return nil
@@ -978,7 +968,7 @@ func (r *LLMRouter) LoadConfig(ctx context.Context, getenv func(context.Context,
 		}
 		if v != "" {
 			r.OpenAICodexAuthToken = v
-			r.reloadCodexAuthToken = reloader(getenv, "OPENAI_CODEX_AUTH_TOKEN")
+			r.reloadCodexAuthToken = credentialReloader(getenv, "OPENAI_CODEX_AUTH_TOKEN")
 		}
 		return nil
 	})
@@ -1204,6 +1194,24 @@ func loadLLMRouter(ctx context.Context, query *Query) (_ *LLMRouter, rerr error)
 	if err := loadFrom(parentClient); err != nil {
 		return nil, err
 	}
+
+	// Re-resolution of a credential must outlive this call. The endpoint this
+	// router routes is memoized for the whole conversation and re-asked on
+	// every provider request — including by an agent loop still stepping long
+	// after the request that first routed it completed — so binding resolution
+	// to this call's context would make the credential die with it. Scope it
+	// to the session instead, the same way the local-LLM tunnel is (see
+	// LLM.Endpoint), so it lives exactly as long as the client that supplies
+	// it. The scope is taken against the parent client, which is a session
+	// client by construction, rather than the possibly-module ambient one.
+	sessionCtx, err := query.Server.SessionScopedContext(
+		engine.ContextWithClientMetadata(ctx, parentClient))
+	if err != nil {
+		return nil, fmt.Errorf("LLM credentials: session context: %w", err)
+	}
+	router.reloadAnthropicAuthToken = router.reloadAnthropicAuthToken.detach(sessionCtx)
+	router.reloadCodexAuthToken = router.reloadCodexAuthToken.detach(sessionCtx)
+
 	return router, nil
 }
 

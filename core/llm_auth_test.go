@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -114,162 +116,183 @@ func newLLMEndpointTestCtx(t *testing.T) (context.Context, *llmEnv) {
 	return ContextWithQuery(ctx, query), env
 }
 
-// TestLLMEndpointMemoizationPinsAuthToken demonstrates the staleness bug:
-// (*LLM).Endpoint memoizes the resolved endpoint (core/llm.go), and the
-// subscription OAuth bearer token is a field of that endpoint — baked into the
-// provider SDK client at construction (newAnthropicClient, core/llm_anthropic.go).
-// So the token a conversation authenticates with is fixed the first time
-// anything resolves its endpoint, for the rest of that LLM value chain's life,
-// no matter how many times the client refreshes the credential afterwards.
-func TestLLMEndpointMemoizationPinsAuthToken(t *testing.T) {
+// anthropic401Server is a stand-in provider that rejects everything, recording
+// the credential each request carried. A 401 body is all the SDK needs to
+// produce a typed API error, and it keeps the tests off the streaming happy
+// path — what is under test is which token went out, not what came back.
+func anthropic401Server(t *testing.T, onRequest func(auth string)) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		onRequest(r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		//nolint:errcheck
+		w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired"}}`))
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func llmTestHistory() []*LLMMessage {
+	return []*LLMMessage{{
+		Role:    LLMMessageRoleUser,
+		Content: []*LLMContentBlock{{Kind: LLMContentText, Text: "hi"}},
+	}}
+}
+
+// TestLLMEndpointResolvesCredentialPerRequest is the core of the fix. The
+// endpoint stays memoized — re-routing costs a full config load, ~21 variables
+// at two client round-trips each — but the credential is no longer part of
+// what gets memoized: the endpoint's transport asks its source per request, so
+// a token the client rotated mid-session reaches the provider without anything
+// rebuilding the endpoint or the SDK client.
+func TestLLMEndpointResolvesCredentialPerRequest(t *testing.T) {
 	ctx, env := newLLMEndpointTestCtx(t)
 	query, err := CurrentQuery(ctx)
 	require.NoError(t, err)
 
+	var mu sync.Mutex
+	var seen []string
+	ts := anthropic401Server(t, func(auth string) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, auth)
+	})
+	env.set("env://ANTHROPIC_BASE_URL", ts.URL)
+
 	llm, err := query.NewLLM(ctx, "claude-sonnet-4-5", "")
 	require.NoError(t, err)
 
-	ep1, err := llm.Endpoint(ctx)
+	ep, err := llm.Endpoint(ctx)
 	require.NoError(t, err)
-	require.Equal(t, Anthropic, ep1.Provider)
-	require.True(t, ep1.IsOAuth)
-	assert.Equal(t, "token-v1", ep1.AuthToken)
-	reads := env.readCount("env://ANTHROPIC_AUTH_TOKEN")
-	assert.Positive(t, reads, "first resolution must read the token from the client")
+	require.Equal(t, Anthropic, ep.Provider)
+	require.True(t, ep.IsOAuth)
+	require.NotNil(t, ep.AuthTokenSource)
+	assert.Equal(t, "token-v1", ep.AuthToken, "the snapshot observed at routing time")
+
+	clk := newTestClock()
+	ep.AuthTokenSource.now = clk.Now
+
+	_, err = ep.Client.SendQuery(ctx, llmTestHistory(), nil, &LLMCallOpts{})
+	require.Error(t, err)
 
 	// The client refreshes the expired access token (secretprovider's
 	// EnvRefresher hook + os.Setenv, engine/client/secretprovider/env.go).
 	env.set("env://ANTHROPIC_AUTH_TOKEN", "token-v2")
+	clk.Advance(credentialRefreshTTL + time.Second)
 
-	// ...but the memoized endpoint never asks again.
-	ep2, err := llm.Endpoint(ctx)
+	_, err = ep.Client.SendQuery(ctx, llmTestHistory(), nil, &LLMCallOpts{})
+	require.Error(t, err)
+
+	mu.Lock()
+	require.Equal(t, []string{"Bearer token-v1", "Bearer token-v2"}, seen)
+	mu.Unlock()
+
+	// The memo is intact — that is deliberate, and no longer costs freshness.
+	again, err := llm.Endpoint(ctx)
 	require.NoError(t, err)
-	assert.Same(t, ep1, ep2, "endpoint is memoized, not re-derived")
-	assert.Equal(t, "token-v1", ep2.AuthToken, "stale token survives the refresh")
-	assert.Equal(t, reads, env.readCount("env://ANTHROPIC_AUTH_TOKEN"),
-		"no further client round-trip, so the refresher never runs")
+	assert.Same(t, ep, again)
+	assert.Equal(t, "token-v1", again.AuthToken,
+		"the routing-time snapshot is unchanged; only the transport is live")
 
-	// Clone() copies the endpoint pointer (core/llm.go), and every LLM
-	// transition — withPrompt, withResponse, withToolResult, step, loop,
-	// fork, the agent runtime's drainMailbox — goes through Clone. So the
-	// whole rest of the conversation inherits the pinned token.
-	t.Run("clone carries the pinned endpoint", func(t *testing.T) {
+	// Clone() copies the endpoint pointer, and every LLM transition —
+	// withPrompt, withResponse, withToolResult, step, loop, fork — goes
+	// through it, so the whole conversation shares the one live source.
+	t.Run("clones share the live credential", func(t *testing.T) {
 		next := llm.WithPrompt("hello").
 			WithResponse([]*LLMContentBlock{{Kind: LLMContentText, Text: "hi"}}, LLMTokenUsage{}).
 			WithToolResult("call_1", "ok", false).
 			Clone()
 		epNext, err := next.Endpoint(ctx)
 		require.NoError(t, err)
-		assert.Same(t, ep1, epNext)
-		assert.Equal(t, "token-v1", epNext.AuthToken)
+		assert.Same(t, ep, epNext)
+
+		env.set("env://ANTHROPIC_AUTH_TOKEN", "token-v3")
+		clk.Advance(credentialRefreshTTL + time.Second)
+		_, err = epNext.Client.SendQuery(ctx, llmTestHistory(), nil, &LLMCallOpts{})
+		require.Error(t, err)
+
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Equal(t, "Bearer token-v3", seen[len(seen)-1])
 	})
 
-	// Two "workers" forked off the same conversation share ONE endpoint
-	// value, so a refresh observed by neither reaches both: parallel agents
-	// derived from a chain whose endpoint is already resolved all run on the
-	// same pinned token.
-	t.Run("parallel forks share the pinned endpoint", func(t *testing.T) {
-		w1, w2 := llm.Clone(), llm.Clone()
-		ep1a, err := w1.Endpoint(ctx)
+	// withModel/withReasoningEffort still drop the memo (the route itself
+	// changes), and re-derive against the current environment.
+	t.Run("withModel re-routes", func(t *testing.T) {
+		ep, err := llm.WithModel("claude-sonnet-4-5", "").Endpoint(ctx)
 		require.NoError(t, err)
-		ep2a, err := w2.Endpoint(ctx)
-		require.NoError(t, err)
-		assert.Same(t, ep1a, ep2a)
-		assert.Equal(t, "token-v1", ep1a.AuthToken)
-	})
-
-	// Only a fresh LLM (a new llm() call) or an explicit endpoint reset
-	// observes the refreshed credential.
-	t.Run("fresh LLM sees the refreshed token", func(t *testing.T) {
-		fresh, err := query.NewLLM(ctx, "claude-sonnet-4-5", "")
-		require.NoError(t, err)
-		ep, err := fresh.Endpoint(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, "token-v2", ep.AuthToken)
-	})
-
-	t.Run("withModel/withReasoningEffort reset the endpoint", func(t *testing.T) {
-		remodeled := llm.WithModel("claude-sonnet-4-5", "")
-		ep, err := remodeled.Endpoint(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, "token-v2", ep.AuthToken)
-
-		reasoned := llm.WithReasoningEffort("low")
-		ep, err = reasoned.Endpoint(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, "token-v2", ep.AuthToken)
+		assert.Equal(t, "token-v3", ep.AuthToken)
 	})
 }
 
-// TestLLMEndpointResolutionOnCloneDoesNotPinReceiver pins down the asymmetry
-// that decides whether a long session self-heals.
-//
-// (*LLM).step clones the receiver before resolving the endpoint (core/llm.go),
-// so a step's own resolution is memoized on a throwaway value: an LLM that has
-// never had its endpoint resolved "persistently" re-derives the router — and
-// therefore re-reads env://ANTHROPIC_AUTH_TOKEN through the client, giving the
-// CLI's refresher hook its chance — on EVERY step.
-//
-// Any resolution on the persistent value itself defeats that permanently:
-// LLM.model / LLM.provider / LLM.contextWindow / LLM.reasoningEffort
-// (core/schema/llm.go) call Endpoint(ctx) straight on the receiver, and Clone
-// then carries the memo into every descendant of the conversation.
-func TestLLMEndpointResolutionOnCloneDoesNotPinReceiver(t *testing.T) {
+// TestLLMEndpointHonorsReportedExpiry runs the *_EXPIRES_AT contract
+// end-to-end: the client exports the token's true expiry beside it, and the
+// engine caches the credential until one margin before that instant — not
+// until the blind 30s TTL, which is all it can do when the expiry is unknown.
+func TestLLMEndpointHonorsReportedExpiry(t *testing.T) {
 	ctx, env := newLLMEndpointTestCtx(t)
 	query, err := CurrentQuery(ctx)
 	require.NoError(t, err)
 
-	llm, err := query.NewLLM(ctx, "claude-sonnet-4-5", "")
-	require.NoError(t, err)
-
-	// The shape of step()/sendQueryWithRetry: resolve on a clone.
-	ep, err := llm.Clone().Endpoint(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, "token-v1", ep.AuthToken)
-
-	env.set("env://ANTHROPIC_AUTH_TOKEN", "token-v2")
-
-	// The next "step" re-derives, so the refreshed token is picked up.
-	ep, err = llm.Clone().Endpoint(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, "token-v2", ep.AuthToken,
-		"a step that resolves on a clone must observe a refreshed credential")
-
-	// One resolution on the persistent value ends that: LLM.model and friends
-	// do exactly this, and every later clone inherits the memo.
-	pinned, err := llm.Endpoint(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, "token-v2", pinned.AuthToken)
-
-	env.set("env://ANTHROPIC_AUTH_TOKEN", "token-v3")
-
-	ep, err = llm.Clone().Endpoint(ctx)
-	require.NoError(t, err)
-	assert.Same(t, pinned, ep)
-	assert.Equal(t, "token-v2", ep.AuthToken,
-		"once the persistent value memoized, every step reuses the pinned token")
-}
-
-// TestAnthropicClientBakesAuthToken shows the second half of the pin: even if
-// something did refresh LLMEndpoint.AuthToken in place, the request would still
-// carry the old bearer token — newAnthropicClient captures it in the SDK
-// client's request options at construction time (core/llm_anthropic.go).
-// It also covers 401 handling: an expired-token 401 is not retryable, so
-// sendQueryWithRetry gives up immediately (which is just as well, since the
-// retry would reuse the same baked-in token).
-func TestAnthropicClientBakesAuthToken(t *testing.T) {
 	var mu sync.Mutex
 	var seen []string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := anthropic401Server(t, func(auth string) {
 		mu.Lock()
-		seen = append(seen, r.Header.Get("Authorization"))
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		//nolint:errcheck
-		w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired"}}`))
-	}))
-	defer ts.Close()
+		defer mu.Unlock()
+		seen = append(seen, auth)
+	})
+	env.set("env://ANTHROPIC_BASE_URL", ts.URL)
+
+	clk := newTestClock()
+	env.set("env://ANTHROPIC_AUTH_TOKEN_EXPIRES_AT",
+		clk.Now().Add(10*time.Minute).Format(time.RFC3339))
+
+	llm, err := query.NewLLM(ctx, "claude-sonnet-4-5", "")
+	require.NoError(t, err)
+	ep, err := llm.Endpoint(ctx)
+	require.NoError(t, err)
+	ep.AuthTokenSource.now = clk.Now
+
+	send := func() {
+		_, err := ep.Client.SendQuery(ctx, llmTestHistory(), nil, &LLMCallOpts{})
+		require.Error(t, err)
+	}
+	send()
+
+	// A rotation the client hasn't announced is invisible until the horizon,
+	// which is capped at credentialMaxTTL even though the token has ten
+	// minutes left.
+	env.set("env://ANTHROPIC_AUTH_TOKEN", "token-v2")
+	clk.Advance(credentialRefreshTTL + time.Second)
+	send()
+	clk.Advance(credentialMaxTTL)
+	send()
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{
+		"Bearer token-v1",
+		"Bearer token-v1",
+		"Bearer token-v2",
+	}, seen)
+
+	reads := env.readCount("env://ANTHROPIC_AUTH_TOKEN_EXPIRES_AT")
+	assert.Positive(t, reads, "the expiry must be read alongside the token")
+}
+
+// TestAnthropicClientWithoutSourceKeepsBakedToken is the invariant behind the
+// whole design: an SDK client captures its credential at construction, so an
+// endpoint without a source sends the token it was routed with forever, no
+// matter what is assigned to LLMEndpoint.AuthToken afterwards.
+func TestAnthropicClientWithoutSourceKeepsBakedToken(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	ts := anthropic401Server(t, func(auth string) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, auth)
+	})
 
 	endpoint := &LLMEndpoint{
 		Model:     "claude-sonnet-4-5",
@@ -280,24 +303,11 @@ func TestAnthropicClientBakesAuthToken(t *testing.T) {
 	}
 	client := newAnthropicClient(endpoint)
 
-	history := []*LLMMessage{{
-		Role:    LLMMessageRoleUser,
-		Content: []*LLMContentBlock{{Kind: LLMContentText, Text: "hi"}},
-	}}
-
-	_, err := client.SendQuery(t.Context(), history, nil, &LLMCallOpts{})
+	_, err := client.SendQuery(t.Context(), llmTestHistory(), nil, &LLMCallOpts{})
 	require.Error(t, err)
 
-	// An expired-token 401 is not classified as retryable, so
-	// sendQueryWithRetry wraps it in backoff.Permanent and the user sees the
-	// raw provider error.
-	assert.False(t, client.IsRetryable(err),
-		"401 authentication_error is not retryable: %v", err)
-
-	// Rotating the token on the endpoint changes nothing: the SDK client
-	// already holds the old one.
 	endpoint.AuthToken = "token-v2"
-	_, err = client.SendQuery(t.Context(), history, nil, &LLMCallOpts{})
+	_, err = client.SendQuery(t.Context(), llmTestHistory(), nil, &LLMCallOpts{})
 	require.Error(t, err)
 
 	mu.Lock()
@@ -308,50 +318,106 @@ func TestAnthropicClientBakesAuthToken(t *testing.T) {
 		"the bearer token is captured at client construction, not read per request")
 }
 
-// TestCodexClientBakesAuthToken is the Codex (ChatGPT subscription) twin of
-// TestAnthropicClientBakesAuthToken. Codex is worse off on two counts: the
-// token is also used to derive the chatgpt-account-id header, and
-// OpenAICodexClient.IsRetryable returns false unconditionally
-// (core/llm_openai_codex.go).
-func TestCodexClientBakesAuthToken(t *testing.T) {
+// TestCodexClientRotatesAccountIDWithToken is the Codex (ChatGPT subscription)
+// twin. Codex needs more than the header swapped: the required
+// chatgpt-account-id header is derived from the token's own JWT claims, so it
+// has to be recomputed whenever the token rotates.
+func TestCodexClientRotatesAccountIDWithToken(t *testing.T) {
+	type request struct{ auth, account string }
 	var mu sync.Mutex
-	var seen []string
+	var seen []request
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		seen = append(seen, r.Header.Get("Authorization"))
+		seen = append(seen, request{
+			auth:    r.Header.Get("Authorization"),
+			account: r.Header.Get("chatgpt-account-id"),
+		})
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		//nolint:errcheck
 		w.Write([]byte(`{"detail":"Your authentication token has expired."}`))
 	}))
-	defer ts.Close()
+	t.Cleanup(ts.Close)
 
+	tokenV1 := codexTestToken(t, "acct-old")
+	tokenV2 := codexTestToken(t, "acct-new")
+
+	var current atomic.Pointer[string]
+	current.Store(&tokenV1)
+	clk := newTestClock()
 	endpoint := &LLMEndpoint{
 		Model:     "gpt-5.5",
 		BaseURL:   ts.URL,
 		Provider:  OpenAICodex,
-		AuthToken: "token-v1",
+		AuthToken: tokenV1,
 		IsOAuth:   true,
+		AuthTokenSource: newTestCredentialSource(clk, func(context.Context) (Credential, error) {
+			return Credential{Token: *current.Load()}, nil
+		}),
 	}
 	client := newOpenAICodexClient(endpoint)
 
-	history := []*LLMMessage{{
-		Role:    LLMMessageRoleUser,
-		Content: []*LLMContentBlock{{Kind: LLMContentText, Text: "hi"}},
-	}}
-
-	_, err := client.SendQuery(t.Context(), history, nil, &LLMCallOpts{})
+	_, err := client.SendQuery(t.Context(), llmTestHistory(), nil, &LLMCallOpts{})
 	require.Error(t, err)
-	assert.False(t, client.IsRetryable(err), "Codex never retries anything")
 
-	endpoint.AuthToken = "token-v2"
-	_, err = client.SendQuery(t.Context(), history, nil, &LLMCallOpts{})
+	current.Store(&tokenV2)
+	clk.Advance(credentialRefreshTTL + time.Second)
+	_, err = client.SendQuery(t.Context(), llmTestHistory(), nil, &LLMCallOpts{})
 	require.Error(t, err)
 
 	mu.Lock()
 	defer mu.Unlock()
 	require.Len(t, seen, 2)
-	assert.Equal(t, "Bearer token-v1", seen[0])
-	assert.Equal(t, "Bearer token-v1", seen[1])
+	assert.Equal(t, "Bearer "+tokenV1, seen[0].auth)
+	assert.Equal(t, "acct-old", seen[0].account)
+	assert.Equal(t, "Bearer "+tokenV2, seen[1].auth)
+	assert.Equal(t, "acct-new", seen[1].account,
+		"the account id is derived from the token, so it must rotate with it")
+}
+
+// TestLLMCredentialResolvesAgainstLoadingClient guards the property that lets
+// a nested `dagger agent` use the session's LLM auth without ever holding
+// credentials: the reload runs against the client whose configuration supplied
+// the token, whoever happens to be making the request.
+func TestLLMCredentialResolvesAgainstLoadingClient(t *testing.T) {
+	srv := newCoreDagqlServerForTest(t, LLMTestQuery{})
+	dagql.Fields[LLMTestQuery]{
+		dagql.Func("secret", func(_ context.Context, _ LLMTestQuery, args struct {
+			URI string
+		}) (mockSecret, error) {
+			return mockSecret{uri: args.URI}, nil
+		}).WithInput(dagql.PerCallInput),
+	}.Install(srv)
+	dagql.Fields[mockSecret]{
+		dagql.Func("plaintext", func(ctx context.Context, self mockSecret, _ struct{}) (string, error) {
+			md, err := engine.ClientMetadataFromContext(ctx)
+			if err != nil {
+				return "", err
+			}
+			if self.uri == "env://ANTHROPIC_AUTH_TOKEN" {
+				return "token-of-" + md.ClientID, nil
+			}
+			return "", nil
+		}).DoNotCache("plaintext is read fresh from the client"),
+	}.Install(srv)
+
+	cache, err := dagql.NewCache(t.Context(), "", nil, nil)
+	require.NoError(t, err)
+	withClient := func(id string) context.Context {
+		return dagql.ContextWithCache(engine.ContextWithClientMetadata(t.Context(),
+			&engine.ClientMetadata{ClientID: id, SessionID: "llm-test-session"}), cache)
+	}
+
+	router := new(LLMRouter)
+	_, err = router.LoadClientConfig(withClient("host"), srv)
+	require.NoError(t, err)
+	require.Equal(t, "token-of-host", router.AnthropicAuthToken)
+	require.NotNil(t, router.reloadAnthropicAuthToken)
+
+	// The request that needs the credential comes from a nested client, which
+	// has no login of its own. Resolution must still land on the host's.
+	cred, err := router.reloadAnthropicAuthToken(withClient("nested-agent"))
+	require.NoError(t, err)
+	assert.Equal(t, "token-of-host", cred.Token)
 }

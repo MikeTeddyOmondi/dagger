@@ -26,7 +26,9 @@ const maxBodyCapture = 256 * 1024 // 256 KiB
 // When the endpoint carries a credential source, the transport chain also
 // re-authenticates every request from it, so a rotated OAuth bearer token
 // takes effect without rebuilding the provider's SDK client (which bakes the
-// credential in at construction).
+// credential in at construction). Credential handling sits *below* the OTel
+// transport, which logs bodies and never headers — a bearer token must not
+// reach telemetry.
 func (endpoint *LLMEndpoint) otelHTTPClient(provider string) *http.Client {
 	var base http.RoundTripper
 	if endpoint.dial != nil {

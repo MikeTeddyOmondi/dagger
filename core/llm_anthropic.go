@@ -26,7 +26,10 @@ func newAnthropicClient(endpoint *LLMEndpoint) *AnthropicClient {
 	case endpoint.IsOAuth:
 		// Claude Code subscription OAuth: bearer token + Claude Code identity
 		// headers. The endpoint rejects requests that don't look like Claude
-		// Code (see also the system-prompt injection in SendQuery).
+		// Code (see also the system-prompt injection in SendQuery). The token
+		// baked in here is only the value observed at construction; when the
+		// endpoint carries a credential source, credentialTransport overwrites
+		// the header with the current token on every request.
 		opts = append(opts,
 			option.WithAuthToken(endpoint.AuthToken),
 			option.WithHeader("anthropic-beta", "claude-code-20250219,oauth-2025-04-20"),
