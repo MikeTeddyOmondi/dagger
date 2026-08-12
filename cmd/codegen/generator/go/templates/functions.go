@@ -161,11 +161,22 @@ func (funcs goTemplateFuncs) FuncMap() template.FuncMap {
 // builds as post-cutover while keeping all v0.20.x modules in legacy mode.
 const legacyGoSDKCompatCutoverVersion = "v0.21.0-0"
 
+// nullableObjectSDKCutoverVersion is the first engine version whose SDKs
+// expose nullable object fields as values that must be resolved before use.
+const nullableObjectSDKCutoverVersion = "v1.0.0-beta.10"
+
 func (funcs goTemplateFuncs) legacyGoSDKCompat() bool {
 	if funcs.schemaVersion == "" || funcs.CommonFunctions == nil {
 		return false
 	}
 	return !funcs.CheckVersionCompatibility(legacyGoSDKCompatCutoverVersion)
+}
+
+func (funcs goTemplateFuncs) supportsNullableObjects() bool {
+	if funcs.schemaVersion == "" || funcs.CommonFunctions == nil {
+		return true
+	}
+	return funcs.CheckVersionCompatibility(nullableObjectSDKCutoverVersion)
 }
 
 // fullSchemaTypes returns all types from the full schema, including dependency
@@ -500,7 +511,7 @@ func (funcs goTemplateFuncs) isInterfaceRef(t *introspection.TypeRef) bool {
 }
 
 func (funcs goTemplateFuncs) isNullableObject(t *introspection.TypeRef) bool {
-	return t != nil && t.IsOptional() && (t.IsObject() || funcs.isInterfaceRef(t))
+	return funcs.supportsNullableObjects() && t != nil && t.IsOptional() && (t.IsObject() || funcs.isInterfaceRef(t))
 }
 
 // isListOfInterface returns true if the type ref is a list whose element is an interface.
