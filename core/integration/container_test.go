@@ -6242,7 +6242,9 @@ func (ContainerSuite) TestStat(ctx context.Context, t *testctx.T) {
 		From(alpineImage).
 		WithWorkdir("/sub").
 		WithNewFile("subdir/data", "contents")
-	stat := ctr.Stat("subdir/data")
+	stat, err := ctr.Stat(ctx, "subdir/data")
+	require.NoError(t, err)
+	require.NotNil(t, stat)
 
 	fileType, err := stat.FileType(ctx)
 	require.NoError(t, err)
@@ -6259,7 +6261,9 @@ func (ContainerSuite) TestStatWithMountedDir(ctx context.Context, t *testctx.T) 
 	ctr := c.Container().
 		From(alpineImage).
 		WithMountedDirectory("/mnt", d)
-	stat := ctr.Stat("/mnt/the-file")
+	stat, err := ctr.Stat(ctx, "/mnt/the-file")
+	require.NoError(t, err)
+	require.NotNil(t, stat)
 
 	fileType, err := stat.FileType(ctx)
 	require.NoError(t, err)
@@ -6276,7 +6280,9 @@ func (ContainerSuite) TestStatWithMountedFile(ctx context.Context, t *testctx.T)
 	ctr := c.Container().
 		From(alpineImage).
 		WithMountedFile("/mnt-file", f)
-	stat := ctr.Stat("/mnt-file")
+	stat, err := ctr.Stat(ctx, "/mnt-file")
+	require.NoError(t, err)
+	require.NotNil(t, stat)
 
 	fileType, err := stat.FileType(ctx)
 	require.NoError(t, err)
@@ -6504,7 +6510,9 @@ func (ContainerSuite) TestHealthcheckIsPublished(ctx context.Context, t *testctx
 	require.Contains(t, pushedRef, "@sha256:")
 
 	pulledCtr := c.Container().From(pushedRef)
-	configuredHealthcheck := pulledCtr.DockerHealthcheck()
+	configuredHealthcheck, err := pulledCtr.DockerHealthcheck(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, configuredHealthcheck)
 
 	healthcheckArgs, err := configuredHealthcheck.Args(ctx)
 	require.NoError(t, err)
@@ -6538,7 +6546,9 @@ func (ContainerSuite) TestHealthcheckDefaults(ctx context.Context, t *testctx.T)
 		From(alpineImage).
 		WithDockerHealthcheck([]string{"/this-will-fail-and-thats-ok"})
 
-	configuredHealthcheck := ctr.DockerHealthcheck()
+	configuredHealthcheck, err := ctr.DockerHealthcheck(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, configuredHealthcheck)
 
 	healthcheckArgs, err := configuredHealthcheck.Args(ctx)
 	require.NoError(t, err)
@@ -6609,11 +6619,9 @@ func (ContainerSuite) TestWithoutHealthcheck(ctx context.Context, t *testctx.T) 
 		WithDockerHealthcheck([]string{"/waiter-check-please"}).
 		WithoutDockerHealthcheck()
 
-	configuredHealthcheck := ctr.DockerHealthcheck()
-
-	healthcheckArgs, err := configuredHealthcheck.Args(ctx)
+	configuredHealthcheck, err := ctr.DockerHealthcheck(ctx)
 	require.NoError(t, err)
-	require.Empty(t, healthcheckArgs)
+	require.Nil(t, configuredHealthcheck)
 }
 
 func (ContainerSuite) TestManifest(ctx context.Context, t *testctx.T) {
