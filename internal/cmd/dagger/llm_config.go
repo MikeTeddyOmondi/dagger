@@ -19,14 +19,29 @@ import (
 	"github.com/dagger/dagger/util/cleanups"
 )
 
-// oauthEnvProviders maps the auth-token environment variable the engine
-// resolves against the client to the llmconfig provider that owns it. Used to
-// refresh a subscription OAuth bearer token on demand (see the env refresher
-// registered below), so long-running sessions don't outlive the token.
-var oauthEnvProviders = map[string]string{
-	"ANTHROPIC_AUTH_TOKEN":    "anthropic",
-	"OPENAI_CODEX_AUTH_TOKEN": "openai-codex",
+// oauthEnvVars maps each subscription OAuth provider to the environment
+// variables the engine resolves against the client: the bearer token, and the
+// true access-token expiry (RFC 3339, UTC; absent or empty means unknown), so
+// the engine can cache the credential until it actually expires. The token is
+// refreshed on demand behind these lookups (see the env refresher registered
+// below), so long-running sessions don't outlive it.
+var oauthEnvVars = map[string]struct{ token, expiresAt string }{
+	"anthropic":    {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN_EXPIRES_AT"},
+	"openai-codex": {"OPENAI_CODEX_AUTH_TOKEN", "OPENAI_CODEX_AUTH_TOKEN_EXPIRES_AT"},
 }
+
+// oauthEnvProviders maps either of a provider's variables back to the provider
+// that owns it. The engine resolves the token first and the expiry second
+// within one credential resolution and the refresher hook fires on each, so it
+// has to answer to both names.
+var oauthEnvProviders = func() map[string]string {
+	providers := make(map[string]string, 2*len(oauthEnvVars))
+	for provider, vars := range oauthEnvVars {
+		providers[vars.token] = provider
+		providers[vars.expiresAt] = provider
+	}
+	return providers
+}()
 
 // llmEnvExports records the values applyLLMConfigEnv and the OAuth refresher
 // hook exported, keyed by variable name, so a refresh can update its own
@@ -40,20 +55,50 @@ var (
 
 // exportLLMEnv sets key to val unless the variable already holds a value we
 // did not put there. Values we do export are remembered, so a later refresh
-// can replace its own.
+// can replace its own. An empty val drops a variable we exported earlier —
+// leaving a stale expiry next to a freshly refreshed token would have the
+// engine cache the new credential against the old deadline.
 func exportLLMEnv(key, val string) {
-	if val == "" {
-		return
-	}
 	llmEnvMu.Lock()
 	defer llmEnvMu.Unlock()
-	if cur, set := os.LookupEnv(key); set {
+	cur, set := os.LookupEnv(key)
+	if set {
 		if exported, ours := llmEnvExports[key]; !ours || exported != cur {
 			return
 		}
 	}
+	if val == "" {
+		if set {
+			os.Unsetenv(key)
+			delete(llmEnvExports, key)
+		}
+		return
+	}
 	os.Setenv(key, val)
 	llmEnvExports[key] = val
+}
+
+// exportOAuthEnv refreshes provider's token if it is due and exports both of
+// its variables. Both, always: the engine resolves the token and the expiry as
+// two lookups of one credential, and updating only the one that was asked for
+// would pair a fresh token with a stale deadline.
+func exportOAuthEnv(ctx context.Context, provider string) error {
+	vars, ok := oauthEnvVars[provider]
+	if !ok {
+		return nil
+	}
+	p, err := llmconfig.RefreshOAuthProviderIfNeeded(ctx, provider)
+	if err != nil {
+		return err
+	}
+	if p == nil {
+		return nil
+	}
+	// Never overwrite credentials the user exported explicitly, even when the
+	// refresh was a no-op and these are just the stored values.
+	exportLLMEnv(vars.token, p.AuthToken)
+	exportLLMEnv(vars.expiresAt, p.TokenExpiresAtRFC3339())
+	return nil
 }
 
 func init() {
@@ -85,14 +130,7 @@ func init() {
 		if !ok {
 			return nil
 		}
-		token, err := llmconfig.RefreshOAuthProviderIfNeeded(ctx, provider)
-		if err != nil {
-			return err
-		}
-		// Never overwrite a token the user exported explicitly, even when the
-		// refresh was a no-op and this is just the stored value.
-		exportLLMEnv(name, token)
-		return nil
+		return exportOAuthEnv(ctx, provider)
 	})
 }
 
@@ -157,14 +195,18 @@ func applyLLMConfigEnv() {
 		}
 		if p.IsOAuth() {
 			// OAuth subscription providers export a bearer token that the
-			// engine's router picks up. Anthropic (Claude Code) and OpenAI
-			// Codex (ChatGPT subscription) are wired through the engine.
+			// engine's router picks up, plus the token's true expiry so the
+			// engine can cache the credential exactly that long. Anthropic
+			// (Claude Code) and OpenAI Codex (ChatGPT subscription) are wired
+			// through the engine.
+			if vars, ok := oauthEnvVars[name]; ok {
+				exportLLMEnv(vars.token, p.AuthToken)
+				exportLLMEnv(vars.expiresAt, p.TokenExpiresAtRFC3339())
+			}
 			switch name {
 			case "anthropic":
-				exportLLMEnv("ANTHROPIC_AUTH_TOKEN", p.AuthToken)
 				exportLLMEnv("ANTHROPIC_REASONING_EFFORT", p.ReasoningEffort)
 			case "openai-codex":
-				exportLLMEnv("OPENAI_CODEX_AUTH_TOKEN", p.AuthToken)
 				exportLLMEnv("OPENAI_CODEX_MODEL", p.Model)
 				exportLLMEnv("OPENAI_CODEX_REASONING_EFFORT", p.ReasoningEffort)
 			}

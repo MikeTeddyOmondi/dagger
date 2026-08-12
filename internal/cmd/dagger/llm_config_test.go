@@ -116,6 +116,87 @@ func TestExplicitAuthTokenNotClobbered(t *testing.T) {
 	}
 }
 
+// TestOAuthExpiryEnvExported pins the env contract the engine depends on: the
+// access token's true expiry travels next to the token as RFC 3339 UTC, and
+// the refresher hook updates both variables whichever one the engine asks for
+// — it resolves the token first and the expiry second within one credential
+// resolution, so updating only the requested variable would pair a fresh token
+// with a stale deadline.
+func TestOAuthExpiryEnvExported(t *testing.T) {
+	tempDir := t.TempDir()
+	origConfigRoot := llmconfig.ConfigRoot
+	origConfigFile := llmconfig.ConfigFile
+	t.Cleanup(func() {
+		llmconfig.ConfigRoot = origConfigRoot
+		llmconfig.ConfigFile = origConfigFile
+	})
+	llmconfig.ConfigRoot = filepath.Join(tempDir, "dagger")
+	llmconfig.ConfigFile = filepath.Join(llmconfig.ConfigRoot, llmconfig.ConfigFileName)
+
+	for _, key := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN_EXPIRES_AT"} {
+		if val, ok := os.LookupEnv(key); ok {
+			t.Cleanup(func() { os.Setenv(key, val) })
+			os.Unsetenv(key)
+		} else {
+			t.Cleanup(func() { os.Unsetenv(key) })
+		}
+	}
+
+	// Truncated to the second: RFC 3339 without sub-second digits is what we
+	// promise to write.
+	expiresAt := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	save := func(token string, expiresAt time.Time) {
+		t.Helper()
+		cfg := &llmconfig.Config{
+			LLM: llmconfig.LLMConfig{
+				DefaultProvider: "anthropic",
+				Providers: map[string]llmconfig.Provider{
+					"anthropic": {
+						AuthType:       "oauth",
+						AuthToken:      token,
+						RefreshToken:   "rt-0",
+						TokenExpiresAt: expiresAt.UnixMilli(),
+						Enabled:        true,
+					},
+				},
+			},
+		}
+		if err := cfg.Save(); err != nil {
+			t.Fatalf("Save() failed: %v", err)
+		}
+	}
+
+	save("config-token", expiresAt)
+	applyLLMConfigEnv()
+
+	if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != "config-token" {
+		t.Errorf("ANTHROPIC_AUTH_TOKEN = %q, want %q", got, "config-token")
+	}
+	if got, want := os.Getenv("ANTHROPIC_AUTH_TOKEN_EXPIRES_AT"), expiresAt.Format(time.RFC3339); got != want {
+		t.Errorf("ANTHROPIC_AUTH_TOKEN_EXPIRES_AT = %q, want %q", got, want)
+	}
+
+	// Another dagger process refreshes the token and rewrites the config.
+	rotatedAt := expiresAt.Add(time.Hour)
+	save("rotated-token", rotatedAt)
+
+	// The engine asks for the expiry variable; the hook must update both.
+	resolver, name, err := secretprovider.ResolverForID("env://ANTHROPIC_AUTH_TOKEN_EXPIRES_AT")
+	if err != nil {
+		t.Fatalf("ResolverForID() failed: %v", err)
+	}
+	val, err := resolver(t.Context(), name)
+	if err != nil {
+		t.Fatalf("resolving env://ANTHROPIC_AUTH_TOKEN_EXPIRES_AT failed: %v", err)
+	}
+	if want := rotatedAt.Format(time.RFC3339); string(val) != want {
+		t.Errorf("resolved expiry = %q, want %q", val, want)
+	}
+	if got := os.Getenv("ANTHROPIC_AUTH_TOKEN"); got != "rotated-token" {
+		t.Errorf("ANTHROPIC_AUTH_TOKEN = %q, want the hook to have updated it to %q", got, "rotated-token")
+	}
+}
+
 // TestApplyLLMConfigEnvOpenAISlot verifies that when both openai and
 // openrouter are enabled, the shared OPENAI_* variables are owned by exactly
 // one provider, chosen deterministically rather than by map iteration order.

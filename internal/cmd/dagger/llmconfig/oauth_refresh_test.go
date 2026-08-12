@@ -176,12 +176,12 @@ func TestRefreshKeepsRefreshTokenWhenOmitted(t *testing.T) {
 				},
 			})
 
-			token, err := RefreshOAuthProviderIfNeeded(t.Context(), provider)
+			refreshed, err := RefreshOAuthProviderIfNeeded(t.Context(), provider)
 			if err != nil {
 				t.Fatalf("RefreshOAuthProviderIfNeeded() failed: %v", err)
 			}
-			if token != "access-1" {
-				t.Errorf("returned token = %q, want %q", token, "access-1")
+			if refreshed == nil || refreshed.AuthToken != "access-1" {
+				t.Errorf("returned provider = %+v, want AuthToken %q", refreshed, "access-1")
 			}
 
 			loaded, err := Load()
@@ -254,12 +254,12 @@ func TestRefreshSkipsDisabledProvider(t *testing.T) {
 		},
 	})
 
-	token, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic")
+	refreshed, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic")
 	if err != nil {
 		t.Fatalf("RefreshOAuthProviderIfNeeded() failed: %v", err)
 	}
-	if token != "" {
-		t.Errorf("RefreshOAuthProviderIfNeeded() returned %q for a disabled provider, want none", token)
+	if refreshed != nil {
+		t.Errorf("RefreshOAuthProviderIfNeeded() returned %+v for a disabled provider, want none", refreshed)
 	}
 
 	if err := RefreshOAuthTokensIfNeeded(t.Context()); err != nil {
@@ -438,12 +438,12 @@ func TestRefreshWithoutExpiresIn(t *testing.T) {
 
 	// A single credential resolution already costs two hook invocations.
 	for i := range 4 {
-		token, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic")
+		refreshed, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic")
 		if err != nil {
 			t.Fatalf("RefreshOAuthProviderIfNeeded() call %d failed: %v", i, err)
 		}
-		if token != "access-1" {
-			t.Fatalf("call %d returned token %q, want %q", i, token, "access-1")
+		if refreshed == nil || refreshed.AuthToken != "access-1" {
+			t.Fatalf("call %d returned provider %+v, want AuthToken %q", i, refreshed, "access-1")
 		}
 	}
 
@@ -615,7 +615,7 @@ func TestRefreshOAuthProviderChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RefreshOAuthProviderIfNeeded() failed: %v", err)
 	}
-	if token == "" {
+	if token == nil || token.AuthToken == "" {
 		t.Fatal("RefreshOAuthProviderIfNeeded() returned no token")
 	}
 }

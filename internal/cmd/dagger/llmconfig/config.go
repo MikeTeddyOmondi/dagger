@@ -433,20 +433,19 @@ func RefreshOAuthTokensIfNeeded(ctx context.Context) error {
 }
 
 // RefreshOAuthProviderIfNeeded refreshes a single OAuth provider by name if its
-// token has expired, persisting the result. It returns the current access token
-// for the provider (refreshed or not), or "" if the provider is absent,
-// disabled, or not an OAuth provider. Used to keep a long-running session's
-// bearer token fresh: the client re-resolves the token on demand rather than
-// only at startup.
-func RefreshOAuthProviderIfNeeded(ctx context.Context, name string) (string, error) {
+// token has expired, persisting the result. It returns the provider as it now
+// stands (refreshed or not), or nil if it is absent, disabled, or not an OAuth
+// provider. Used to keep a long-running session's bearer token fresh: the
+// client re-resolves the token on demand rather than only at startup.
+func RefreshOAuthProviderIfNeeded(ctx context.Context, name string) (*Provider, error) {
 	oauthRefreshMu.Lock()
 	defer oauthRefreshMu.Unlock()
 
 	if !ConfigExists() {
-		return "", nil
+		return nil, nil
 	}
 
-	var token string
+	var current *Provider
 	err := withConfigLock(func(cfg *Config) (bool, error) {
 		provider, ok := cfg.LLM.Providers[name]
 		if !ok || !provider.IsOAuth() || !provider.Enabled {
@@ -456,14 +455,14 @@ func RefreshOAuthProviderIfNeeded(ctx context.Context, name string) (string, err
 		if err != nil {
 			return false, err
 		}
-		token = refreshed.AuthToken
+		current = &refreshed
 		if changed {
 			cfg.LLM.Providers[name] = refreshed
 		}
 		return changed, nil
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return token, nil
+	return current, nil
 }

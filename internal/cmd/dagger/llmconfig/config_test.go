@@ -593,7 +593,11 @@ func TestRefreshOAuthProviderConcurrent(t *testing.T) {
 	for i := 0; i < workers; i++ {
 		go func() {
 			<-start
-			token, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic")
+			refreshed, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic")
+			var token string
+			if refreshed != nil {
+				token = refreshed.AuthToken
+			}
 			results <- result{token, err}
 		}()
 	}
