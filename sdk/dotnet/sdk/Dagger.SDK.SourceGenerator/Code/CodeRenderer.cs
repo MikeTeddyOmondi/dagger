@@ -12,6 +12,8 @@ namespace Dagger.SDK.SourceGenerator.Code;
 
 public class CodeRenderer : ICodeRenderer
 {
+    public bool SupportsNullableObjects { get; set; } = true;
+
     /// <summary>
     /// Set of all known OBJECT type names in the schema (for resolving @expectedType).
     /// Must be set before calling Render methods.
@@ -274,9 +276,11 @@ public class CodeRenderer : ICodeRenderer
         return field.Type.IsLeaf() || field.Type.IsList() || IsNullableObject(field.Type);
     }
 
-    private static bool IsNullableObject(TypeRef type)
+    private bool IsNullableObject(TypeRef type)
     {
-        return type.Kind != "NON_NULL" && type.IsObjectOrInterface();
+        return SupportsNullableObjects
+            && type.Kind != "NON_NULL"
+            && type.IsObjectOrInterface();
     }
 
     /// <summary>

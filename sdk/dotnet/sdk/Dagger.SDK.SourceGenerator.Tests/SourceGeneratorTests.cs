@@ -1,7 +1,9 @@
 using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
+using Dagger.SDK.SourceGenerator.Code;
 using Dagger.SDK.SourceGenerator.Tests.Utils;
+using Dagger.SDK.SourceGenerator.Types;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -11,6 +13,25 @@ namespace Dagger.SDK.SourceGenerator.Tests;
 [TestClass]
 public class SourceGeneratorTests
 {
+    [TestMethod]
+    public void NullableObjectsKeepOlderEngineShape()
+    {
+        var introspection = NullableObjectIntrospection("v1.0.0-beta.9");
+        var code = new CodeGenerator(new CodeRenderer()).Generate(introspection);
+
+        StringAssert.Contains(code, "public GitRef LatestVersion()");
+        Assert.IsFalse(code.Contains("LatestVersionAsync"));
+    }
+
+    [TestMethod]
+    public void NullableObjectsUseResolvedShapeFromBeta10()
+    {
+        var introspection = NullableObjectIntrospection("v1.0.0-beta.10");
+        var code = new CodeGenerator(new CodeRenderer()).Generate(introspection);
+
+        StringAssert.Contains(code, "public async Task<GitRef?> LatestVersionAsync");
+    }
+
     [TestMethod]
     [DataRow("introspection.json", TestData.Schema)]
     public void GenerateCodeBasedOnSchema(string path, string text)
@@ -86,4 +107,34 @@ public class SourceGeneratorTests
         // Assert
         Assert.IsTrue(diagnostics.Contains(SourceGenerator.FailedToParseSchemaFile));
     }
+
+    private static Introspection NullableObjectIntrospection(string version) =>
+        new()
+        {
+            SchemaVersion = version,
+            Schema = new Schema
+            {
+                Types =
+                [
+                    new Dagger.SDK.SourceGenerator.Types.Type
+                    {
+                        Kind = "OBJECT",
+                        Name = "GitRepository",
+                        Fields =
+                        [
+                            new Field
+                            {
+                                Name = "latestVersion",
+                                Type = new TypeRef { Kind = "OBJECT", Name = "GitRef" },
+                            },
+                        ],
+                    },
+                    new Dagger.SDK.SourceGenerator.Types.Type
+                    {
+                        Kind = "OBJECT",
+                        Name = "GitRef",
+                    },
+                ],
+            },
+        };
 }
