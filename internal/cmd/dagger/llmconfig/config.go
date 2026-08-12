@@ -105,8 +105,9 @@ func Load() (*Config, error) {
 // config file is shared with other subsystems, so the section is merged into
 // the existing document rather than replacing the whole file.
 func (c *Config) Save() error {
-	// Create directory if needed
-	if err := os.MkdirAll(ConfigRoot, 0755); err != nil {
+	// Create the directory the config file actually lives in, which is not
+	// ConfigRoot when DAGGER_CONFIG points somewhere else.
+	if err := os.MkdirAll(filepath.Dir(ConfigFile), 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
