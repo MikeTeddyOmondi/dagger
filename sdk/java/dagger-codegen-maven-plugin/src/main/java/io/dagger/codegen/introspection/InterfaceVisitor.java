@@ -52,9 +52,9 @@ class InterfaceVisitor extends AbstractVisitor {
                 .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT);
 
         TypeName returnType = resolveReturnType(field);
-		if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
-		  returnType = ParameterizedTypeName.get(ClassName.get(Optional.class), returnType);
-		}
+        if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
+          returnType = ParameterizedTypeName.get(ClassName.get(Optional.class), returnType);
+        }
         methodBuilder.returns(returnType);
 
         // Add parameters for required args
@@ -132,10 +132,10 @@ class InterfaceVisitor extends AbstractVisitor {
             .addAnnotation(Override.class);
 
     TypeName returnType = resolveReturnType(field);
-	TypeName objectReturnType = returnType;
-	if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
-	  returnType = ParameterizedTypeName.get(ClassName.get(Optional.class), returnType);
-	}
+    TypeName objectReturnType = returnType;
+    if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
+      returnType = ParameterizedTypeName.get(ClassName.get(Optional.class), returnType);
+    }
     fieldMethodBuilder.returns(returnType);
 
     List<ParameterSpec> mandatoryParams =
@@ -202,8 +202,10 @@ class InterfaceVisitor extends AbstractVisitor {
           .addException(ClassName.get("io.dagger.client.exception", "DaggerQueryException"));
     } else if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
       String graphqlTypeName = field.getTypeRef().getTypeName();
-      String clientClassName = field.getTypeRef().isInterface()
-          ? graphqlTypeName + "Client" : objectReturnType.toString();
+      String clientClassName =
+          field.getTypeRef().isInterface()
+              ? graphqlTypeName + "Client"
+              : objectReturnType.toString();
       fieldMethodBuilder.addStatement(
           "QueryBuilder objectQueryBuilder = nextQueryBuilder.executeNullableObjectQuery($S)",
           graphqlTypeName);
