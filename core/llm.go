@@ -1247,13 +1247,18 @@ func (*LLM) Type() *ast.Type {
 }
 
 func (llm *LLM) Clone() *LLM {
+	// Read under the lock: llm may be a persistent, shared value whose
+	// endpoint another goroutine is resolving right now — a detached agent
+	// loop cloning per step against the CLI's status line resolving the model
+	// on the same node.
+	llm.endpointMtx.Lock()
 	cp := *llm
+	llm.endpointMtx.Unlock()
 	// The messages themselves stay shared with the receiver and any other
 	// clones, so they must be treated as immutable: copy-on-write via
 	// LLMMessage.Clone before modifying one.
 	cp.Messages = slices.Clone(cp.Messages)
 	cp.mcp = cp.mcp.Clone()
-	cp.endpoint = llm.endpoint
 	cp.endpointMtx = &sync.Mutex{}
 	return &cp
 }
@@ -1418,9 +1423,8 @@ func (llm *LLM) WithModel(model, provider string) *LLM {
 	llm = llm.Clone()
 	llm.model = model
 	llm.provider = provider
-
-	llm.endpointMtx.Lock()
-	defer llm.endpointMtx.Unlock()
+	// No lock: the clone is not shared with anyone yet, and locking its own
+	// fresh mutex would protect nothing.
 	llm.endpoint = nil
 
 	return llm
@@ -1432,9 +1436,6 @@ func (llm *LLM) WithModel(model, provider string) *LLM {
 func (llm *LLM) WithReasoningEffort(effort string) *LLM {
 	llm = llm.Clone()
 	llm.reasoningEffort = effort
-
-	llm.endpointMtx.Lock()
-	defer llm.endpointMtx.Unlock()
 	llm.endpoint = nil
 
 	return llm

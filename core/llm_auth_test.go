@@ -494,3 +494,39 @@ func TestLLMCredentialResolvesAgainstLoadingClient(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "token-of-host", cred.Token)
 }
+
+// TestLLMEndpointConcurrentCloneAndResolve exercises the Clone()/Endpoint()
+// pair the way a session actually does: a detached agent loop cloning per step
+// while the CLI's status line resolves the model on the same persistent node.
+// Worth little without -race, and worth a lot with it.
+func TestLLMEndpointConcurrentCloneAndResolve(t *testing.T) {
+	ctx, _ := newLLMEndpointTestCtx(t)
+	query, err := CurrentQuery(ctx)
+	require.NoError(t, err)
+
+	llm, err := query.NewLLM(ctx, "claude-sonnet-4-5", "")
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := llm.Endpoint(ctx)
+			assert.NoError(t, err)
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			clone := llm.Clone().WithPrompt("hi")
+			_, err := clone.Endpoint(ctx)
+			assert.NoError(t, err)
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = llm.WithModel("claude-sonnet-4-5", "")
+		}()
+	}
+	wg.Wait()
+}
