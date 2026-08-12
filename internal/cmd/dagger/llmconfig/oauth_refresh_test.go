@@ -237,6 +237,47 @@ func TestRefreshTokensKeepsSucceededProviders(t *testing.T) {
 	}
 }
 
+// TestRefreshSkipsDisabledProvider verifies that a disabled provider is left
+// alone. Its credentials are never exported, so refreshing it spends a
+// single-use grant for nothing and rotates a refresh token the user still
+// expects to work when they re-enable it.
+func TestRefreshSkipsDisabledProvider(t *testing.T) {
+	srv := newFakeOAuthServer(t, "rt-0")
+	srv.install(t)
+
+	disabled := expiredOAuthProvider("rt-0")
+	disabled.Enabled = false
+	useTempConfig(t, &Config{
+		LLM: LLMConfig{
+			DefaultProvider: "anthropic",
+			Providers:       map[string]Provider{"anthropic": disabled},
+		},
+	})
+
+	token, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic")
+	if err != nil {
+		t.Fatalf("RefreshOAuthProviderIfNeeded() failed: %v", err)
+	}
+	if token != "" {
+		t.Errorf("RefreshOAuthProviderIfNeeded() returned %q for a disabled provider, want none", token)
+	}
+
+	if err := RefreshOAuthTokensIfNeeded(t.Context()); err != nil {
+		t.Fatalf("RefreshOAuthTokensIfNeeded() failed: %v", err)
+	}
+
+	if grants, _ := srv.state(); grants != 0 {
+		t.Errorf("token endpoint granted %d refreshes for a disabled provider, want 0", grants)
+	}
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	if got := loaded.LLM.Providers["anthropic"].RefreshToken; got != "rt-0" {
+		t.Errorf("stored RefreshToken = %q, want it untouched at %q", got, "rt-0")
+	}
+}
+
 // TestRefreshHonorsContext verifies that a hung token endpoint doesn't wedge
 // the caller. Refresh runs inside the client's GetSecret handler with the
 // engine blocked on that RPC, so an unbounded request would take the whole
