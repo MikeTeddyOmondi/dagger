@@ -515,6 +515,16 @@ class Directory extends Client\AbstractObject implements Client\IdAble, Exportab
     }
 
     /**
+     * Return a snapshot with subdirectories removed
+     */
+    public function withoutDirectories(array $paths): Directory
+    {
+        $innerQueryBuilder = new \Dagger\Client\QueryBuilder('withoutDirectories');
+        $innerQueryBuilder->setArgument('paths', $paths);
+        return new \Dagger\Directory($this->client, $this->queryBuilderChain->chain($innerQueryBuilder));
+    }
+
+    /**
      * Return a snapshot with a subdirectory removed
      */
     public function withoutDirectory(string $path): Directory
