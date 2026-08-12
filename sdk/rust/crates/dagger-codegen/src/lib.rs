@@ -255,10 +255,10 @@ mod tests {
     #[test]
     fn interface_return_type_uses_client() {
         let code = generate_from_json(interface_schema());
-        // Query.node() should return NodeClient, not Node
+        // Query.node() should return an optional NodeClient, not Node.
         assert!(
-            code.contains("-> NodeClient"),
-            "expected node() to return NodeClient, not Node"
+            code.contains("Result<Option<NodeClient>, DaggerError>"),
+            "expected node() to return an optional NodeClient, not Node"
         );
     }
 
