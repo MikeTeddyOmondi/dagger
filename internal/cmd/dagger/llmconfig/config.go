@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/adrg/xdg"
 	"github.com/gofrs/flock"
@@ -18,6 +19,19 @@ import (
 // token (providers rotate them), or clobber another provider's freshly
 // rotated token via Save's whole-section rewrite.
 var oauthRefreshMu sync.Mutex
+
+// oauthRefreshFloor bounds how often a single provider is refreshed in this
+// process, whatever its persisted expiry says. A token whose whole lifetime is
+// shorter than the safety margin sits inside that margin from the moment it is
+// issued, so the expiry check alone would refresh — and rotate the single-use
+// refresh token — on every secret resolution, twice per credential.
+const oauthRefreshFloor = 30 * time.Second
+
+// lastOAuthRefresh records when each provider was last refreshed. Keyed by
+// config file as well as provider name, so pointing DAGGER_CONFIG at a
+// different credential store starts from a clean slate. Guarded by
+// oauthRefreshMu.
+var lastOAuthRefresh = map[string]time.Time{}
 
 const (
 	ConfigFileName = "config.toml"
@@ -360,6 +374,14 @@ func refreshProviderToken(ctx context.Context, name string, provider Provider) (
 	if !provider.Enabled || !provider.IsOAuth() || !IsTokenExpired(&provider) {
 		return provider, false, nil
 	}
+	// Rate-limit per provider, so a pathologically short-lived token can't turn
+	// every resolution into another rotation. The caller holds oauthRefreshMu.
+	floorKey := ConfigFile + "\x00" + name
+	if time.Since(lastOAuthRefresh[floorKey]) < oauthRefreshFloor {
+		return provider, false, nil
+	}
+	lastOAuthRefresh[floorKey] = time.Now()
+
 	var refreshed *Provider
 	var err error
 	switch name {

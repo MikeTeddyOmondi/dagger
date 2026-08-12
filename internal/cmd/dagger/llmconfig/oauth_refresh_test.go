@@ -467,7 +467,9 @@ func TestRefreshWithoutExpiresIn(t *testing.T) {
 
 // TestRefreshWithShortExpiresIn checks that a lifetime shorter than the safety
 // margin still persists a real, future expiry rather than a value that is
-// already in the past.
+// already in the past — and that the resulting "always inside the margin"
+// token is refreshed at most once per floor interval instead of on every
+// resolution.
 func TestRefreshWithShortExpiresIn(t *testing.T) {
 	srv := newFakeOAuthServer(t, "rt-0")
 	srv.expiresIn = 60
@@ -482,8 +484,14 @@ func TestRefreshWithShortExpiresIn(t *testing.T) {
 		},
 	})
 
-	if _, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic"); err != nil {
-		t.Fatalf("RefreshOAuthProviderIfNeeded() failed: %v", err)
+	for i := range 4 {
+		if _, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic"); err != nil {
+			t.Fatalf("RefreshOAuthProviderIfNeeded() call %d failed: %v", i, err)
+		}
+	}
+
+	if grants, _ := srv.state(); grants != 1 {
+		t.Errorf("token endpoint granted %d refreshes, want exactly 1", grants)
 	}
 
 	loaded, err := Load()
