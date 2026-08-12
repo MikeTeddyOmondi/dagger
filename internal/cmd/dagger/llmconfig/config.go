@@ -375,17 +375,23 @@ func RefreshOAuthTokensIfNeeded() error {
 
 	return withConfigLock(func(cfg *Config) (bool, error) {
 		var changed bool
+		var errs []error
 		for name, provider := range cfg.LLM.Providers {
 			refreshed, didChange, err := refreshProviderToken(name, provider)
 			if err != nil {
-				return false, err
+				// Keep going: a refresh grant is single-use, so a provider
+				// that already spent its own must not lose the result because
+				// a later provider failed — and which provider that is was
+				// decided by Go's randomized map order.
+				errs = append(errs, err)
+				continue
 			}
 			if didChange {
 				cfg.LLM.Providers[name] = refreshed
 				changed = true
 			}
 		}
-		return changed, nil
+		return changed, errors.Join(errs...)
 	})
 }
 

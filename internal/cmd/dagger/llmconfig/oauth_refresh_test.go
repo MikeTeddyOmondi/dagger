@@ -194,6 +194,48 @@ func TestRefreshKeepsRefreshTokenWhenOmitted(t *testing.T) {
 	}
 }
 
+// TestRefreshTokensKeepsSucceededProviders verifies that one provider's
+// failure doesn't discard another's refreshed credentials. The grant is
+// single-use, so a result that isn't persisted is a permanent logout for that
+// provider — and returning early meant which provider lost was decided by Go's
+// randomized map order.
+func TestRefreshTokensKeepsSucceededProviders(t *testing.T) {
+	srv := newFakeOAuthServer(t, "rt-0")
+	srv.install(t)
+
+	useTempConfig(t, &Config{
+		LLM: LLMConfig{
+			DefaultProvider: "anthropic",
+			Providers: map[string]Provider{
+				"anthropic": expiredOAuthProvider("rt-0"),
+				// Already spent its grant elsewhere: the endpoint answers
+				// invalid_grant.
+				"openai-codex": expiredOAuthProvider("rt-spent"),
+			},
+		},
+	})
+
+	err := RefreshOAuthTokensIfNeeded()
+	if err == nil {
+		t.Fatal("RefreshOAuthTokensIfNeeded() succeeded, want the failing provider reported")
+	}
+	if !strings.Contains(err.Error(), "openai-codex") {
+		t.Errorf("error %v does not name the failing provider", err)
+	}
+
+	loaded, loadErr := Load()
+	if loadErr != nil {
+		t.Fatalf("Load() failed: %v", loadErr)
+	}
+	anthropic := loaded.LLM.Providers["anthropic"]
+	if anthropic.AuthToken != "access-1" {
+		t.Errorf("persisted anthropic AuthToken = %q, want the refreshed %q", anthropic.AuthToken, "access-1")
+	}
+	if anthropic.RefreshToken != "rt-1" {
+		t.Errorf("persisted anthropic RefreshToken = %q, want the rotated %q", anthropic.RefreshToken, "rt-1")
+	}
+}
+
 // Environment used to drive the re-executed test binary in
 // TestRefreshOAuthProviderCrossProcess.
 const (
