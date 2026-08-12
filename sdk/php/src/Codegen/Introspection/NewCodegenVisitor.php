@@ -22,10 +22,15 @@ use Nette\PhpGenerator\Method;
  */
 class NewCodegenVisitor extends CodeWriter
 {
+    private bool $supportsNullableObjects;
+
     public function __construct(
-        string $targetDirectory
+        string $targetDirectory,
+        ?string $schemaVersion = null,
     ) {
         parent::__construct($targetDirectory);
+        $this->supportsNullableObjects = $schemaVersion === null
+            || version_compare(ltrim($schemaVersion, 'v'), '1.0.0-beta.10', '>=');
     }
 
     public function visitScalar(IntrospectionType $type): void
@@ -190,7 +195,7 @@ class NewCodegenVisitor extends CodeWriter
             $phpReturnType = $this->resolveReturnType($returnType, $field);
             if ($returnType->isNonNull()) {
                 $method->setReturnNullable(false);
-            } elseif ($returnType->isObject() || $returnType->isInterface()) {
+            } elseif ($this->supportsNullableObjects && ($returnType->isObject() || $returnType->isInterface())) {
                 $method->setReturnNullable(true);
             }
             $method->setReturnType($phpReturnType);
@@ -212,7 +217,11 @@ class NewCodegenVisitor extends CodeWriter
                 [$field->name]
             );
             $method->addBody('return $this;');
-        } elseif (!$returnType->isNonNull() && ($returnType->isObject() || $returnType->isInterface())) {
+        } elseif (
+            $this->supportsNullableObjects
+            && !$returnType->isNonNull()
+            && ($returnType->isObject() || $returnType->isInterface())
+        ) {
             $method->addBody('$objectQueryBuilder = new \Dagger\Client\QueryBuilder(?);', [$field->name]);
             $this->generateMethodArgsBody($method, $sortedArgs, 'objectQueryBuilder');
             $method->addBody('$objectQueryBuilder->selectField(?);', ['id']);
@@ -301,7 +310,7 @@ class NewCodegenVisitor extends CodeWriter
             $phpReturnType = $this->resolveReturnType($returnType, $field);
             if ($returnType->isNonNull()) {
                 $method->setReturnNullable(false);
-            } elseif ($returnType->isObject() || $returnType->isInterface()) {
+            } elseif ($this->supportsNullableObjects && ($returnType->isObject() || $returnType->isInterface())) {
                 $method->setReturnNullable(true);
             }
             $method->setReturnType($phpReturnType);
