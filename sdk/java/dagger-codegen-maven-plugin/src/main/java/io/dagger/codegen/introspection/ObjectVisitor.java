@@ -215,7 +215,9 @@ class ObjectVisitor extends AbstractVisitor {
         MethodSpec.methodBuilder(Helpers.formatName(field)).addModifiers(Modifier.PUBLIC);
     TypeName returnType = resolveReturnType(field);
     TypeName objectReturnType = returnType;
-    if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
+    if (getSchema().supportsNullableObjects()
+        && field.getTypeRef().isOptional()
+        && field.getTypeRef().isObjectOrInterface()) {
       returnType = ParameterizedTypeName.get(ClassName.get(Optional.class), returnType);
     }
     fieldMethodBuilder.returns(returnType);
@@ -299,7 +301,9 @@ class ObjectVisitor extends AbstractVisitor {
           .addException(InterruptedException.class)
           .addException(ExecutionException.class)
           .addException(ClassName.get("io.dagger.client.exception", "DaggerQueryException"));
-    } else if (field.getTypeRef().isOptional() && field.getTypeRef().isObjectOrInterface()) {
+    } else if (getSchema().supportsNullableObjects()
+        && field.getTypeRef().isOptional()
+        && field.getTypeRef().isObjectOrInterface()) {
       String graphqlTypeName = field.getTypeRef().getTypeName();
       String clientClassName =
           field.getTypeRef().isInterface()

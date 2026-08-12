@@ -8,8 +8,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class Schema {
+
+  private static final Pattern VERSION_PATTERN =
+      Pattern.compile("^v?(\\d+)\\.(\\d+)\\.(\\d+)(?:-([0-9A-Za-z-]+)(?:\\.(\\d+))?)?.*$");
 
   public static class SchemaContainer {
 
@@ -67,6 +72,38 @@ public class Schema {
 
   public String getVersion() {
     return version;
+  }
+
+  public boolean supportsNullableObjects() {
+    if (version == null || version.isBlank()) {
+      return true;
+    }
+
+    Matcher matcher = VERSION_PATTERN.matcher(version);
+    if (!matcher.matches()) {
+      return true;
+    }
+
+    int[] current = {
+      Integer.parseInt(matcher.group(1)),
+      Integer.parseInt(matcher.group(2)),
+      Integer.parseInt(matcher.group(3))
+    };
+    int[] cutover = {1, 0, 0};
+    for (int i = 0; i < current.length; i++) {
+      if (current[i] != cutover[i]) {
+        return current[i] > cutover[i];
+      }
+    }
+
+    String prerelease = matcher.group(4);
+    if (prerelease == null) {
+      return true;
+    }
+    if (prerelease.equals("beta") && matcher.group(5) != null) {
+      return Integer.parseInt(matcher.group(5)) >= 10;
+    }
+    return prerelease.compareTo("beta") > 0;
   }
 
   public Type query() {
