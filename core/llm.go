@@ -133,6 +133,16 @@ type LLMEndpoint struct {
 	AuthToken string
 	IsOAuth   bool
 
+	// AuthTokenSource, when set, supersedes AuthToken at request time: the
+	// endpoint's HTTP client asks it for the current bearer token before
+	// every provider request and overwrites the Authorization header with
+	// the result. Subscription OAuth access tokens expire within the hour
+	// and are rotated behind the session, so the snapshot AuthToken holds
+	// goes stale in any long-running conversation. AuthToken is kept as the
+	// value observed when the endpoint was routed (used for the SDK's own
+	// construction-time setup and as the fallback when no source is set).
+	AuthTokenSource CredentialSource
+
 	// ReasoningEffort is the reasoning level (e.g. "low"/"medium"/"high",
 	// sourced from catwalk's per-model levels) for providers that support
 	// reasoning. Each provider maps it onto its native effort parameter
@@ -608,6 +618,25 @@ type LLMRouter struct {
 	// (see LLM.Endpoint) must run through that client's session. Set by
 	// loadLLMRouter; nil when the router was built for a single client.
 	localClient *engine.ClientMetadata
+
+	// reloadAnthropicAuthToken / reloadCodexAuthToken re-run the lookup that
+	// supplied each subscription OAuth token, against the client that
+	// supplied it. They are what makes a token a live credential rather than
+	// a snapshot: the client's secret provider re-reads (and, for the CLI,
+	// refreshes) the token on every resolution, so asking again at request
+	// time yields the current one. Nil when no token was configured.
+	reloadAnthropicAuthToken CredentialSource
+	reloadCodexAuthToken     CredentialSource
+}
+
+// reloader returns a CredentialSource that re-runs getenv for key. The
+// returned closure carries no client identity of its own — LoadClientConfig
+// binds getenv to the client whose configuration is being read, so a reload
+// resolves against the same client that supplied the value.
+func reloader(getenv func(context.Context, string) (string, error), key string) CredentialSource {
+	return func(ctx context.Context) (string, error) {
+		return getenv(ctx, key)
+	}
 }
 
 func (r *LLMRouter) isAnthropicModel(model string) bool {
@@ -664,6 +693,7 @@ func (r *LLMRouter) routeAnthropicModel() *LLMEndpoint {
 		Provider:        Anthropic,
 		AuthToken:       r.AnthropicAuthToken,
 		IsOAuth:         r.AnthropicIsOAuth,
+		AuthTokenSource: cachedCredential(credentialRefreshTTL, r.reloadAnthropicAuthToken),
 		ReasoningEffort: r.AnthropicReasoningEffort,
 	}
 	endpoint.Client = newAnthropicClient(endpoint)
@@ -689,6 +719,7 @@ func (r *LLMRouter) routeCodexModel() *LLMEndpoint {
 		Provider:        OpenAICodex,
 		AuthToken:       r.OpenAICodexAuthToken,
 		IsOAuth:         true,
+		AuthTokenSource: cachedCredential(credentialRefreshTTL, r.reloadCodexAuthToken),
 		ReasoningEffort: r.OpenAICodexReasoningEffort,
 	}
 	endpoint.Client = newOpenAICodexClient(endpoint)
@@ -916,6 +947,7 @@ func (r *LLMRouter) LoadConfig(ctx context.Context, getenv func(context.Context,
 		}
 		if v != "" {
 			r.AnthropicAuthToken = v
+			r.reloadAnthropicAuthToken = reloader(getenv, "ANTHROPIC_AUTH_TOKEN")
 			anthropicTokenSet = true
 		}
 		return nil
@@ -940,7 +972,15 @@ func (r *LLMRouter) LoadConfig(ctx context.Context, getenv func(context.Context,
 	eg.Go(func() error {
 		// OAuth (ChatGPT subscription) bearer token for the Codex Responses API,
 		// exported client-side from the persisted llmconfig by `dagger llm`.
-		return save("OPENAI_CODEX_AUTH_TOKEN", &r.OpenAICodexAuthToken)
+		var v string
+		if err := save("OPENAI_CODEX_AUTH_TOKEN", &v); err != nil {
+			return err
+		}
+		if v != "" {
+			r.OpenAICodexAuthToken = v
+			r.reloadCodexAuthToken = reloader(getenv, "OPENAI_CODEX_AUTH_TOKEN")
+		}
+		return nil
 	})
 	eg.Go(func() error {
 		return save("OPENAI_CODEX_MODEL", &r.OpenAICodexModel)
@@ -1010,6 +1050,7 @@ func (r *LLMRouter) LoadConfig(ctx context.Context, getenv func(context.Context,
 	// the Anthropic client prefers OAuth whenever a token is present.
 	if anthropicKeySet && !anthropicTokenSet {
 		r.AnthropicAuthToken = ""
+		r.reloadAnthropicAuthToken = nil
 	}
 	if anthropicTokenSet && !anthropicKeySet {
 		r.AnthropicAPIKey = ""
@@ -1027,6 +1068,19 @@ func (r *LLMRouter) LoadConfig(ctx context.Context, getenv func(context.Context,
 // set on the router, so configuration can be layered — e.g. the session's main
 // client as the base with the calling client's own values on top.
 func (r *LLMRouter) LoadClientConfig(ctx context.Context, srv *dagql.Server) (suppliedLocal bool, _ error) {
+	// Pin the client whose configuration this load reads. The getenv closure
+	// below outlives this call — a credential reloader keeps it to re-resolve
+	// a rotated OAuth token at request time — and by then the ambient context
+	// belongs to whichever client is making the LLM call, which may be a
+	// different (e.g. nested) client that cannot see this one's environment.
+	loadClient, clientErr := engine.ClientMetadataFromContext(ctx)
+	bindClient := func(ctx context.Context) context.Context {
+		if clientErr != nil {
+			return ctx
+		}
+		return engine.ContextWithClientMetadata(ctx, loadClient)
+	}
+
 	// Get the secret plaintext, from either a URI (provider lookup) or a plaintext (no-op)
 	loadSecret := func(ctx context.Context, uriOrPlaintext string) (string, error) {
 		if _, _, err := secretprovider.ResolverForID(uriOrPlaintext); err == nil {
@@ -1056,6 +1110,7 @@ func (r *LLMRouter) LoadClientConfig(ctx context.Context, srv *dagql.Server) (su
 		}
 	}
 	return r.LoadConfig(ctx, func(ctx context.Context, k string) (string, error) {
+		ctx = bindClient(ctx)
 		// First lookup in the .env file
 		if v, ok := env[k]; ok {
 			return loadSecret(ctx, v)
