@@ -1,6 +1,7 @@
 package llmconfig
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -341,7 +342,7 @@ func Remove() error {
 // refreshProviderToken refreshes an expired OAuth provider in place, dispatching
 // to the provider-specific refresh flow. It returns the (possibly updated)
 // provider and whether it changed.
-func refreshProviderToken(name string, provider Provider) (Provider, bool, error) {
+func refreshProviderToken(ctx context.Context, name string, provider Provider) (Provider, bool, error) {
 	if !provider.IsOAuth() || !IsTokenExpired(&provider) {
 		return provider, false, nil
 	}
@@ -349,10 +350,10 @@ func refreshProviderToken(name string, provider Provider) (Provider, bool, error
 	var err error
 	switch name {
 	case "openai-codex":
-		refreshed, err = RefreshOpenAIOAuthToken(&provider)
+		refreshed, err = RefreshOpenAIOAuthToken(ctx, &provider)
 	default:
 		// Anthropic and other providers use the standard refresh
-		refreshed, err = RefreshOAuthToken(&provider)
+		refreshed, err = RefreshOAuthToken(ctx, &provider)
 	}
 	if err != nil {
 		return provider, false, fmt.Errorf("failed to refresh OAuth token for %s: %w", name, err)
@@ -363,7 +364,7 @@ func refreshProviderToken(name string, provider Provider) (Provider, bool, error
 // RefreshOAuthTokensIfNeeded checks all OAuth providers in the config and
 // refreshes any expired tokens. This should be called client-side before
 // connecting to the engine.
-func RefreshOAuthTokensIfNeeded() error {
+func RefreshOAuthTokensIfNeeded(ctx context.Context) error {
 	oauthRefreshMu.Lock()
 	defer oauthRefreshMu.Unlock()
 
@@ -377,7 +378,7 @@ func RefreshOAuthTokensIfNeeded() error {
 		var changed bool
 		var errs []error
 		for name, provider := range cfg.LLM.Providers {
-			refreshed, didChange, err := refreshProviderToken(name, provider)
+			refreshed, didChange, err := refreshProviderToken(ctx, name, provider)
 			if err != nil {
 				// Keep going: a refresh grant is single-use, so a provider
 				// that already spent its own must not lose the result because
@@ -400,7 +401,7 @@ func RefreshOAuthTokensIfNeeded() error {
 // for the provider (refreshed or not), or "" if the provider is absent or not
 // an OAuth provider. Used to keep a long-running session's bearer token fresh:
 // the client re-resolves the token on demand rather than only at startup.
-func RefreshOAuthProviderIfNeeded(name string) (string, error) {
+func RefreshOAuthProviderIfNeeded(ctx context.Context, name string) (string, error) {
 	oauthRefreshMu.Lock()
 	defer oauthRefreshMu.Unlock()
 
@@ -414,7 +415,7 @@ func RefreshOAuthProviderIfNeeded(name string) (string, error) {
 		if !ok || !provider.IsOAuth() {
 			return false, nil
 		}
-		refreshed, changed, err := refreshProviderToken(name, provider)
+		refreshed, changed, err := refreshProviderToken(ctx, name, provider)
 		if err != nil {
 			return false, err
 		}

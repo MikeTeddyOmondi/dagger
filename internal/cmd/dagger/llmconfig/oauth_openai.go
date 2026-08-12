@@ -1,12 +1,10 @@
 package llmconfig
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -63,7 +61,7 @@ func GenerateOpenAIOAuthURL() (authURL, verifier, state string, err error) {
 }
 
 // ExchangeOpenAIOAuthCode exchanges an authorization code for OpenAI tokens.
-func ExchangeOpenAIOAuthCode(code, verifier string) (*Provider, error) {
+func ExchangeOpenAIOAuthCode(ctx context.Context, code, verifier string) (*Provider, error) {
 	body := url.Values{
 		"grant_type":    {"authorization_code"},
 		"client_id":     {openaiClientID},
@@ -72,20 +70,9 @@ func ExchangeOpenAIOAuthCode(code, verifier string) (*Provider, error) {
 		"redirect_uri":  {openaiRedirectURI},
 	}
 
-	resp, err := http.Post(openaiTokenURL, "application/x-www-form-urlencoded", strings.NewReader(body.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("token exchange request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("token exchange failed (HTTP %d): %s", resp.StatusCode, string(respBody))
-	}
-
 	var tokenResp OpenAITokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to decode token response: %w", err)
+	if err := postOAuthToken(ctx, openaiTokenURL, "token exchange", "application/x-www-form-urlencoded", strings.NewReader(body.Encode()), &tokenResp); err != nil {
+		return nil, err
 	}
 
 	expiryMs := time.Now().UnixMilli() + int64(tokenResp.ExpiresIn)*1000 - 5*60*1000
@@ -100,7 +87,7 @@ func ExchangeOpenAIOAuthCode(code, verifier string) (*Provider, error) {
 }
 
 // RefreshOpenAIOAuthToken refreshes an expired OpenAI OAuth token.
-func RefreshOpenAIOAuthToken(provider *Provider) (*Provider, error) {
+func RefreshOpenAIOAuthToken(ctx context.Context, provider *Provider) (*Provider, error) {
 	if provider.RefreshToken == "" {
 		return nil, fmt.Errorf("no refresh token available")
 	}
@@ -111,20 +98,9 @@ func RefreshOpenAIOAuthToken(provider *Provider) (*Provider, error) {
 		"client_id":     {openaiClientID},
 	}
 
-	resp, err := http.Post(openaiTokenURL, "application/x-www-form-urlencoded", strings.NewReader(body.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("token refresh request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("token refresh failed (HTTP %d): %s", resp.StatusCode, string(respBody))
-	}
-
 	var tokenResp OpenAITokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to decode refresh response: %w", err)
+	if err := postOAuthToken(ctx, openaiTokenURL, "token refresh", "application/x-www-form-urlencoded", strings.NewReader(body.Encode()), &tokenResp); err != nil {
+		return nil, err
 	}
 
 	expiryMs := time.Now().UnixMilli() + int64(tokenResp.ExpiresIn)*1000 - 5*60*1000

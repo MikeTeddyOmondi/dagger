@@ -1,6 +1,7 @@
 package llmconfig
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -175,7 +176,7 @@ func TestRefreshKeepsRefreshTokenWhenOmitted(t *testing.T) {
 				},
 			})
 
-			token, err := RefreshOAuthProviderIfNeeded(provider)
+			token, err := RefreshOAuthProviderIfNeeded(t.Context(), provider)
 			if err != nil {
 				t.Fatalf("RefreshOAuthProviderIfNeeded() failed: %v", err)
 			}
@@ -215,7 +216,7 @@ func TestRefreshTokensKeepsSucceededProviders(t *testing.T) {
 		},
 	})
 
-	err := RefreshOAuthTokensIfNeeded()
+	err := RefreshOAuthTokensIfNeeded(t.Context())
 	if err == nil {
 		t.Fatal("RefreshOAuthTokensIfNeeded() succeeded, want the failing provider reported")
 	}
@@ -233,6 +234,58 @@ func TestRefreshTokensKeepsSucceededProviders(t *testing.T) {
 	}
 	if anthropic.RefreshToken != "rt-1" {
 		t.Errorf("persisted anthropic RefreshToken = %q, want the rotated %q", anthropic.RefreshToken, "rt-1")
+	}
+}
+
+// TestRefreshHonorsContext verifies that a hung token endpoint doesn't wedge
+// the caller. Refresh runs inside the client's GetSecret handler with the
+// engine blocked on that RPC, so an unbounded request would take the whole
+// session down with it — and the process-wide refresh mutex with it.
+func TestRefreshHonorsContext(t *testing.T) {
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(blocked)
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	// Runs before srv.Close (cleanups are LIFO), so the handler is never left
+	// holding the server open.
+	t.Cleanup(func() { close(release) })
+
+	origToken, origProfile := oauthTokenURL, oauthProfileURL
+	t.Cleanup(func() { oauthTokenURL, oauthProfileURL = origToken, origProfile })
+	oauthTokenURL = srv.URL + "/token"
+	oauthProfileURL = srv.URL + "/profile"
+
+	useTempConfig(t, &Config{
+		LLM: LLMConfig{
+			DefaultProvider: "anthropic",
+			Providers: map[string]Provider{
+				"anthropic": expiredOAuthProvider("rt-0"),
+			},
+		},
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		<-blocked
+		cancel()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := RefreshOAuthProviderIfNeeded(ctx, "anthropic")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("RefreshOAuthProviderIfNeeded() succeeded against a hung endpoint")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("RefreshOAuthProviderIfNeeded() ignored the cancelled context")
 	}
 }
 
@@ -343,7 +396,7 @@ func TestRefreshOAuthProviderChild(t *testing.T) {
 		time.Sleep(time.Until(time.Unix(0, nanos)))
 	}
 
-	token, err := RefreshOAuthProviderIfNeeded("anthropic")
+	token, err := RefreshOAuthProviderIfNeeded(t.Context(), "anthropic")
 	if err != nil {
 		t.Fatalf("RefreshOAuthProviderIfNeeded() failed: %v", err)
 	}

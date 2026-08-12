@@ -51,12 +51,12 @@ func init() {
 	// env://<KEY> against the client on each LLM router config load, so hook
 	// that resolution: when the engine asks for an OAuth auth-token var, refresh
 	// it if expired and update the process env before it's read.
-	secretprovider.RegisterEnvRefresher(func(_ context.Context, name string) error {
+	secretprovider.RegisterEnvRefresher(func(ctx context.Context, name string) error {
 		provider, ok := oauthEnvProviders[name]
 		if !ok {
 			return nil
 		}
-		token, err := llmconfig.RefreshOAuthProviderIfNeeded(provider)
+		token, err := llmconfig.RefreshOAuthProviderIfNeeded(ctx, provider)
 		if err != nil {
 			return err
 		}
@@ -79,8 +79,9 @@ func init() {
 func applyLLMConfigEnv() {
 	// Refresh any expired OAuth tokens before exporting them. A failure here is
 	// non-fatal (we fall back to whatever token is persisted), but warn so an
-	// otherwise-silent 401 later on has a breadcrumb.
-	if err := llmconfig.RefreshOAuthTokensIfNeeded(); err != nil {
+	// otherwise-silent 401 later on has a breadcrumb. cobra initializers get no
+	// context; the refresh bounds itself with its own timeout.
+	if err := llmconfig.RefreshOAuthTokensIfNeeded(context.Background()); err != nil {
 		slog.Warn("failed to refresh LLM OAuth tokens", "error", err)
 	}
 	cfg, err := llmconfig.Load()
